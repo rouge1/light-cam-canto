@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+
+# pytest
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug output
+*.png
+*.jpg
+rx_debug.*
+
+# Thingino firmware build tree (large, has its own repo)
+thingino-firmware/
+
+# Claude Code
+.claude/

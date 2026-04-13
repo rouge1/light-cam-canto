@@ -28,6 +28,10 @@ Thumbs.db
 *.jpg
 rx_debug.*
 
+# Cross-compiled MIPS binaries
+transmitter/tx_pwm
+transmitter/test_luma
+
 # Thingino firmware build tree (large, has its own repo)
 thingino-firmware/
 

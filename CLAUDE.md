@@ -2,30 +2,33 @@
 
 ## Project Overview
 
-IR light communication system between Wyze V3 cameras using their built-in IR illuminators. Cameras transmit data by modulating IR LEDs and receive by analyzing video frames for brightness changes.
+IR light communication system between Wyze V3 cameras using their built-in IR illuminators. Cameras transmit data by modulating IR LEDs and receive by analyzing video frames for brightness changes. The project builds custom firmware on top of Thingino to enable on-camera TX/RX for a full-duplex reliable link.
 
 ## Tech Stack
 
 - **Python 3.10+** — receiver, protocol, benchmarks, test orchestration
-- **C (cross-compiled)** — low-level GPIO/PWM transmitter for Ingenic T31
-- **OpenCV** — frame capture and brightness analysis
-- **Paramiko** — SSH orchestration to cameras
-- **NumPy** — signal processing
-- **Matplotlib** — benchmark plotting
+- **C (cross-compiled for MIPS)** — on-camera GPIO transmitter, brightness monitor
+- **OpenCV** — host-side frame capture and brightness analysis
+- **NumPy** — signal processing and decoding
+- **Matplotlib** — debug plots
 - **pytest** — testing
+- **Conda env: `light`** — `conda activate light`
 
-## Firmware: Thingino
+## Firmware: Thingino (Custom Build)
 
-This project uses **Thingino** (https://github.com/themactep/thingino-firmware), a full replacement firmware for Ingenic-based cameras. It replaces the stock Wyze firmware entirely — no Wyze code runs.
+This project builds **custom firmware** on top of Thingino (https://github.com/themactep/thingino-firmware). The firmware source is cloned into `thingino-firmware/` (not committed — has its own repo).
 
-### Why Thingino (not wz_mini_hacks)
+### Custom Firmware Changes
 
-- **Hardware PWM** on 940nm IR LEDs via `/dev/pwm` ioctls (nanosecond precision)
+- **USB CDC-NCM networking** — added `BR2_PACKAGE_USBNET=y` and `BR2_PACKAGE_USBNET_USB_DIRECT_NCM=y` to defconfig (requires USB data cable, not yet tested)
+- **BrightnessMonitor** — patched prudynt-t to expose per-frame brightness via `/run/prudynt/brightness` using `IMP_FrameSource_SnapFrame` API
+
+### Why Thingino
+
 - Full kernel/system control — custom modules, ISP tuning, no cloud
-- Reliable USB RNDIS networking with built-in DHCP
 - Prudynt-T RTSP streamer (dual streams, ONVIF, audio, motion)
 - Writable JFFS2 overlay — SCP binaries that persist across reboots
-- `daynightd` fully controllable or disableable (no auto IR switching surprises)
+- `daynightd` fully controllable or disableable
 
 ## Target Hardware
 
@@ -33,177 +36,184 @@ This project uses **Thingino** (https://github.com/themactep/thingino-firmware),
 
 | Camera | SoC | IR LEDs | FPS | Firmware |
 |--------|-----|---------|-----|----------|
-| Wyze V3 | Ingenic T31X (MIPS) | 4x 850nm + 4x 940nm | 15-20 | Thingino |
+| Wyze V3 | Ingenic T31X (MIPS) | 4x 850nm + 4x 940nm | 15-20 | Thingino (custom) |
 
-Three V3 hardware variants exist (different WiFi chips):
-
-| Thingino config | WiFi chip | SoC |
-|---|---|---|
-| `wyze_cam3_t31x_gc2053_atbm6031` | ATBM6031 | T31X |
-| `wyze_cam3_t31x_gc2053_rtl8189ftv` | RTL8189FTV | T31X |
-| `wyze_cam3_t31al_gc2053_atbm6031` | ATBM6031 | T31AL |
-
-### Unsupported Cameras
-
-| Camera | SoC | Why |
-|--------|-----|-----|
-| Wyze Cam OG | Fulhan (not Ingenic) | Different SoC, no custom firmware support |
-| Wyze V4 | Ingenic T41 (secure boot) | Requires physical chip swap to bypass secure boot |
-| Wyze Cam Pan V3 | — | Not supported by Thingino |
-| Wyze V2 | Ingenic T20 (MIPS) | Out of scope — focusing on V3 only |
+Both test cameras are the `wyze_cam3_t31x_gc2053_atbm6031` variant (ATBM6031 WiFi, T31X SoC).
 
 ## GPIO and PWM Map (Wyze V3 / T31)
 
 ```
-GPIO 47  — 850nm IR LEDs (GPIO only, no PWM)
-GPIO 49  — 940nm IR LEDs (PWM channel 0 on T31!) ← primary TX path
+GPIO 47  — 850nm IR LEDs (GPIO only, no PWM, faint visible red glow)
+GPIO 49  — 940nm IR LEDs (PWM channel 0, invisible) ← primary TX path
 GPIO 52  — IR cut filter (open)
 GPIO 53  — IR cut filter (close)
 GPIO 38  — Red status LED (active low)
 GPIO 39  — Blue status LED (active low)
-GPIO 51  — Reset button
-GPIO 48  — MMC power (active low)
-GPIO 57  — WLAN enable
-GPIO 59  — MMC card detect
 ```
 
-### PWM Control (940nm LEDs)
+### IR Cut Filter
 
-The 940nm LEDs (GPIO 49) map to hardware PWM channel 0 on the T31 SoC. This enables precision modulation from C code:
+**Critical for IR communication.** The IR cut filter physically blocks infrared light from reaching the sensor. Must be opened before any IR reception:
 
-```c
-// ioctl commands on /dev/pwm
-PWM_CONFIG       0x001  // Set period + duty + polarity (nanoseconds)
-PWM_CONFIG_DUTY  0x002  // Change duty only (fast — use for OOK modulation)
-PWM_ENABLE       0x010  // Enable channel
-PWM_DISABLE      0x100  // Disable channel
-```
-
-Shell shorthand (for testing only — too slow for data):
 ```bash
-pwm-ctrl 49 50   # GPIO 49 at 50% duty
-pwm -c 0 -P 1000000 -D 500000 -p 1 -e  # PWM0, 1ms period, 50% duty
+ircut off           # Open filter (night mode) — IR passes through
+ircut on            # Close filter (day mode) — IR blocked
+killall daynightd   # Prevent auto-switching back
 ```
 
-**850nm LEDs (GPIO 47)** are GPIO-only: on/off, no PWM. Useful for visible-glow testing (faint red) but not for high-speed modulation.
+## Protocol Stack
 
-## PC-to-Camera Connectivity
+### Manchester Encoding (IEEE 802.3)
 
-Primary connection is **USB Direct / RNDIS** (no WiFi). The camera's USB port carries both power and data.
+Every data bit maps to two symbols with a guaranteed mid-bit transition:
+- `0` → `[1, 0]` (falling edge)
+- `1` → `[0, 1]` (rising edge)
 
-### USB Modes (via Thingino)
-- **USB Direct / RNDIS**: Network-over-USB. Camera gets an IP, SSH and RTSP work over the USB cable.
-- **CDC-NCM**: Alternative USB networking mode.
-- **USB Direct NCM**: Acts as DHCP server for plug-and-play networking.
+Self-clocking — the receiver can never lose sync.
 
-WiFi is **not used** in this project. Most use cases have cameras connected directly to a laptop/PC via USB.
-
-### System Topology (Single-PC Test Bench)
+### Frame Format
 
 ```
-         USB              IR              USB
-    [PC] <==> [Cam A] <==> [Cam B] <==> [PC]
-    port1    tx/rx         tx/rx        port2
+[PREAMBLE 8] [SYNC 8] [LENGTH 8] [PAYLOAD N×8] [CRC-8] [POSTAMBLE 4] → Manchester encoded
 ```
 
-Both cameras connected to the same PC via USB. Cameras pointed at each other for IR communication.
+- **Preamble**: `10101010` — clock recovery
+- **Sync word**: `11001011` — frame boundary marker
+- **Length**: payload byte count (0-255)
+- **CRC-8/CCITT**: polynomial 0x07, covers length + payload
+- **Postamble**: `1010` — clean termination
 
-### Duplex Mode
+### Speeds Achieved
 
-IR communication is **full-duplex**. Both cameras can transmit and receive simultaneously — IR LEDs point outward (same direction as the lens), so a camera's own LEDs cannot blind its own sensor. However, signal-to-noise may degrade in full-duplex if both cameras' IR interferes at the receiver. Half-duplex (taking turns) is available as a fallback.
+| Phase | Method | Speed | Status |
+|-------|--------|-------|--------|
+| Phase 1 | Shell `gpio set` + `usleep` | ~1 bps | Done, reliable |
+| Phase 2 | C binary, sysfs GPIO | ~3 bps | Done, reliable |
+| Phase 2+ | Hardware PWM ioctls | TBD | PWM_ENABLE fails — needs investigation |
 
-## Development Phases
+## Project Structure
 
-### Phase 0 — Infrastructure (current)
-
-Prove the basic toolchain works over USB-only, no IR yet.
-
-1. **0.1 — Repeatable SSH over USB**: Paramiko connects to both cameras reliably
-2. **0.2 — Code deployment**: SCP files to camera's JFFS2 overlay, verify persistence
-3. **0.3 — RTSP video over USB**: Capture frames from Prudynt-T via OpenCV
-4. **0.4 — GPIO toggle + verify**: Toggle IR LEDs on Cam A, verify brightness change in Cam B's RTSP stream
-
-### Phase 1 — Proof of Concept (shell-based)
-
-IR modulation via shell commands (~5-10 bps). Slow but proves the concept end-to-end.
-
-### Phase 2 — Direct GPIO/PWM (on-camera C)
-
-C program on camera uses `/dev/pwm` ioctls for high-speed 940nm modulation (~100-1000 bps).
-
-### Phase 2+ — Rolling Shutter Exploitation
-
-Use rolling shutter timing to encode multiple bits per frame (~1-10 kbps). Research phase.
+```
+protocol/          — Manchester encoding, CRC-8, frame encode/decode (pure Python)
+transmitter/       — TX code: shell scripts, C GPIO binary, Makefile
+  tx_shell.py      — Phase 1: generates shell toggle scripts
+  tx_pwm.py        — Phase 2: Python wrapper for C transmitter
+  tx_pwm.c         — Phase 2: C binary using sysfs GPIO, cross-compiled for MIPS
+  Makefile         — Cross-compilation via Thingino toolchain
+receiver/          — RX code: RTSP brightness capture + dual-strategy decoder
+host/              — Host-side orchestration: SSH, config, end-to-end CLI
+  config.py        — Camera IPs, GPIO pins, timing constants
+  ssh.py           — SSH/SCP wrappers (uses `scp -O` for Thingino compatibility)
+  send_message.py  — CLI: `python -m host.send_message "HELLO"`
+tests/             — pytest: 26 tests covering protocol layer
+thingino-firmware/ — Thingino build tree (not committed, clone separately)
+```
 
 ## Setup
 
 ### Host Machine
 ```bash
+conda create -n light python=3.12 -y
+conda activate light
 pip install opencv-python numpy paramiko matplotlib pytest
 ```
 
-### Wyze V3 Cameras (Thingino)
-1. Identify your V3 hardware variant (WiFi chip — check via `dmesg` after first flash)
-2. Download the matching Thingino firmware image from https://github.com/themactep/thingino-firmware
-3. Flash via SD card: rename image to `autoupdate-full.bin`, place on FAT32 SD card, boot camera
-4. Connect camera to PC via USB cable (RNDIS mode)
-5. Verify SSH: `ssh root@<cam_ip>` (default creds: `root/root`)
-6. Disable day/night auto-switching if needed (disable `daynightd`)
-7. Verify RTSP: `ffplay rtsp://<cam_ip>/ch0` (Prudynt-T, port 554, creds `thingino/thingino`)
+### Camera SSH Setup
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/cam_key
+ssh-copy-id -i ~/.ssh/cam_key root@192.168.50.110
+ssh-copy-id -i ~/.ssh/cam_key root@192.168.50.141
+```
+
+Add to `~/.ssh/config`:
+```
+Host da-camera1
+    HostName 192.168.50.110
+    User root
+    IdentityFile ~/.ssh/cam_key
+
+Host da-camera2
+    HostName 192.168.50.141
+    User root
+    IdentityFile ~/.ssh/cam_key
+```
 
 ### Code Deployment to Camera
 ```bash
-# SCP a binary or script to the camera (persists across reboots via JFFS2 overlay)
-scp my_program root@<cam_ip>:/usr/local/bin/
-ssh root@<cam_ip> "chmod +x /usr/local/bin/my_program && /usr/local/bin/my_program"
+# Use scp -O (legacy mode) — Thingino lacks sftp-server
+scp -O my_program root@da-camera1:/opt/bin/
+ssh da-camera1 "chmod +x /opt/bin/my_program && /opt/bin/my_program"
 ```
 
-### Cross-Compilation
-- Wyze V3 (T31): MIPS cross-compiler via Thingino's Buildroot toolchain
-- Alternatively: `mipsel-linux-gnu-gcc` with appropriate sysroot
-
-## Project Structure
-
-```
-transmitter/   — code that runs ON the transmitting camera (shell scripts, C GPIO/PWM)
-receiver/      — code that runs on host or receiving camera (frame analysis)
-protocol/      — encoding, framing, link layer (pure Python, shared)
-host/          — test orchestration (runs on host PC, SSHs into cameras)
-benchmarks/    — range/speed test scripts and results
-tests/         — pytest unit tests
-docs/          — hardware notes, GPIO pinouts
+### Cross-Compilation (C for MIPS)
+```bash
+cd transmitter && make        # Uses Thingino's Buildroot toolchain
+make deploy                   # SCP to da-camera1
 ```
 
-## IR Channel Limitations
+Toolchain path: `thingino-firmware/output/stable/wyze_cam3_t31x_gc2053_atbm6031-3.10.14-musl/host/bin/mipsel-linux-gcc`
 
-The IR link between cameras is a **very slow serial channel**. It cannot carry video or audio.
+### Building Custom Firmware
+```bash
+cd thingino-firmware
+BOARD=wyze_cam3_t31x_gc2053_atbm6031 make defconfig
+BOARD=wyze_cam3_t31x_gc2053_atbm6031 make
+# Output: output/stable/.../images/thingino-wyze_cam3_t31x_gc2053_atbm6031.bin
+# Flash: copy to SD card as autoupdate-full.bin, boot camera
+```
 
-| Phase | Speed | Realistic payload |
-|-------|-------|-------------------|
-| Phase 0 (infra) | N/A | Connectivity and toolchain validation |
-| Phase 1 (shell) | 5-10 bps | Trigger signals, status codes |
-| Phase 2 (PWM) | 100-1000 bps | Short text, sensor readings, commands |
-| Phase 2+ (rolling shutter) | 1-10 kbps | Larger text, small files (slowly) |
+### Rebuilding Patched Prudynt-T
+```bash
+# Edit source in dl/prudynt-t/git/src/ AND copy to build dir:
+# output/stable/.../build/prudynt-t-<hash>/src/
+# Then:
+BOARD=wyze_cam3_t31x_gc2053_atbm6031 make prudynt-t-rebuild
+# Deploy: scp -O .../per-package/prudynt-t/target/usr/bin/prudynt root@<cam>:/opt/bin/prudynt-patched
+```
 
-Compressed audio needs ~8 kbps minimum (codec2). Video is completely out of reach.
+## Camera Filesystem
+
+| Path | Type | Persists | Use |
+|------|------|----------|-----|
+| `/opt/` | JFFS2 (extras) | Yes, ~8MB | Deploy binaries here |
+| `/etc/` | JFFS2 (config) | Yes, ~224KB | Config files (very small!) |
+| `/usr/bin/`, `/usr/lib/` | SquashFS | Read-only | Stock firmware |
+| `/tmp/` | RAM | No | Temp files |
+| `/run/prudynt/` | RAM | No | Prudynt runtime data |
 
 ## Common Pitfalls
 
-- **940nm is invisible**: You can't see 940nm IR. Use a phone camera to verify, or verify programmatically via the other camera's RTSP brightness. 850nm (GPIO 47) has a faint visible red glow for quick sanity checks.
-- **Day/night auto-switching**: Thingino's `daynightd` may toggle IR based on ambient light. Disable it before testing: `killall daynightd` or disable in config.
-- **RTSP stream latency**: Prudynt-T adds 0.5-2s latency. Account for this in TX/RX synchronization. Use timestamps, not assumed timing.
-- **RTSP credentials**: Prudynt-T defaults to `thingino/thingino`. OpenCV needs them in the URL: `rtsp://thingino:thingino@<ip>/ch0`.
-- **Frame rate drops at night**: Sensor drops to 10-15fps in night/IR mode due to longer exposure. This directly reduces receive bandwidth.
-- **850nm vs 940nm for TX**: 940nm has hardware PWM (fast modulation). 850nm is GPIO-only (on/off). Use 940nm for data transmission.
-- **Rolling shutter direction**: Stripe patterns from rolling shutter depend on scan direction (typically top-to-bottom). Verify orientation before implementing stripe decoder.
-- **Full-duplex SNR**: Both cameras transmitting simultaneously is physically possible but may degrade signal-to-noise. Test full-duplex vs half-duplex BER early.
-- **JFFS2 overlay is small**: The writable config partition is ~224 KB. For larger files, use the SD card.
-- **USB port assignment**: With two cameras on one PC, USB device IPs may swap on reboot. Use MAC-based DHCP or static IP assignment to keep them stable.
+- **IR cut filter must be open** (`ircut off`). Without this, IR is physically blocked — no amount of software can detect it. After every reboot, the filter resets to day mode (closed). Kill `daynightd` to prevent auto-switching.
+- **940nm is invisible**. Use a phone camera to verify, or check the other camera's RTSP stream. 850nm (GPIO 47) has a faint visible red glow for quick sanity checks.
+- **Auto-exposure fights the signal**. The ISP compensates for brightness changes within ~200ms. This means sustained brightness levels are unreliable — use edge detection or transition-based decoding instead.
+- **SCP needs `-O` flag**. Thingino doesn't have `sftp-server`. Use `scp -O` (legacy SCP protocol).
+- **RTSP creds**: `thingino/thingino`. Web UI creds: `root/<your_password>`.
+- **Overlay filesystem is tiny** (~224KB config + 8MB /opt). Don't try to `cp` large files to `/usr/bin/` — it will fill the overlay and corrupt the binary. Deploy to `/opt/bin/` instead.
+- **Corrupted overlay recovery**: If you accidentally filled the overlay (e.g., failed `cp`), remove the overlay file: `rm /overlay/usr/bin/<file>` and reboot.
+- **PWM hardware doesn't work** (as of current firmware). `ioctl(fd, PWM_ENABLE, channel)` returns "Operation not permitted" and kernel logs "pwm could not work!". The `pwm_device` is NULL — the kernel PWM subsystem doesn't initialize the device. Use sysfs GPIO toggle instead.
+- **GPIO mux state persists**. Running `tx_pwm` switches GPIO 49 to PWM function mode (`gpio-diag PB17 func 0`). If the binary exits without resetting, the pin stays in PWM mode and GPIO commands have no effect. Reset with `gpio-diag PB17 func 1` or reboot.
+- **IMP SDK is per-process**. You cannot call `IMP_ISP_Tuning_*` functions from a separate process — they require ISP initialization done by prudynt-t. The `libimp.so` on camera uses musl libc but was built against uclibc symbols; linking works at runtime but `dlopen` calls that hit ISP tuning will segfault from an uninitialized process.
+- **IMP_ISP_Tuning_GetAeLuma is useless for IR detection**. It returns the auto-exposure's internal luminance estimate, which barely changes when IR LEDs toggle (delta ~3-4 units in daylight). Use raw frame brightness instead.
+- **Prudynt-t BrightnessMonitor uses SnapFrame API**. `IMP_FrameSource_SnapFrame` grabs a single NV12 frame from an already-running channel without needing IVS binding. Works alongside prudynt-t's encoder pipeline.
+- **Buildroot wipes source on rebuild**. Patches to `dl/prudynt-t/git/src/` are NOT used during build. You must also copy changes to `output/stable/.../build/prudynt-t-<hash>/src/`. Use Buildroot's patch system for permanent changes.
+- **Frame rate is the receiver bottleneck**. At 15fps RTSP, each symbol needs ~3+ frames for reliable detection. Maximum practical bps = fps / (2 * samples_per_symbol) ≈ 3-5 bps via RTSP.
 
 ## Running Tests
 
 ```bash
+conda activate light
+cd /data/python/light-cam-canto
 pytest tests/ -v
+```
+
+## Usage
+
+```bash
+# Send a message via IR (Phase 2, ~3 bps)
+python -m host.send_message "HELLO"
+
+# Send via shell fallback (Phase 1, ~1 bps)
+python -m host.send_message --shell "HI"
 ```
 
 ## Key References
@@ -211,6 +221,5 @@ pytest tests/ -v
 - Thingino firmware: https://github.com/themactep/thingino-firmware
 - Prudynt-T streamer: https://github.com/gtxaspec/prudynt-t
 - ingenic-pwm: https://github.com/gtxaspec/ingenic-pwm
-- OpenIPC (alternative firmware): https://github.com/OpenIPC
 - Ingenic T31 datasheet: search "Ingenic T31 programming manual"
 - Rolling shutter OCC research: https://pmc.ncbi.nlm.nih.gov/articles/PMC7061997/

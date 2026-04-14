@@ -39,3 +39,6 @@ thingino-firmware/
 
 # Claude Code
 .claude/
+
+# photos
+photos/

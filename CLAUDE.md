@@ -6,10 +6,11 @@ IR light communication system between Wyze V3 cameras using their built-in IR il
 
 ## Tech Stack
 
-- **Python 3.10+** — receiver, protocol, benchmarks, test orchestration
+- **Python 3.10+** — receiver, protocol, benchmarks, test orchestration, calibration
 - **C (cross-compiled for MIPS)** — on-camera GPIO transmitter, brightness monitor
-- **OpenCV** — host-side frame capture and brightness analysis
+- **OpenCV** — host-side frame capture, RTSP stream reading, calibration imaging
 - **NumPy** — signal processing and decoding
+- **requests** — Thingino web API control (LED toggle, ISP settings)
 - **Matplotlib** — debug plots
 - **pytest** — testing
 - **Conda env: `light`** — `conda activate light`
@@ -32,7 +33,7 @@ This project builds **custom firmware** on top of Thingino (https://github.com/t
 | `/run/prudynt/brightness_grid` | `<timestamp_ms> <b0> <b1> ... <b59>` | 10x6 block grid (ROI detection) |
 | `/run/prudynt/ae_freeze` | `0` or `1` | Write `1` to freeze AE, `0` to unfreeze |
 
-The grid divides the 640x360 frame into 60 blocks (64x60 pixels each). The `irlink_rx` receiver uses the grid to find and track the specific block containing the transmitter's IR LEDs, enabling AE-resilient decoding.
+The grid divides the 640x360 frame into 240 blocks (20x12, 32x30 pixels each). The `irlink` receiver uses the grid to find and track the specific block containing the transmitter's IR LEDs. The host-side `pixel_rx.py` bypasses the grid entirely and reads the RTSP stream at exact pixel coordinates for much higher signal-to-noise ratio.
 
 ### Why Thingino
 
@@ -103,6 +104,8 @@ Self-clocking — the receiver can never lose sync.
 | Phase 2+ | Hardware PWM ioctls | TBD | PWM_ENABLE fails — needs investigation |
 | On-camera RX | irlink_rx + BrightnessMonitor | ~3 bps | Working (ROI + AE residual) |
 | Half-duplex link | irlink (TX+RX+protocol) | ~3 bps | Working (AE freeze + raw block) |
+| Dual LED TX | irlink (850nm + 940nm together) | ~3 bps | Working, 2x signal at distance |
+| Host pixel RX | pixel_rx.py (RTSP + pixel ROI) | ~3 bps | In progress (delta 200+ at 10-20ft) |
 
 ## Project Structure
 
@@ -122,6 +125,14 @@ host/              — Host-side orchestration: SSH, config, end-to-end CLI
   config.py        — Camera IPs, GPIO pins, timing constants
   ssh.py           — SSH/SCP wrappers (uses `scp -O` for Thingino compatibility)
   send_message.py  — CLI: `python -m host.send_message "HELLO"`
+  cam_setup.sh     — Camera pre-flight: night mode, ircut, LEDs, prudynt, AE freeze
+  cal_procedure.py — Pixel-level calibration: diff LED-on/off RTSP frames to find TX
+  calibration.json — Saved calibration data (TX pixel coords per camera pair)
+  pixel_rx.py      — Host-side RTSP pixel receiver (reads exact TX pixel ROI)
+photos/            — Calibration images, debug snapshots, calibration.html viewer
+  find_transmitter.py — One-shot TX locator with bounding box
+  grab_grid.py     — RTSP frame grab with brightness grid overlay
+  calibration.html — Visual calibration report (serve with python -m http.server)
 tests/             — pytest: 26 tests covering protocol layer
 thingino-firmware/ — Thingino build tree (not committed, clone separately)
 ```
@@ -132,7 +143,7 @@ thingino-firmware/ — Thingino build tree (not committed, clone separately)
 ```bash
 conda create -n light python=3.12 -y
 conda activate light
-pip install opencv-python numpy paramiko matplotlib pytest
+pip install opencv-python numpy paramiko matplotlib pytest requests
 ```
 
 ### Camera SSH Setup
@@ -224,14 +235,23 @@ BOARD=wyze_cam3_t31x_gc2053_atbm6031 make prudynt-t-rebuild
 - **Cameras too close (<6 inches) gives poor signal**. The IR LEDs flood the entire sensor when very close, and the image is out of focus (min focus ~50cm). Best results at 2-3 feet where the LEDs form a focused spot.
 - **AE freeze is required for half-duplex protocol**. Without AE freeze, the camera's own LED reflections cause massive AE swings that take 3-5 seconds to settle after TX ends. With `IMP_ISP_Tuning_SetAeFreeze(ENABLE)`, exposure locks and raw block brightness changes are instantaneous and predictable. Freeze AE before comms, unfreeze after.
 - **Self-reflection dominates raw brightness**. When a camera toggles its own IR LED, reflections off walls/ceiling cause block 45 to change by 8-10 units (vs 23-45 from the peer). With AE frozen, these reflections are small and consistent — not a problem. With AE active, the reflections trigger AE compensation that ruins subsequent reception.
-- **Consecutive-frame filter prevents false activity detection**. Single-frame brightness spikes (from self-reflection or noise) trigger false IDLE→ACTIVE transitions. Requiring 3 consecutive frames above threshold eliminates these.
-- **Inter-message gap must exceed SETTLE_MS**. Back-to-back transmissions (ACK immediately followed by DATA) merge into one continuous activity period for the receiver. The gap between messages must be at least SETTLE_MS (1500ms) + margin so the receiver detects "end of TX" and decodes each message separately.
+- **Consecutive-frame filter prevents false activity detection**. Single-frame brightness spikes (from self-reflection or noise) trigger false IDLE→ACTIVE transitions. Requiring 2 consecutive frames above threshold eliminates these (reduced from 3 with AE freeze).
+- **Inter-message gap must exceed SETTLE_MS**. Back-to-back transmissions (ACK immediately followed by DATA) merge into one continuous activity period for the receiver. The gap between messages must be at least SETTLE_MS (400ms) + 100ms margin so the receiver detects "end of TX" and decodes each message separately.
 - **RX thread stack overflow on MIPS/musl**. The default pthread stack (~128KB on musl) overflows with large local arrays. `sample_t samples[8192]` (~128KB) must be declared static, not stack-local.
 - **Boot automation via `/etc/rc.local`**. Both cameras have rc.local that auto-mounts /opt, swaps to patched prudynt, opens IR filter, and kills daynightd. Runs via `S94rc.local` at end of boot sequence.
+- **Prudynt daynight overrides GPIO LED state**. Even after `gpio set 47`, prudynt's daynight daemon can immediately turn it off. You MUST disable daynight before toggling LEDs: `echo '{"daynight":{"enabled":false}}' | prudyntctl json -`. The `light` command is the reliable LED control: `light ir850 on`, `light ir940 on`, `light ir850 read` (returns 0 or 1). This is what the web UI uses internally.
+- **`color status` and `imp-control ispmode` lie**. The `color` CLI reads a stale file (`/tmp/colormode.txt`), not actual ISP state. `imp-control ispmode 1` may silently fail. Use the Thingino web API instead: `POST /x/json-imp.cgi {"cmd":"color","val":1}`. Verify via heartbeat: `GET /x/json-heartbeat.cgi` (SSE, use `--max-time`) returns `color_mode` (0=color, 1=mono).
+- **Thingino web API requires session cookies**. Login with `POST /x/login.cgi {"username":"root","password":"password"}` to get a session cookie. Cookies expire — always re-login before commands. The API endpoint is `/x/json-imp.cgi` with commands: `daynight`, `color`, `ircut`, `ir850`, `ir940`.
+- **ircut_state semantics are inverted from what you'd expect**. In the heartbeat API: `ircut_state=0` means filter REMOVED (night mode, IR passes through = GOOD). `ircut_state=1` means filter SET (day mode, IR blocked = BAD). The `daynight night` API command sometimes re-closes the ircut filter — always set ircut as the LAST step after all other mode changes.
+- **RTSP stream buffers stale frames**. When toggling LEDs and capturing via RTSP, the OpenCV VideoCapture buffer contains frames from before the LED state changed. Opening a fresh stream after the state change (rather than flushing frames on an existing stream) is the reliable approach.
+- **OSD timestamp changes create false calibration peaks**. The on-screen timestamp (top-left corner) changes every second, creating large brightness deltas that can be mistaken for IR LEDs during frame differencing. Mask out the top 30 and bottom 30 pixel rows when searching for the TX peak.
+- **Grid-based brightness (20x12 blocks) dilutes IR signal at distance**. At 10-20 feet, the IR LED spot is ~10-20 pixels across but the grid block is 32x30 pixels. The spot's +200 pixel delta gets averaged down to +10-15 in the block. Host-side pixel-level RTSP reading (`pixel_rx.py`) gives the full undiluted delta.
+- **Dual LED TX (850nm + 940nm) doubles signal**. `irlink` now toggles both GPIO 47 and 49 simultaneously. At 10-20 feet: single LED gives +15 grid delta, dual gives +23. At pixel level: +200 for both.
+- **Camera setup order matters**. The `cam_setup.sh` script must: (1) start prudynt, (2) kill daynightd, (3) set night/monochrome mode, (4) turn off LEDs, (5) set ircut filter LAST (because other commands re-close it).
 
 ## On-Camera Transceiver (irlink)
 
-The `irlink` binary is the combined half-duplex transceiver with a TCP-like protocol layer. It runs on-camera, reading brightness from BrightnessMonitor and toggling the IR LED via sysfs GPIO.
+The `irlink` binary is the combined half-duplex transceiver with a TCP-like protocol layer. It runs on-camera, reading brightness from BrightnessMonitor and toggling both IR LEDs (850nm + 940nm) simultaneously via sysfs GPIO for maximum signal strength.
 
 ### Protocol Message Types
 
@@ -252,22 +272,25 @@ Frame payload format: `[msg_type] [seq_num] [data...]`
 ### Usage
 
 ```bash
-# Calibrate: toggle the other camera's LED during the 5-second window
+# Calibrate: toggle the other camera's LED during the 4-second window
 irlink calibrate
-# Output: block index (e.g., 45)
+# Output: block index (e.g., 212)
 
 # Listen for incoming connection (daemon mode, auto-responds)
-irlink daemon-listen --block 45
+irlink daemon-listen --block 212
 
 # Connect and send a message
-irlink send "HELLO" --block 45
+irlink send "HELLO" --block 212
 
 # Interactive mode (type commands after handshake)
-irlink connect --block 45
+irlink connect --block 212
 # Then: send <text>, ping, cal, quit
 
 # One-shot listen
-irlink listen --block 45
+irlink listen --block 212
+
+# Adjust symbol speed (default 160ms, use --speed)
+irlink connect --block 212 --speed 200
 ```
 
 ### AE Freeze During Communication
@@ -282,14 +305,23 @@ The freeze is controlled via `/run/prudynt/ae_freeze` — irlink writes `1` befo
 
 ### ROI Calibration
 
-The 10x6 grid (60 blocks) finds the transmitter's IR LED spot:
+Two calibration methods:
+
+**On-camera (grid-based):** The 20x12 grid (240 blocks) finds the transmitter's block:
 ```bash
-# On cam2, while toggling cam1's LED:
-irlink calibrate
-# Output: block index with highest residual variance
+irlink calibrate    # toggle peer LED during 4s window
 ```
 
-Calibration still uses AE residual (block - mean) since AE is active. Once calibrated, communication uses raw block brightness with AE frozen.
+**Host-side (pixel-level, recommended for distance):** Frame differencing finds the exact TX pixel:
+```bash
+conda activate light
+python -m host.cal_procedure              # both directions, interactive
+python -m host.cal_procedure --no-interactive  # automated
+python -m host.cal_procedure --show        # show saved calibration
+```
+Saves results to `host/calibration.json`. The pixel RX loads calibration automatically.
+
+The host-side method gives +200 delta at 10-20 feet vs +10-15 with the grid method at the same distance.
 
 ### Boot Automation
 
@@ -310,6 +342,29 @@ BOARD=wyze_cam3_t31x_gc2053_atbm6031 make prudynt-t-rebuild
 scp -O .../per-package/prudynt-t/target/usr/bin/prudynt root@<cam>:/opt/bin/prudynt-patched
 # Restart prudynt on camera, then: ircut off; killall daynightd
 ```
+
+### Camera Setup Script
+
+Run before any calibration or communication to ensure cameras are in the correct state:
+```bash
+./host/cam_setup.sh                  # setup both cameras
+./host/cam_setup.sh da-camera1       # one camera only
+./host/cam_setup.sh --check          # verify only, don't fix
+```
+
+Checks and fixes: patched prudynt, night/monochrome mode, IR cut filter, daynightd killed, LEDs off, AE freeze idle, brightness grid active, irlink deployed. Uses Thingino web API (curl) for ISP controls, SSH for GPIO and process management. Sets ircut filter LAST because other commands re-close it.
+
+### Host-side Pixel Receiver
+
+For long-distance communication (10-20 feet) where the grid-based on-camera RX has insufficient signal:
+```bash
+conda activate light
+python -m host.cal_procedure --no-interactive  # calibrate first
+python -m host.pixel_rx --cam cam2             # auto-loads calibration
+python -m host.pixel_rx --cam cam2 --tx-pos 384,178  # manual position
+```
+
+Reads the RTSP stream directly and tracks a small pixel ROI (15x15) around the calibrated TX position. Gets delta +200 at 10-20 feet vs +10-15 with the grid.
 
 ### After Fresh Firmware Flash
 
@@ -332,11 +387,31 @@ pytest tests/ -v
 ## Usage
 
 ```bash
-# Send a message via IR (Phase 2, ~3 bps)
-python -m host.send_message "HELLO"
+# 1. Setup cameras (run after every reboot)
+./host/cam_setup.sh
 
-# Send via shell fallback (Phase 1, ~1 bps)
-python -m host.send_message --shell "HI"
+# 2. Calibrate (find TX pixel locations)
+conda activate light
+python -m host.cal_procedure --no-interactive
+
+# 3a. On-camera communication (short distance, ~3 bps)
+# On cam1: irlink listen --block 212
+# On cam2: irlink connect --block 113
+# On cam2: irlink send "HELLO" --block 113
+
+# 3b. Host-side pixel RX (long distance, ~3 bps)
+python -m host.pixel_rx --cam cam2    # listens using calibration
+# Then trigger TX from cam1: ssh da-camera1 "/opt/bin/irlink connect --block 212"
+
+# Legacy: send via Python host orchestration
+python -m host.send_message "HELLO"
+```
+
+### Calibration Viewer
+
+```bash
+cd photos && python -m http.server 8888
+# Open http://localhost:8888/calibration.html
 ```
 
 ## Key References

@@ -32,21 +32,25 @@
 
 /* ---- Configuration ---- */
 
-#define IR_GPIO             49
+#define IR_GPIO_940         49
+#define IR_GPIO_850         47
 #define BRIGHTNESS_PATH     "/run/prudynt/brightness"
 #define GRID_PATH           "/run/prudynt/brightness_grid"
 #define AE_FREEZE_PATH      "/run/prudynt/ae_freeze"
-#define SYMBOL_MS           333     /* symbol duration (3 bps) */
-#define SYMBOL_US           (SYMBOL_MS * 1000)
-#define POLL_INTERVAL_US    15000
+#define POLL_INTERVAL_US    5000
 #define MAX_SAMPLES         8192
 #define MAX_SYMBOLS         4096
 #define MAX_PAYLOAD         255
-#define SETTLE_MS           1500
+#define SETTLE_MS           400     /* quiet time to detect end of TX (longer = fewer false splits) */
 #define MIN_BRIGHTNESS_DELTA 5
-#define GRID_BLOCKS         60
-#define ACK_TIMEOUT_MS      180000  /* time to wait for ACK (includes peer TX + decode time) */
+#define GRID_BLOCKS         240     /* 20x12 grid (32x30 pixel blocks) */
 #define MAX_RETRIES         3
+
+/* Runtime-configurable speed */
+static int symbol_ms = 160;        /* default: 160ms/symbol (~3 bps after Manchester, ~3 frames/symbol at 18fps) */
+
+/* Computed from symbol_ms at startup */
+static int ack_timeout_ms = 60000; /* auto-scaled to 3x max frame round-trip */
 
 /* ---- Message types ---- */
 
@@ -135,9 +139,10 @@ static void set_ae_freeze(int freeze)
  *  GPIO TX
  * ================================================================ */
 
-static int gpio_fd = -1;
+static int gpio_fd_940 = -1;
+static int gpio_fd_850 = -1;
 
-static int gpio_init(int pin)
+static int gpio_open(int pin)
 {
     char path[64];
     FILE *fp;
@@ -158,22 +163,34 @@ static int gpio_init(int pin)
     fclose(fp);
 
     snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/value", pin);
-    gpio_fd = open(path, O_WRONLY);
-    if (gpio_fd < 0) {
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) {
         perror("gpio value");
         return -1;
     }
 
+    return fd;
+}
+
+static int gpio_init(int pin940, int pin850)
+{
+    gpio_fd_940 = gpio_open(pin940);
+    if (gpio_fd_940 < 0) return -1;
+    gpio_fd_850 = gpio_open(pin850);
+    if (gpio_fd_850 < 0)
+        fprintf(stderr, "GPIO: 850nm (pin %d) not available, using 940nm only\n", pin850);
     return 0;
 }
 
 static inline void gpio_set(int val)
 {
-    if (gpio_fd < 0) return;
-    if (val)
-        write(gpio_fd, "1", 1);
-    else
-        write(gpio_fd, "0", 1);
+    if (val) {
+        if (gpio_fd_940 >= 0) write(gpio_fd_940, "1", 1);
+        if (gpio_fd_850 >= 0) write(gpio_fd_850, "1", 1);
+    } else {
+        if (gpio_fd_940 >= 0) write(gpio_fd_940, "0", 1);
+        if (gpio_fd_850 >= 0) write(gpio_fd_850, "0", 1);
+    }
 }
 
 /* ---- Manchester encode data bits into symbols ---- */
@@ -256,23 +273,22 @@ static void transmit_symbols(const uint8_t *symbols, int n_sym)
 
     /* Quiet before */
     gpio_set(0);
-    usleep(SYMBOL_US * 2);
+    usleep((symbol_ms * 1000) * 2);
 
     for (int i = 0; i < n_sym; i++) {
         gpio_set(symbols[i]);
-        usleep(SYMBOL_US);
+        usleep((symbol_ms * 1000));
     }
 
     /* Trailer */
     gpio_set(0);
-    usleep(SYMBOL_US);
+    usleep((symbol_ms * 1000));
     gpio_set(1);
-    usleep(SYMBOL_US);
+    usleep((symbol_ms * 1000));
     gpio_set(0);
 
-    /* Inter-message gap: must exceed SETTLE_MS so peer's RX detects
-     * end of our transmission. With AE frozen, no settle needed. */
-    usleep((SETTLE_MS + 500) * 1000);
+    /* Inter-message gap: exceed SETTLE_MS so peer detects end of TX */
+    usleep((SETTLE_MS + 100) * 1000);
 
     tx_active = 0;
     pthread_mutex_unlock(&tx_mutex);
@@ -311,7 +327,7 @@ typedef struct {
 
 static int read_grid(int64_t *ts_ms, uint8_t *blocks, int max_blocks)
 {
-    char buf[512];
+    char buf[2048];
     int fd = open(GRID_PATH, O_RDONLY);
     if (fd < 0) return -1;
     int n = read(fd, buf, sizeof(buf) - 1);
@@ -453,8 +469,11 @@ static int decode_samples(sample_t *samp, int n, rx_message_t *msg)
 {
     if (n < 4) return -1;
 
+    /* Use sample[0] (synthetic baseline) as the "LED off" reference.
+     * bmin/bmax can be skewed by transient noise or AE settling. */
+    uint8_t baseline = samp[0].brightness;
     uint8_t bmin = 255, bmax = 0;
-    for (int i = 0; i < n; i++) {
+    for (int i = 1; i < n; i++) {
         if (samp[i].brightness < bmin) bmin = samp[i].brightness;
         if (samp[i].brightness > bmax) bmax = samp[i].brightness;
     }
@@ -462,10 +481,13 @@ static int decode_samples(sample_t *samp, int n, rx_message_t *msg)
     int delta = bmax - bmin;
     if (delta < MIN_BRIGHTNESS_DELTA) return -1;
 
-    uint8_t threshold = bmin + delta / 2;
+    /* Threshold = midpoint between baseline and peak, not bmin and bmax.
+     * This avoids transient dips pulling the threshold below baseline. */
+    uint8_t threshold = (baseline + bmax) / 2;
+    if (threshold <= baseline) threshold = baseline + delta / 4;
 
-    fprintf(stderr, "RX: %d samples, brightness %d-%d, delta %d\n",
-            n, bmin, bmax, delta);
+    fprintf(stderr, "RX: %d samples, brightness %d-%d, delta %d, threshold %d\n",
+            n, bmin, bmax, delta, threshold);
 
     /* Find TX start: first sample that crosses threshold.
      * Skip sample[0] which is a synthetic baseline placeholder. */
@@ -482,7 +504,7 @@ static int decode_samples(sample_t *samp, int n, rx_message_t *msg)
     if (tx_start < 0) return -1;
 
     /* Use half a symbol before the first real transition as t0 */
-    int64_t t0 = samp[tx_start].ts_ms - SYMBOL_MS / 2;
+    int64_t t0 = samp[tx_start].ts_ms - symbol_ms / 2;
 
     fprintf(stderr, "RX: tx_start=%d, t0=%lld, first_ts=%lld\n",
             tx_start, (long long)t0, (long long)samp[tx_start].ts_ms);
@@ -492,8 +514,8 @@ static int decode_samples(sample_t *samp, int n, rx_message_t *msg)
     int n_sym = 0;
 
     for (int sym = 0; sym < MAX_SYMBOLS; sym++) {
-        int64_t win_start = t0 + (int64_t)SYMBOL_MS * sym + SYMBOL_MS / 4;
-        int64_t win_end   = t0 + (int64_t)SYMBOL_MS * sym + SYMBOL_MS * 3 / 4;
+        int64_t win_start = t0 + (int64_t)symbol_ms * sym + symbol_ms / 4;
+        int64_t win_end   = t0 + (int64_t)symbol_ms * sym + symbol_ms * 3 / 4;
 
         int sum = 0, count = 0;
         for (int i = tx_start; i < n; i++) {
@@ -557,61 +579,115 @@ static int decode_samples(sample_t *samp, int n, rx_message_t *msg)
     return -1;
 }
 
-/* ---- Calibration ---- */
+/* ---- Calibration: AE freeze + raw delta (LED OFF vs LED ON) ---- */
 
 static int calibrate(void)
 {
-    fprintf(stderr, "CALIBRATE: reading grid for 5 seconds...\n");
-    fprintf(stderr, "CALIBRATE: toggle the transmitter LED during this time!\n");
+    fprintf(stderr, "CALIBRATE: freezing AE...\n");
+    set_ae_freeze(1);
+    usleep(500000); /* 500ms for AE to apply final update */
 
-    #define MAX_CAL_FRAMES 200
-    uint8_t frames[MAX_CAL_FRAMES][GRID_BLOCKS];
-    uint8_t means[MAX_CAL_FRAMES];
-    int n_frames = 0;
-
-    int64_t start = now_ms();
+    /* Step 1: Capture baseline grid (peer LED OFF) — average several frames */
+    fprintf(stderr, "CALIBRATE: capturing baseline (LED OFF)...\n");
+    int baseline[GRID_BLOCKS] = {0};
+    int n_baseline = 0;
     int64_t last_ts = 0;
+    int64_t start = now_ms();
 
-    while (now_ms() - start < 5000 && n_frames < MAX_CAL_FRAMES) {
+    while (now_ms() - start < 1000 && n_baseline < 30) {
         int64_t ts;
         uint8_t blocks[GRID_BLOCKS];
         int n = read_grid(&ts, blocks, GRID_BLOCKS);
         if (n > 0 && ts != last_ts) {
             last_ts = ts;
-            memcpy(frames[n_frames], blocks, GRID_BLOCKS);
-            int sum = 0;
-            for (int i = 0; i < n; i++) sum += blocks[i];
-            means[n_frames] = sum / n;
-            n_frames++;
+            for (int i = 0; i < GRID_BLOCKS; i++)
+                baseline[i] += blocks[i];
+            n_baseline++;
         }
         usleep(POLL_INTERVAL_US);
     }
 
-    fprintf(stderr, "CALIBRATE: %d frames\n", n_frames);
-    if (n_frames < 10) return -1;
+    if (n_baseline < 5) {
+        fprintf(stderr, "CALIBRATE: too few baseline frames (%d)\n", n_baseline);
+        set_ae_freeze(0);
+        return -1;
+    }
 
-    int best = -1, best_range = 0;
-    for (int b = 0; b < GRID_BLOCKS; b++) {
-        int rmin = 999, rmax = -999;
-        for (int f = 0; f < n_frames; f++) {
-            int residual = (int)frames[f][b] - (int)means[f];
-            if (residual < rmin) rmin = residual;
-            if (residual > rmax) rmax = residual;
+    for (int i = 0; i < GRID_BLOCKS; i++)
+        baseline[i] /= n_baseline;
+
+    fprintf(stderr, "CALIBRATE: got %d baseline frames\n", n_baseline);
+
+    /* Step 2: Wait for peer LED ON — capture grid for 4 seconds */
+    fprintf(stderr, "CALIBRATE: turn ON the peer's IR LED now! (4 second window)\n");
+
+    int led_on[GRID_BLOCKS] = {0};
+    int n_led = 0;
+    last_ts = 0;
+    start = now_ms();
+
+    while (now_ms() - start < 4000 && n_led < 120) {
+        int64_t ts;
+        uint8_t blocks[GRID_BLOCKS];
+        int n = read_grid(&ts, blocks, GRID_BLOCKS);
+        if (n > 0 && ts != last_ts) {
+            last_ts = ts;
+            for (int i = 0; i < GRID_BLOCKS; i++)
+                led_on[i] += blocks[i];
+            n_led++;
         }
-        int range = rmax - rmin;
-        if (range > best_range) {
-            best_range = range;
+        usleep(POLL_INTERVAL_US);
+    }
+
+    if (n_led < 5) {
+        fprintf(stderr, "CALIBRATE: too few LED-ON frames (%d)\n", n_led);
+        set_ae_freeze(0);
+        return -1;
+    }
+
+    for (int i = 0; i < GRID_BLOCKS; i++)
+        led_on[i] /= n_led;
+
+    fprintf(stderr, "CALIBRATE: got %d LED-ON frames\n", n_led);
+
+    /* Step 3: Find block with biggest positive delta (LED ON - LED OFF) */
+    int best = -1, best_delta = 0;
+    int deltas[GRID_BLOCKS];
+
+    for (int b = 0; b < GRID_BLOCKS; b++) {
+        deltas[b] = led_on[b] - baseline[b];
+        if (deltas[b] > best_delta) {
+            best_delta = deltas[b];
             best = b;
         }
     }
 
-    if (best < 0 || best_range < 3) {
-        fprintf(stderr, "CALIBRATE: no IR block detected (range=%d)\n", best_range);
+    set_ae_freeze(0);
+
+    if (best < 0 || best_delta < 3) {
+        fprintf(stderr, "CALIBRATE: no IR block detected (max delta=%d)\n", best_delta);
         return -1;
     }
 
-    fprintf(stderr, "CALIBRATE: block=%d (row=%d, col=%d), range=%d\n",
-            best, best / 10, best % 10, best_range);
+    fprintf(stderr, "CALIBRATE: block=%d (row=%d, col=%d), delta=%d (OFF=%d, ON=%d)\n",
+            best, best / 20, best % 20, best_delta, baseline[best], led_on[best]);
+
+    /* Print delta grid */
+    fprintf(stderr, "CALIBRATE: delta grid (20x12):\n");
+    for (int r = 0; r < 12; r++) {
+        fprintf(stderr, "  ");
+        for (int c = 0; c < 20; c++) {
+            int idx = r * 20 + c;
+            if (idx >= GRID_BLOCKS) break;
+            if (idx == best)
+                fprintf(stderr, "[%3d]", deltas[idx]);
+            else
+                fprintf(stderr, " %3d ", deltas[idx]);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    printf("%d\n", best);
     return best;
 }
 
@@ -676,7 +752,7 @@ static void *rx_thread(void *arg)
         last_ts = ts_ms;
 
         /* After TX ends, briefly update baseline (AE is frozen, so fast) */
-        if (tx_end_time > 0 && now_ms() - tx_end_time < 100) {
+        if (tx_end_time > 0 && now_ms() - tx_end_time < 500) {
             baseline = brightness;
             baseline_set = 1;
             last_change_ms = now_ms();
@@ -708,12 +784,12 @@ static void *rx_thread(void *arg)
         case IDLE:
             if (diff >= MIN_BRIGHTNESS_DELTA) {
                 active_count++;
-                if (active_count >= 3) {  /* require 3 consecutive frames (~100ms) */
+                if (active_count >= 2) {  /* require 2 consecutive frames (AE frozen = clean signal) */
                     fprintf(stderr, "RX: activity detected (baseline=%d, now=%d, delta=%d)\n",
                             baseline, brightness, diff);
                     state = ACTIVE;
                     n_samples = 0;
-                    samples[n_samples].ts_ms = ts_ms - SYMBOL_MS;
+                    samples[n_samples].ts_ms = ts_ms - symbol_ms;
                     samples[n_samples].brightness = baseline;
                     n_samples++;
                 }
@@ -730,7 +806,9 @@ static void *rx_thread(void *arg)
                 n_samples++;
             }
 
-            if (diff >= MIN_BRIGHTNESS_DELTA)
+            /* Use higher threshold to keep settle timer running —
+             * only reset on strong signal, not baseline drift */
+            if (diff >= MIN_BRIGHTNESS_DELTA * 2)
                 last_change_ms = now_ms();
 
             if (now_ms() - last_change_ms > SETTLE_MS) {
@@ -860,7 +938,7 @@ static int do_connect(void)
 
         fprintf(stderr, "PROTO: waiting for SYN_ACK...\n");
         rx_message_t reply;
-        if (wait_for_msg(MSG_SYN_ACK, &reply, ACK_TIMEOUT_MS) == 0) {
+        if (wait_for_msg(MSG_SYN_ACK, &reply, ack_timeout_ms) == 0) {
             fprintf(stderr, "PROTO: got SYN_ACK! Sending ACK...\n");
             send_message(MSG_ACK, 0, NULL, 0);
             fprintf(stderr, "PROTO: connected!\n");
@@ -889,7 +967,7 @@ static int do_listen(void)
 
             fprintf(stderr, "PROTO: waiting for ACK...\n");
             rx_message_t ack;
-            if (wait_for_msg(MSG_ACK, &ack, ACK_TIMEOUT_MS) == 0) {
+            if (wait_for_msg(MSG_ACK, &ack, ack_timeout_ms) == 0) {
                 fprintf(stderr, "PROTO: connected!\n");
                 return 0;
             }
@@ -916,7 +994,7 @@ static int do_send(const char *text)
 
         fprintf(stderr, "PROTO: waiting for ACK seq=%d...\n", seq);
         rx_message_t reply;
-        if (wait_for_msg(MSG_ACK, &reply, ACK_TIMEOUT_MS) == 0) {
+        if (wait_for_msg(MSG_ACK, &reply, ack_timeout_ms) == 0) {
             if (reply.seq == seq) {
                 fprintf(stderr, "PROTO: ACK received for seq=%d\n", seq);
                 seq++;
@@ -946,7 +1024,7 @@ static int do_cal_request(void)
         send_message(MSG_CAL_REQ, 0, NULL, 0);
 
         rx_message_t reply;
-        if (wait_for_msg(MSG_CAL_ACK, &reply, ACK_TIMEOUT_MS) == 0) {
+        if (wait_for_msg(MSG_CAL_ACK, &reply, ack_timeout_ms) == 0) {
             fprintf(stderr, "PROTO: peer acknowledged, scanning...\n");
             /* Peer is now holding LED ON — run calibration */
             int block = calibrate();
@@ -1042,7 +1120,7 @@ static int interactive_mode(int is_listener)
             int64_t t0 = now_ms();
             send_message(MSG_PING, 0, NULL, 0);
             rx_message_t reply;
-            if (wait_for_msg(MSG_PONG, &reply, ACK_TIMEOUT_MS) == 0) {
+            if (wait_for_msg(MSG_PONG, &reply, ack_timeout_ms) == 0) {
                 int64_t rtt = now_ms() - t0;
                 fprintf(stderr, "PING: pong received, RTT=%lld ms\n", (long long)rtt);
                 printf("PONG: RTT=%lld ms\n", (long long)rtt);
@@ -1158,28 +1236,44 @@ int main(int argc, char *argv[])
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <command> [options]\n", argv[0]);
         fprintf(stderr, "Commands:\n");
-        fprintf(stderr, "  listen [--block N]     — wait for connection\n");
-        fprintf(stderr, "  connect [--block N]    — initiate connection\n");
-        fprintf(stderr, "  daemon-listen [--block N] — listen + auto-respond\n");
-        fprintf(stderr, "  daemon-connect [--block N] — connect + auto-respond\n");
-        fprintf(stderr, "  send <text> [--block N]  — connect, send, exit\n");
+        fprintf(stderr, "  listen [--block N] [--speed MS]     — wait for connection\n");
+        fprintf(stderr, "  connect [--block N] [--speed MS]    — initiate connection\n");
+        fprintf(stderr, "  daemon-listen [--block N] [--speed MS] — listen + auto-respond\n");
+        fprintf(stderr, "  daemon-connect [--block N] [--speed MS] — connect + auto-respond\n");
+        fprintf(stderr, "  send <text> [--block N] [--speed MS]  — connect, send, exit\n");
         fprintf(stderr, "  calibrate              — manual ROI calibration\n");
+        fprintf(stderr, "\nOptions:\n");
+        fprintf(stderr, "  --block N    track grid block N (0-59) for ROI\n");
+        fprintf(stderr, "  --speed MS   symbol duration in ms (default 333, min 40)\n");
         return 1;
     }
 
-    /* Parse --block from any position */
+    /* Parse --block and --speed from any position */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--block") == 0 && i + 1 < argc) {
             tracked_block = atoi(argv[i + 1]);
             fprintf(stderr, "irlink: tracking block %d\n", tracked_block);
+        } else if (strcmp(argv[i], "--speed") == 0 && i + 1 < argc) {
+            symbol_ms = atoi(argv[i + 1]);
+            if (symbol_ms < 40 || symbol_ms > 2000) {
+                fprintf(stderr, "irlink: --speed must be 40-2000 ms\n");
+                return 1;
+            }
+            fprintf(stderr, "irlink: symbol speed %d ms\n", symbol_ms);
         }
     }
+
+    /* Scale ACK timeout to symbol speed: 3x max frame round-trip
+     * Max frame = ~140 symbols (DATA with short payload).
+     * Round-trip = 2 * (frame TX + gap + settle + decode) */
+    ack_timeout_ms = 140 * symbol_ms * 4 + 10000;
+    fprintf(stderr, "irlink: ack timeout %d ms\n", ack_timeout_ms);
 
     signal(SIGINT, sighandler);
     signal(SIGTERM, sighandler);
 
     /* Init GPIO */
-    if (gpio_init(IR_GPIO) < 0) {
+    if (gpio_init(IR_GPIO_940, IR_GPIO_850) < 0) {
         fprintf(stderr, "irlink: GPIO init failed (are you root?)\n");
         return 1;
     }
@@ -1201,7 +1295,7 @@ int main(int argc, char *argv[])
 
     if (strcmp(cmd, "listen") == 0) {
         set_ae_freeze(1);
-        usleep(200000); /* 200ms for last AE update to apply */
+        usleep(1000000); /* 1s for AE to apply final update and settle */
         int ret = interactive_mode(1);
         set_ae_freeze(0);
         return ret;
@@ -1209,7 +1303,7 @@ int main(int argc, char *argv[])
 
     if (strcmp(cmd, "connect") == 0) {
         set_ae_freeze(1);
-        usleep(200000);
+        usleep(1000000); /* 1s AE settle */
         int ret = interactive_mode(0);
         set_ae_freeze(0);
         return ret;
@@ -1217,7 +1311,7 @@ int main(int argc, char *argv[])
 
     if (strcmp(cmd, "daemon-listen") == 0) {
         set_ae_freeze(1);
-        usleep(200000);
+        usleep(1000000); /* 1s AE settle */
         int ret = daemon_mode(1);
         set_ae_freeze(0);
         return ret;
@@ -1225,7 +1319,7 @@ int main(int argc, char *argv[])
 
     if (strcmp(cmd, "daemon-connect") == 0) {
         set_ae_freeze(1);
-        usleep(200000);
+        usleep(1000000); /* 1s AE settle */
         int ret = daemon_mode(0);
         set_ae_freeze(0);
         return ret;
@@ -1236,10 +1330,11 @@ int main(int argc, char *argv[])
             fprintf(stderr, "Usage: irlink send <text> [--block N]\n");
             return 1;
         }
-        /* Find the text argument (skip --block N) */
+        /* Find the text argument (skip --block N and --speed N) */
         const char *text = NULL;
         for (int i = 2; i < argc; i++) {
-            if (strcmp(argv[i], "--block") == 0) {
+            if ((strcmp(argv[i], "--block") == 0 || strcmp(argv[i], "--speed") == 0)
+                && i + 1 < argc) {
                 i++; /* skip value */
                 continue;
             }
@@ -1252,7 +1347,7 @@ int main(int argc, char *argv[])
         }
 
         set_ae_freeze(1);
-        usleep(200000);
+        usleep(1000000); /* 1s AE settle */
 
         /* Start RX, connect, send, done */
         pthread_t rx_tid;

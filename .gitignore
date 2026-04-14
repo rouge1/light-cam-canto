@@ -31,6 +31,7 @@ rx_debug.*
 # Cross-compiled MIPS binaries
 transmitter/tx_pwm
 transmitter/test_luma
+receiver/irlink_rx
 
 # Thingino firmware build tree (large, has its own repo)
 thingino-firmware/

@@ -14,9 +14,9 @@ An experimental system that turns Wyze V3 security cameras into IR Li-Fi transce
 ```
 
 1. **Transmitter**: C binary on camera toggles 940nm IR LEDs via sysfs GPIO with precise timing
-2. **Receiver**: Captures RTSP video frames, measures brightness, decodes Manchester-encoded symbols
+2. **Receiver**: On-camera C binary reads brightness from patched prudynt-t, decodes Manchester symbols using ROI tracking with AE residual cancellation
 3. **Protocol**: Manchester encoding (self-clocking) + CRC-8 checksums + frame sync
-4. **Host PC**: Orchestrates TX/RX, runs decoder, reports results
+4. **Host PC**: Orchestrates TX/RX, can also run host-side RTSP decoder
 
 ## Current Status
 
@@ -26,6 +26,7 @@ An experimental system that turns Wyze V3 security cameras into IR Li-Fi transce
 | Phase 1 (shell-based OOK) | ~1 bps | Done |
 | Phase 2 (C GPIO transmitter) | ~3 bps | Done |
 | On-camera brightness monitor | N/A | Working (prudynt-t patch) |
+| On-camera receiver (irlink_rx) | ~3 bps | Working (ROI + AE residual) |
 | Duplex protocol (ACK/retransmit) | TBD | In progress |
 
 ## Requirements
@@ -68,7 +69,7 @@ pytest tests/ -v
 ```
 protocol/      — Manchester encoding, CRC-8, frame encode/decode
 transmitter/   — TX: shell scripts (Phase 1), C GPIO binary (Phase 2)
-receiver/      — RX: RTSP brightness capture + dual-strategy decoder
+receiver/      — RX: on-camera decoder (irlink_rx.c) + host-side RTSP decoder
 host/          — SSH orchestration, config, end-to-end CLI
 tests/         — 26 pytest tests (protocol layer)
 ```

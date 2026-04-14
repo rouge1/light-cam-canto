@@ -21,7 +21,16 @@ This project builds **custom firmware** on top of Thingino (https://github.com/t
 ### Custom Firmware Changes
 
 - **USB CDC-NCM networking** — added `BR2_PACKAGE_USBNET=y` and `BR2_PACKAGE_USBNET_USB_DIRECT_NCM=y` to defconfig (requires USB data cable, not yet tested)
-- **BrightnessMonitor** — patched prudynt-t to expose per-frame brightness via `/run/prudynt/brightness` using `IMP_FrameSource_SnapFrame` API
+- **BrightnessMonitor** — patched prudynt-t to expose per-frame brightness via `/run/prudynt/brightness` and per-block grid via `/run/prudynt/brightness_grid` using `IMP_FrameSource_SnapFrame` API
+
+### BrightnessMonitor Output Files
+
+| File | Format | Purpose |
+|------|--------|---------|
+| `/run/prudynt/brightness` | `<timestamp_ms> <mean> <max_block>` | Whole-frame brightness (fast reads) |
+| `/run/prudynt/brightness_grid` | `<timestamp_ms> <b0> <b1> ... <b59>` | 10x6 block grid (ROI detection) |
+
+The grid divides the 640x360 frame into 60 blocks (64x60 pixels each). The `irlink_rx` receiver uses the grid to find and track the specific block containing the transmitter's IR LEDs, enabling AE-resilient decoding.
 
 ### Why Thingino
 
@@ -90,6 +99,7 @@ Self-clocking — the receiver can never lose sync.
 | Phase 1 | Shell `gpio set` + `usleep` | ~1 bps | Done, reliable |
 | Phase 2 | C binary, sysfs GPIO | ~3 bps | Done, reliable |
 | Phase 2+ | Hardware PWM ioctls | TBD | PWM_ENABLE fails — needs investigation |
+| On-camera RX | irlink_rx + BrightnessMonitor | ~3 bps | Working (ROI + AE residual) |
 
 ## Project Structure
 
@@ -100,7 +110,10 @@ transmitter/       — TX code: shell scripts, C GPIO binary, Makefile
   tx_pwm.py        — Phase 2: Python wrapper for C transmitter
   tx_pwm.c         — Phase 2: C binary using sysfs GPIO, cross-compiled for MIPS
   Makefile         — Cross-compilation via Thingino toolchain
-receiver/          — RX code: RTSP brightness capture + dual-strategy decoder
+receiver/          — RX code: on-camera decoder + host-side RTSP decoder
+  irlink_rx.c      — On-camera Manchester decoder with ROI tracking (C, MIPS)
+  rx_stream.py     — Host-side RTSP brightness capture + dual-strategy decoder
+  Makefile         — Cross-compilation for irlink_rx
 host/              — Host-side orchestration: SSH, config, end-to-end CLI
   config.py        — Camera IPs, GPIO pins, timing constants
   ssh.py           — SSH/SCP wrappers (uses `scp -O` for Thingino compatibility)
@@ -197,6 +210,67 @@ BOARD=wyze_cam3_t31x_gc2053_atbm6031 make prudynt-t-rebuild
 - **Prudynt-t BrightnessMonitor uses SnapFrame API**. `IMP_FrameSource_SnapFrame` grabs a single NV12 frame from an already-running channel without needing IVS binding. Works alongside prudynt-t's encoder pipeline.
 - **Buildroot wipes source on rebuild**. Patches to `dl/prudynt-t/git/src/` are NOT used during build. You must also copy changes to `output/stable/.../build/prudynt-t-<hash>/src/`. Use Buildroot's patch system for permanent changes.
 - **Frame rate is the receiver bottleneck**. At 15fps RTSP, each symbol needs ~3+ frames for reliable detection. Maximum practical bps = fps / (2 * samples_per_symbol) ≈ 3-5 bps via RTSP.
+- **OTA sysupgrade can corrupt kernel module state**. The `-update.bin` may not fully update the kernel, leaving `sensor_gc2053_t31.ko` with unresolved symbols. Use full SD card flash (`autoupdate-full.bin`) for reliable firmware updates.
+- **Both cameras must run the same firmware version**. A patched prudynt built against one firmware version will crash on another — config parsing produces garbage values (e.g., `1952542720` for `mic_sample_rate`), encoder initialization fails, and SnapFrame returns -1.
+- **Stock prudynt must be stopped via init script, not kill**. Use `/etc/init.d/S31prudynt stop` to cleanly shut down. Direct `kill` or `killall` can leave the IMP SDK in a bad state (zombie process, locked ISP device). If the IMP state is stuck, reboot.
+- **IR cut filter resets on prudynt restart too**. Not just on boot — restarting prudynt (even the patched version) triggers `daynightd` to re-evaluate and close the filter. Always run `ircut off; killall daynightd` after starting prudynt.
+- **`/opt` may not auto-mount after fresh flash**. The JFFS2 partition at `/dev/mtdblock5` needs `mount -t jffs2 /dev/mtdblock5 /opt`. Check with `mount | grep opt`.
+- **AE over-compensates for IR LEDs**. When the IR LED turns ON, the ISP reduces exposure, making the whole-frame MEAN brightness DROP (inverted from expected). The IR block gets brighter, but everything else gets darker. Use residual-based detection (block - mean) to cancel AE, not absolute brightness.
+- **Whole-frame mean is useless for ROI detection**. At 2-3 feet, the IR LEDs occupy ~1 grid block out of 60. The mean brightness delta is ~1-3 units (noise level), but the specific block delta is 30-100+ units. Always calibrate and track the specific block.
+- **Cameras too close (<6 inches) gives poor signal**. The IR LEDs flood the entire sensor when very close, and the image is out of focus (min focus ~50cm). Best results at 2-3 feet where the LEDs form a focused spot.
+
+## On-Camera Receiver (irlink_rx)
+
+The `irlink_rx` binary runs on-camera and decodes Manchester-encoded IR transmissions without a host PC. It reads brightness data from the BrightnessMonitor patch in prudynt-t.
+
+### ROI Calibration
+
+The receiver uses a spatial grid to find the transmitter's IR LED spot. This is critical because:
+- Whole-frame mean brightness has tiny delta (~1-3) due to AE compensation
+- The specific block containing the IR LEDs has delta of 30-100+
+- AE residual cancellation (block - mean + 128) gives 100x SNR improvement
+
+```bash
+# Calibrate: toggle the other camera's LED during the 5-second window
+irlink_rx --calibrate
+# Output: block index (e.g., 34) and residual range grid
+
+# Receive with tracked block
+irlink_rx 333 --block 34
+```
+
+### AE Residual Cancellation
+
+When IR LEDs turn ON, the ISP auto-exposure darkens the entire frame. The residual approach cancels this:
+- `residual = block_brightness - frame_mean + 128`
+- AE changes shift both block and mean equally, so they cancel
+- Only the IR LED contribution remains in the residual
+
+### Deploying Patched Prudynt
+
+Both cameras must run the patched prudynt-t for on-camera RX:
+
+```bash
+# Stop stock prudynt cleanly (must use init script, not kill)
+/etc/init.d/S31prudynt stop
+sleep 1
+rm -f /run/prudynt/prudynt.lock
+/opt/bin/prudynt-patched &
+
+# Open IR filter (resets on every boot AND prudynt restart)
+ircut off
+killall daynightd
+```
+
+### After Fresh Firmware Flash
+
+The `/opt` JFFS2 partition may not auto-mount after a fresh SD card flash:
+
+```bash
+mount -t jffs2 /dev/mtdblock5 /opt
+mkdir -p /opt/bin
+# Then SCP binaries to /opt/bin/
+```
 
 ## Running Tests
 

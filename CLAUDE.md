@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-IR light communication system between Wyze V3 cameras using their built-in IR illuminators. Cameras transmit data by modulating IR LEDs and receive by analyzing video frames for brightness changes. The project builds custom firmware on top of Thingino to enable on-camera TX/RX for a full-duplex reliable link.
+IR light communication system between Wyze V3 cameras using their built-in IR illuminators. Cameras transmit data by modulating IR LEDs and receive by analyzing video frames for brightness changes. The project builds custom firmware on top of Thingino to enable on-camera TX/RX for a half-duplex reliable link with TCP-like protocol (SYN/ACK handshake, retransmit).
 
 ## Tech Stack
 
@@ -22,6 +22,7 @@ This project builds **custom firmware** on top of Thingino (https://github.com/t
 
 - **USB CDC-NCM networking** — added `BR2_PACKAGE_USBNET=y` and `BR2_PACKAGE_USBNET_USB_DIRECT_NCM=y` to defconfig (requires USB data cable, not yet tested)
 - **BrightnessMonitor** — patched prudynt-t to expose per-frame brightness via `/run/prudynt/brightness` and per-block grid via `/run/prudynt/brightness_grid` using `IMP_FrameSource_SnapFrame` API
+- **AE Freeze control** — BrightnessMonitor reads `/run/prudynt/ae_freeze` and calls `IMP_ISP_Tuning_SetAeFreeze` to lock/unlock auto-exposure. Written by irlink during communication.
 
 ### BrightnessMonitor Output Files
 
@@ -29,6 +30,7 @@ This project builds **custom firmware** on top of Thingino (https://github.com/t
 |------|--------|---------|
 | `/run/prudynt/brightness` | `<timestamp_ms> <mean> <max_block>` | Whole-frame brightness (fast reads) |
 | `/run/prudynt/brightness_grid` | `<timestamp_ms> <b0> <b1> ... <b59>` | 10x6 block grid (ROI detection) |
+| `/run/prudynt/ae_freeze` | `0` or `1` | Write `1` to freeze AE, `0` to unfreeze |
 
 The grid divides the 640x360 frame into 60 blocks (64x60 pixels each). The `irlink_rx` receiver uses the grid to find and track the specific block containing the transmitter's IR LEDs, enabling AE-resilient decoding.
 
@@ -100,18 +102,20 @@ Self-clocking — the receiver can never lose sync.
 | Phase 2 | C binary, sysfs GPIO | ~3 bps | Done, reliable |
 | Phase 2+ | Hardware PWM ioctls | TBD | PWM_ENABLE fails — needs investigation |
 | On-camera RX | irlink_rx + BrightnessMonitor | ~3 bps | Working (ROI + AE residual) |
+| Half-duplex link | irlink (TX+RX+protocol) | ~3 bps | Working (AE freeze + raw block) |
 
 ## Project Structure
 
 ```
+irlink/            — Combined half-duplex transceiver with protocol layer
+  irlink.c         — TX+RX threads, SYN/ACK/DATA/PING/CAL protocol (C, MIPS)
+  Makefile         — Cross-compilation, deploy to both cameras
 protocol/          — Manchester encoding, CRC-8, frame encode/decode (pure Python)
 transmitter/       — TX code: shell scripts, C GPIO binary, Makefile
-  tx_shell.py      — Phase 1: generates shell toggle scripts
-  tx_pwm.py        — Phase 2: Python wrapper for C transmitter
   tx_pwm.c         — Phase 2: C binary using sysfs GPIO, cross-compiled for MIPS
   Makefile         — Cross-compilation via Thingino toolchain
-receiver/          — RX code: on-camera decoder + host-side RTSP decoder
-  irlink_rx.c      — On-camera Manchester decoder with ROI tracking (C, MIPS)
+receiver/          — RX code: standalone on-camera decoder + host-side RTSP decoder
+  irlink_rx.c      — Standalone Manchester decoder with ROI tracking (C, MIPS)
   rx_stream.py     — Host-side RTSP brightness capture + dual-strategy decoder
   Makefile         — Cross-compilation for irlink_rx
 host/              — Host-side orchestration: SSH, config, end-to-end CLI
@@ -218,48 +222,93 @@ BOARD=wyze_cam3_t31x_gc2053_atbm6031 make prudynt-t-rebuild
 - **AE over-compensates for IR LEDs**. When the IR LED turns ON, the ISP reduces exposure, making the whole-frame MEAN brightness DROP (inverted from expected). The IR block gets brighter, but everything else gets darker. Use residual-based detection (block - mean) to cancel AE, not absolute brightness.
 - **Whole-frame mean is useless for ROI detection**. At 2-3 feet, the IR LEDs occupy ~1 grid block out of 60. The mean brightness delta is ~1-3 units (noise level), but the specific block delta is 30-100+ units. Always calibrate and track the specific block.
 - **Cameras too close (<6 inches) gives poor signal**. The IR LEDs flood the entire sensor when very close, and the image is out of focus (min focus ~50cm). Best results at 2-3 feet where the LEDs form a focused spot.
+- **AE freeze is required for half-duplex protocol**. Without AE freeze, the camera's own LED reflections cause massive AE swings that take 3-5 seconds to settle after TX ends. With `IMP_ISP_Tuning_SetAeFreeze(ENABLE)`, exposure locks and raw block brightness changes are instantaneous and predictable. Freeze AE before comms, unfreeze after.
+- **Self-reflection dominates raw brightness**. When a camera toggles its own IR LED, reflections off walls/ceiling cause block 45 to change by 8-10 units (vs 23-45 from the peer). With AE frozen, these reflections are small and consistent — not a problem. With AE active, the reflections trigger AE compensation that ruins subsequent reception.
+- **Consecutive-frame filter prevents false activity detection**. Single-frame brightness spikes (from self-reflection or noise) trigger false IDLE→ACTIVE transitions. Requiring 3 consecutive frames above threshold eliminates these.
+- **Inter-message gap must exceed SETTLE_MS**. Back-to-back transmissions (ACK immediately followed by DATA) merge into one continuous activity period for the receiver. The gap between messages must be at least SETTLE_MS (1500ms) + margin so the receiver detects "end of TX" and decodes each message separately.
+- **RX thread stack overflow on MIPS/musl**. The default pthread stack (~128KB on musl) overflows with large local arrays. `sample_t samples[8192]` (~128KB) must be declared static, not stack-local.
+- **Boot automation via `/etc/rc.local`**. Both cameras have rc.local that auto-mounts /opt, swaps to patched prudynt, opens IR filter, and kills daynightd. Runs via `S94rc.local` at end of boot sequence.
 
-## On-Camera Receiver (irlink_rx)
+## On-Camera Transceiver (irlink)
 
-The `irlink_rx` binary runs on-camera and decodes Manchester-encoded IR transmissions without a host PC. It reads brightness data from the BrightnessMonitor patch in prudynt-t.
+The `irlink` binary is the combined half-duplex transceiver with a TCP-like protocol layer. It runs on-camera, reading brightness from BrightnessMonitor and toggling the IR LED via sysfs GPIO.
 
-### ROI Calibration
+### Protocol Message Types
 
-The receiver uses a spatial grid to find the transmitter's IR LED spot. This is critical because:
-- Whole-frame mean brightness has tiny delta (~1-3) due to AE compensation
-- The specific block containing the IR LEDs has delta of 30-100+
-- AE residual cancellation (block - mean + 128) gives 100x SNR improvement
+| Type | Code | Purpose |
+|------|------|---------|
+| SYN | 0x01 | Initiate connection |
+| SYN_ACK | 0x02 | Acknowledge connection |
+| ACK | 0x03 | Acknowledge data (with seq number) |
+| DATA | 0x04 | Payload data |
+| CAL_REQ | 0x05 | Request calibration |
+| CAL_ACK | 0x06 | Acknowledge calibration |
+| CAL_DONE | 0x07 | Calibration complete |
+| PING | 0x08 | Measure RTT |
+| PONG | 0x09 | Ping response |
+
+Frame payload format: `[msg_type] [seq_num] [data...]`
+
+### Usage
 
 ```bash
 # Calibrate: toggle the other camera's LED during the 5-second window
-irlink_rx --calibrate
-# Output: block index (e.g., 34) and residual range grid
+irlink calibrate
+# Output: block index (e.g., 45)
 
-# Receive with tracked block
-irlink_rx 333 --block 34
+# Listen for incoming connection (daemon mode, auto-responds)
+irlink daemon-listen --block 45
+
+# Connect and send a message
+irlink send "HELLO" --block 45
+
+# Interactive mode (type commands after handshake)
+irlink connect --block 45
+# Then: send <text>, ping, cal, quit
+
+# One-shot listen
+irlink listen --block 45
 ```
 
-### AE Residual Cancellation
+### AE Freeze During Communication
 
-When IR LEDs turn ON, the ISP auto-exposure darkens the entire frame. The residual approach cancels this:
-- `residual = block_brightness - frame_mean + 128`
-- AE changes shift both block and mean equally, so they cancel
-- Only the IR LED contribution remains in the residual
+irlink freezes auto-exposure before any protocol exchange and unfreezes after. This is critical because:
+- The camera's own LED reflections cause massive AE swings (3-5s settle time)
+- With AE frozen, raw block brightness is stable and predictable
+- The peer's IR LED causes a clean delta (23-45 units) on the tracked block
+- Between communications, AE runs normally to adapt to ambient light
 
-### Deploying Patched Prudynt
+The freeze is controlled via `/run/prudynt/ae_freeze` — irlink writes `1` before starting, `0` when done. BrightnessMonitor in prudynt calls `IMP_ISP_Tuning_SetAeFreeze()`.
 
-Both cameras must run the patched prudynt-t for on-camera RX:
+### ROI Calibration
+
+The 10x6 grid (60 blocks) finds the transmitter's IR LED spot:
+```bash
+# On cam2, while toggling cam1's LED:
+irlink calibrate
+# Output: block index with highest residual variance
+```
+
+Calibration still uses AE residual (block - mean) since AE is active. Once calibrated, communication uses raw block brightness with AE frozen.
+
+### Boot Automation
+
+Both cameras run `/etc/rc.local` at boot (via `S94rc.local`):
+1. Mounts `/opt` JFFS2 partition if not mounted
+2. Stops stock prudynt, starts patched version
+3. Opens IR cut filter, kills daynightd
+
+### Deploying
 
 ```bash
-# Stop stock prudynt cleanly (must use init script, not kill)
-/etc/init.d/S31prudynt stop
-sleep 1
-rm -f /run/prudynt/prudynt.lock
-/opt/bin/prudynt-patched &
+# Build and deploy irlink to both cameras
+cd irlink && make deploy
 
-# Open IR filter (resets on every boot AND prudynt restart)
-ircut off
-killall daynightd
+# Rebuild and deploy patched prudynt (with AE freeze + BrightnessMonitor)
+cd thingino-firmware
+BOARD=wyze_cam3_t31x_gc2053_atbm6031 make prudynt-t-rebuild
+scp -O .../per-package/prudynt-t/target/usr/bin/prudynt root@<cam>:/opt/bin/prudynt-patched
+# Restart prudynt on camera, then: ircut off; killall daynightd
 ```
 
 ### After Fresh Firmware Flash

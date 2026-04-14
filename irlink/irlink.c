@@ -1,0 +1,1273 @@
+/*
+ * irlink — Full-duplex IR link transceiver for Wyze V3 cameras.
+ *
+ * Combined TX + RX with protocol layer supporting:
+ * - SYN/SYN_ACK/ACK handshake (TCP-like connection setup)
+ * - DATA with ACK/retransmit
+ * - CAL_REQ/CAL_ACK/CAL_DONE for over-the-link ROI calibration
+ *
+ * TX: toggles 940nm IR LEDs via sysfs GPIO
+ * RX: reads brightness grid from patched prudynt-t BrightnessMonitor
+ *
+ * Protocol frame payload: [msg_type] [seq_num] [data...]
+ * Wrapped in Manchester-encoded frame: preamble + sync + len + payload + CRC-8 + postamble
+ *
+ * Usage:
+ *   irlink listen              — wait for incoming connection
+ *   irlink connect             — initiate connection to peer
+ *   irlink send <message>      — send data (after connected)
+ *   irlink calibrate           — calibrate ROI block
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
+#include <signal.h>
+#include <pthread.h>
+#include <errno.h>
+
+/* ---- Configuration ---- */
+
+#define IR_GPIO             49
+#define BRIGHTNESS_PATH     "/run/prudynt/brightness"
+#define GRID_PATH           "/run/prudynt/brightness_grid"
+#define AE_FREEZE_PATH      "/run/prudynt/ae_freeze"
+#define SYMBOL_MS           333     /* symbol duration (3 bps) */
+#define SYMBOL_US           (SYMBOL_MS * 1000)
+#define POLL_INTERVAL_US    15000
+#define MAX_SAMPLES         8192
+#define MAX_SYMBOLS         4096
+#define MAX_PAYLOAD         255
+#define SETTLE_MS           1500
+#define MIN_BRIGHTNESS_DELTA 5
+#define GRID_BLOCKS         60
+#define ACK_TIMEOUT_MS      180000  /* time to wait for ACK (includes peer TX + decode time) */
+#define MAX_RETRIES         3
+
+/* ---- Message types ---- */
+
+#define MSG_SYN         0x01
+#define MSG_SYN_ACK     0x02
+#define MSG_ACK         0x03
+#define MSG_DATA        0x04
+#define MSG_CAL_REQ     0x05
+#define MSG_CAL_ACK     0x06
+#define MSG_CAL_DONE    0x07
+#define MSG_PING        0x08
+#define MSG_PONG        0x09
+
+/* ---- Sync word ---- */
+
+static const uint8_t SYNC_WORD[] = {1,1,0,0,1,0,1,1};
+#define SYNC_LEN 8
+
+/* ---- Globals ---- */
+
+static volatile int running = 1;
+static volatile int tx_active = 0;  /* suppress RX during TX */
+static int tracked_block = -1;
+static pthread_mutex_t tx_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* RX callback: called when a complete message is decoded */
+typedef struct {
+    uint8_t msg_type;
+    uint8_t seq;
+    uint8_t data[MAX_PAYLOAD];
+    int data_len;
+    int valid;  /* set to 1 when a new message is ready */
+} rx_message_t;
+
+static rx_message_t rx_msg;
+static pthread_mutex_t rx_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t rx_cond = PTHREAD_COND_INITIALIZER;
+
+/* ---- Signal handler ---- */
+
+static void sighandler(int sig)
+{
+    (void)sig;
+    running = 0;
+}
+
+/* ---- CRC-8/CCITT ---- */
+
+static uint8_t crc8(const uint8_t *data, int len)
+{
+    uint8_t crc = 0x00;
+    for (int i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            if (crc & 0x80)
+                crc = (crc << 1) ^ 0x07;
+            else
+                crc = crc << 1;
+        }
+    }
+    return crc;
+}
+
+/* ---- Monotonic time ---- */
+
+static int64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* ---- AE freeze control (via prudynt BrightnessMonitor) ---- */
+
+static void set_ae_freeze(int freeze)
+{
+    int fd = open(AE_FREEZE_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        write(fd, freeze ? "1" : "0", 1);
+        close(fd);
+        fprintf(stderr, "AE: freeze %s\n", freeze ? "ON" : "OFF");
+    }
+}
+
+/* ================================================================
+ *  GPIO TX
+ * ================================================================ */
+
+static int gpio_fd = -1;
+
+static int gpio_init(int pin)
+{
+    char path[64];
+    FILE *fp;
+
+    fp = fopen("/sys/class/gpio/export", "w");
+    if (fp) {
+        fprintf(fp, "%d", pin);
+        fclose(fp);
+    }
+
+    snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/direction", pin);
+    fp = fopen(path, "w");
+    if (!fp) {
+        perror("gpio direction");
+        return -1;
+    }
+    fprintf(fp, "out");
+    fclose(fp);
+
+    snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/value", pin);
+    gpio_fd = open(path, O_WRONLY);
+    if (gpio_fd < 0) {
+        perror("gpio value");
+        return -1;
+    }
+
+    return 0;
+}
+
+static inline void gpio_set(int val)
+{
+    if (gpio_fd < 0) return;
+    if (val)
+        write(gpio_fd, "1", 1);
+    else
+        write(gpio_fd, "0", 1);
+}
+
+/* ---- Manchester encode data bits into symbols ---- */
+
+static int encode_manchester(const uint8_t *bits, int n_bits, uint8_t *symbols)
+{
+    int n = 0;
+    for (int i = 0; i < n_bits; i++) {
+        if (bits[i] == 0) {
+            symbols[n++] = 1;
+            symbols[n++] = 0;
+        } else {
+            symbols[n++] = 0;
+            symbols[n++] = 1;
+        }
+    }
+    return n;
+}
+
+/* ---- Encode a frame to symbols ---- */
+
+static void byte_to_bits(uint8_t byte, uint8_t *bits)
+{
+    for (int i = 0; i < 8; i++)
+        bits[i] = (byte >> (7 - i)) & 1;
+}
+
+static int build_frame_symbols(uint8_t msg_type, uint8_t seq,
+                                const uint8_t *data, int data_len,
+                                uint8_t *symbols)
+{
+    /* Build data bits: preamble + sync + length + payload + CRC + postamble */
+    uint8_t bits[MAX_SYMBOLS];
+    int nb = 0;
+
+    /* Preamble: 10101010 */
+    uint8_t preamble[] = {1,0,1,0,1,0,1,0};
+    memcpy(bits + nb, preamble, 8); nb += 8;
+
+    /* Sync: 11001011 */
+    memcpy(bits + nb, SYNC_WORD, 8); nb += 8;
+
+    /* Length: msg_type(1) + seq(1) + data_len */
+    uint8_t frame_len = 2 + data_len;
+    byte_to_bits(frame_len, bits + nb); nb += 8;
+
+    /* Payload: [msg_type, seq, data...] */
+    uint8_t payload[MAX_PAYLOAD];
+    payload[0] = msg_type;
+    payload[1] = seq;
+    if (data_len > 0)
+        memcpy(payload + 2, data, data_len);
+
+    for (int i = 0; i < frame_len; i++) {
+        byte_to_bits(payload[i], bits + nb);
+        nb += 8;
+    }
+
+    /* CRC over [length, payload...] */
+    uint8_t crc_data[MAX_PAYLOAD + 1];
+    crc_data[0] = frame_len;
+    memcpy(crc_data + 1, payload, frame_len);
+    uint8_t crc = crc8(crc_data, frame_len + 1);
+    byte_to_bits(crc, bits + nb); nb += 8;
+
+    /* Postamble: 1010 */
+    uint8_t postamble[] = {1,0,1,0};
+    memcpy(bits + nb, postamble, 4); nb += 4;
+
+    /* Manchester encode */
+    return encode_manchester(bits, nb, symbols);
+}
+
+/* ---- Transmit symbols (thread-safe) ---- */
+
+static void transmit_symbols(const uint8_t *symbols, int n_sym)
+{
+    pthread_mutex_lock(&tx_mutex);
+    tx_active = 1;
+
+    /* Quiet before */
+    gpio_set(0);
+    usleep(SYMBOL_US * 2);
+
+    for (int i = 0; i < n_sym; i++) {
+        gpio_set(symbols[i]);
+        usleep(SYMBOL_US);
+    }
+
+    /* Trailer */
+    gpio_set(0);
+    usleep(SYMBOL_US);
+    gpio_set(1);
+    usleep(SYMBOL_US);
+    gpio_set(0);
+
+    /* Inter-message gap: must exceed SETTLE_MS so peer's RX detects
+     * end of our transmission. With AE frozen, no settle needed. */
+    usleep((SETTLE_MS + 500) * 1000);
+
+    tx_active = 0;
+    pthread_mutex_unlock(&tx_mutex);
+}
+
+/* ---- Send a protocol message ---- */
+
+static void send_message(uint8_t msg_type, uint8_t seq,
+                          const uint8_t *data, int data_len)
+{
+    uint8_t symbols[MAX_SYMBOLS];
+    int n = build_frame_symbols(msg_type, seq, data, data_len, symbols);
+
+    const char *type_names[] = {
+        [MSG_SYN] = "SYN", [MSG_SYN_ACK] = "SYN_ACK", [MSG_ACK] = "ACK",
+        [MSG_DATA] = "DATA", [MSG_CAL_REQ] = "CAL_REQ",
+        [MSG_CAL_ACK] = "CAL_ACK", [MSG_CAL_DONE] = "CAL_DONE",
+        [MSG_PING] = "PING", [MSG_PONG] = "PONG"
+    };
+    const char *name = (msg_type <= MSG_PONG) ? type_names[msg_type] : "???";
+    fprintf(stderr, "TX: %s seq=%d (%d symbols)\n", name, seq, n);
+
+    transmit_symbols(symbols, n);
+}
+
+/* ================================================================
+ *  Brightness RX
+ * ================================================================ */
+
+typedef struct {
+    int64_t ts_ms;
+    uint8_t brightness;
+} sample_t;
+
+/* ---- Read grid file ---- */
+
+static int read_grid(int64_t *ts_ms, uint8_t *blocks, int max_blocks)
+{
+    char buf[512];
+    int fd = open(GRID_PATH, O_RDONLY);
+    if (fd < 0) return -1;
+    int n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+
+    long long ts;
+    char *p = buf;
+    if (sscanf(p, "%lld", &ts) != 1) return -1;
+    *ts_ms = (int64_t)ts;
+
+    while (*p && *p != ' ') p++;
+
+    int count = 0;
+    while (*p && count < max_blocks) {
+        unsigned val;
+        while (*p == ' ') p++;
+        if (sscanf(p, "%u", &val) != 1) break;
+        blocks[count++] = (uint8_t)(val > 255 ? 255 : val);
+        while (*p && *p != ' ' && *p != '\n') p++;
+    }
+    return count;
+}
+
+/* ---- Read brightness: raw block value (AE frozen during comms) ---- */
+
+static int read_brightness(int64_t *ts_ms, uint8_t *brightness)
+{
+    if (tracked_block >= 0) {
+        uint8_t blocks[GRID_BLOCKS];
+        int64_t grid_ts;
+        int nblocks = read_grid(&grid_ts, blocks, GRID_BLOCKS);
+        if (nblocks > tracked_block) {
+            *ts_ms = grid_ts;
+            *brightness = blocks[tracked_block];
+            return 0;
+        }
+    }
+
+    char buf[64];
+    int fd = open(BRIGHTNESS_PATH, O_RDONLY);
+    if (fd < 0) return -1;
+    int n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+
+    long long ts;
+    unsigned val, max_val;
+    if (sscanf(buf, "%lld %u %u", &ts, &val, &max_val) == 3) {
+        *ts_ms = (int64_t)ts;
+        *brightness = (uint8_t)(val > 255 ? 255 : val);
+        return 0;
+    }
+    if (sscanf(buf, "%lld %u", &ts, &val) == 2) {
+        *ts_ms = (int64_t)ts;
+        *brightness = (uint8_t)(val > 255 ? 255 : val);
+        return 0;
+    }
+    return -1;
+}
+
+/* ---- Manchester decode ---- */
+
+static int manchester_decode(const uint8_t *symbols, int n_sym, uint8_t *bits)
+{
+    if (n_sym % 2 != 0) return -1;
+    int n_bits = 0;
+    for (int i = 0; i < n_sym; i += 2) {
+        if (symbols[i] == 1 && symbols[i+1] == 0)
+            bits[n_bits++] = 0;
+        else if (symbols[i] == 0 && symbols[i+1] == 1)
+            bits[n_bits++] = 1;
+        else
+            return -1;
+    }
+    return n_bits;
+}
+
+static uint8_t bits_to_byte(const uint8_t *bits)
+{
+    uint8_t val = 0;
+    for (int i = 0; i < 8; i++)
+        val = (val << 1) | bits[i];
+    return val;
+}
+
+/* ---- Parse decoded bits into protocol message ---- */
+
+static int parse_frame(const uint8_t *bits, int n_bits, rx_message_t *msg)
+{
+    /* Find sync word */
+    int sync_idx = -1;
+    for (int i = 0; i <= n_bits - SYNC_LEN; i++) {
+        int match = 1;
+        for (int j = 0; j < SYNC_LEN; j++) {
+            if (bits[i+j] != SYNC_WORD[j]) { match = 0; break; }
+        }
+        if (match) { sync_idx = i + SYNC_LEN; break; }
+    }
+    if (sync_idx < 0) return -1;
+
+    int remaining = n_bits - sync_idx;
+    const uint8_t *data = bits + sync_idx;
+    if (remaining < 24) return -1;
+
+    uint8_t length = bits_to_byte(data);
+    if (length < 2) return -1;  /* need at least msg_type + seq */
+
+    int needed = 8 + length * 8 + 8;
+    if (remaining < needed) return -1;
+
+    uint8_t payload[MAX_PAYLOAD];
+    uint8_t crc_data[MAX_PAYLOAD + 1];
+    crc_data[0] = length;
+    for (int i = 0; i < length; i++) {
+        payload[i] = bits_to_byte(data + 8 + i * 8);
+        crc_data[i + 1] = payload[i];
+    }
+
+    uint8_t received_crc = bits_to_byte(data + 8 + length * 8);
+    uint8_t expected_crc = crc8(crc_data, length + 1);
+    if (received_crc != expected_crc) return -1;
+
+    msg->msg_type = payload[0];
+    msg->seq = payload[1];
+    msg->data_len = length - 2;
+    if (msg->data_len > 0)
+        memcpy(msg->data, payload + 2, msg->data_len);
+    msg->valid = 1;
+
+    return length;
+}
+
+/* ---- Decode collected samples ---- */
+
+static int decode_samples(sample_t *samp, int n, rx_message_t *msg)
+{
+    if (n < 4) return -1;
+
+    uint8_t bmin = 255, bmax = 0;
+    for (int i = 0; i < n; i++) {
+        if (samp[i].brightness < bmin) bmin = samp[i].brightness;
+        if (samp[i].brightness > bmax) bmax = samp[i].brightness;
+    }
+
+    int delta = bmax - bmin;
+    if (delta < MIN_BRIGHTNESS_DELTA) return -1;
+
+    uint8_t threshold = bmin + delta / 2;
+
+    fprintf(stderr, "RX: %d samples, brightness %d-%d, delta %d\n",
+            n, bmin, bmax, delta);
+
+    /* Find TX start: first sample that crosses threshold.
+     * Skip sample[0] which is a synthetic baseline placeholder. */
+    int tx_start = -1;
+    for (int i = 1; i < n; i++) {
+        int diff = (int)samp[i].brightness - (int)samp[0].brightness;
+        if (diff < 0) diff = -diff;
+        if (diff >= delta / 3) {
+            /* Back up 1 sample for context, but not to the synthetic sample[0] */
+            tx_start = i > 1 ? i - 1 : i;
+            break;
+        }
+    }
+    if (tx_start < 0) return -1;
+
+    /* Use half a symbol before the first real transition as t0 */
+    int64_t t0 = samp[tx_start].ts_ms - SYMBOL_MS / 2;
+
+    fprintf(stderr, "RX: tx_start=%d, t0=%lld, first_ts=%lld\n",
+            tx_start, (long long)t0, (long long)samp[tx_start].ts_ms);
+
+    /* Extract symbols */
+    uint8_t symbols[MAX_SYMBOLS];
+    int n_sym = 0;
+
+    for (int sym = 0; sym < MAX_SYMBOLS; sym++) {
+        int64_t win_start = t0 + (int64_t)SYMBOL_MS * sym + SYMBOL_MS / 4;
+        int64_t win_end   = t0 + (int64_t)SYMBOL_MS * sym + SYMBOL_MS * 3 / 4;
+
+        int sum = 0, count = 0;
+        for (int i = tx_start; i < n; i++) {
+            if (samp[i].ts_ms >= win_start && samp[i].ts_ms <= win_end) {
+                sum += samp[i].brightness;
+                count++;
+            }
+            if (samp[i].ts_ms > win_end) break;
+        }
+        if (count == 0) break;
+        symbols[n_sym++] = (sum / count) >= threshold ? 1 : 0;
+    }
+
+    fprintf(stderr, "RX: %d symbols from tx_start=%d\n", n_sym, tx_start);
+
+    if (n_sym > 0) {
+        fprintf(stderr, "RX: symbols: ");
+        int lim = n_sym < 120 ? n_sym : 120;
+        for (int i = 0; i < lim; i++) fprintf(stderr, "%d", symbols[i]);
+        fprintf(stderr, "\n");
+    }
+
+    if (n_sym < 20) return -1;
+
+    /* Try decoding with trim offsets */
+    for (int trim_s = 0; trim_s < 12; trim_s++) {
+        for (int trim_e = 0; trim_e < 12; trim_e++) {
+            int sc = n_sym - trim_s - trim_e;
+            if (sc < 20 || sc % 2 != 0) continue;
+
+            uint8_t bits[MAX_SYMBOLS / 2];
+            int nb = manchester_decode(symbols + trim_s, sc, bits);
+            if (nb < 0) continue;
+
+            if (parse_frame(bits, nb, msg) > 0) {
+                fprintf(stderr, "RX: decoded trim [%d:%d]\n", trim_s, trim_e);
+                return 0;
+            }
+        }
+    }
+
+    /* Try inverted */
+    for (int i = 0; i < n_sym; i++) symbols[i] = symbols[i] ? 0 : 1;
+
+    for (int trim_s = 0; trim_s < 12; trim_s++) {
+        for (int trim_e = 0; trim_e < 12; trim_e++) {
+            int sc = n_sym - trim_s - trim_e;
+            if (sc < 20 || sc % 2 != 0) continue;
+
+            uint8_t bits[MAX_SYMBOLS / 2];
+            int nb = manchester_decode(symbols + trim_s, sc, bits);
+            if (nb < 0) continue;
+
+            if (parse_frame(bits, nb, msg) > 0) {
+                fprintf(stderr, "RX: decoded inverted trim [%d:%d]\n", trim_s, trim_e);
+                return 0;
+            }
+        }
+    }
+
+    return -1;
+}
+
+/* ---- Calibration ---- */
+
+static int calibrate(void)
+{
+    fprintf(stderr, "CALIBRATE: reading grid for 5 seconds...\n");
+    fprintf(stderr, "CALIBRATE: toggle the transmitter LED during this time!\n");
+
+    #define MAX_CAL_FRAMES 200
+    uint8_t frames[MAX_CAL_FRAMES][GRID_BLOCKS];
+    uint8_t means[MAX_CAL_FRAMES];
+    int n_frames = 0;
+
+    int64_t start = now_ms();
+    int64_t last_ts = 0;
+
+    while (now_ms() - start < 5000 && n_frames < MAX_CAL_FRAMES) {
+        int64_t ts;
+        uint8_t blocks[GRID_BLOCKS];
+        int n = read_grid(&ts, blocks, GRID_BLOCKS);
+        if (n > 0 && ts != last_ts) {
+            last_ts = ts;
+            memcpy(frames[n_frames], blocks, GRID_BLOCKS);
+            int sum = 0;
+            for (int i = 0; i < n; i++) sum += blocks[i];
+            means[n_frames] = sum / n;
+            n_frames++;
+        }
+        usleep(POLL_INTERVAL_US);
+    }
+
+    fprintf(stderr, "CALIBRATE: %d frames\n", n_frames);
+    if (n_frames < 10) return -1;
+
+    int best = -1, best_range = 0;
+    for (int b = 0; b < GRID_BLOCKS; b++) {
+        int rmin = 999, rmax = -999;
+        for (int f = 0; f < n_frames; f++) {
+            int residual = (int)frames[f][b] - (int)means[f];
+            if (residual < rmin) rmin = residual;
+            if (residual > rmax) rmax = residual;
+        }
+        int range = rmax - rmin;
+        if (range > best_range) {
+            best_range = range;
+            best = b;
+        }
+    }
+
+    if (best < 0 || best_range < 3) {
+        fprintf(stderr, "CALIBRATE: no IR block detected (range=%d)\n", best_range);
+        return -1;
+    }
+
+    fprintf(stderr, "CALIBRATE: block=%d (row=%d, col=%d), range=%d\n",
+            best, best / 10, best % 10, best_range);
+    return best;
+}
+
+/* ================================================================
+ *  RX Thread
+ * ================================================================ */
+
+static sample_t rx_samples[MAX_SAMPLES]; /* static to avoid stack overflow */
+
+static void *rx_thread(void *arg)
+{
+    (void)arg;
+
+    sample_t *samples = rx_samples;
+    int n_samples = 0;
+
+    enum { IDLE, ACTIVE } state = IDLE;
+    uint8_t baseline = 0;
+    int baseline_set = 0;
+    int64_t last_change_ms = 0;
+    int64_t last_ts = 0;
+    int64_t tx_end_time = 0;  /* timestamp when tx_active last went 0 */
+    int was_tx_active = 0;
+    int active_count = 0;    /* consecutive frames above threshold */
+
+    fprintf(stderr, "RX: thread started (block=%d)\n", tracked_block);
+
+    /* Log first few brightness readings for debugging */
+    int debug_count = 0;
+
+    while (running) {
+        /* Suppress RX during our own TX to avoid self-interference. */
+        if (tx_active) {
+            if (state == ACTIVE) {
+                state = IDLE;
+                n_samples = 0;
+            }
+            was_tx_active = 1;
+            usleep(POLL_INTERVAL_US);
+            continue;
+        }
+
+        /* Record when TX ended for post-TX baseline settling */
+        if (was_tx_active) {
+            was_tx_active = 0;
+            tx_end_time = now_ms();
+            baseline_set = 0;
+        }
+
+        int64_t ts_ms;
+        uint8_t brightness;
+
+        if (read_brightness(&ts_ms, &brightness) < 0) {
+            usleep(POLL_INTERVAL_US);
+            continue;
+        }
+
+        if (ts_ms == last_ts) {
+            usleep(POLL_INTERVAL_US);
+            continue;
+        }
+        last_ts = ts_ms;
+
+        /* After TX ends, briefly update baseline (AE is frozen, so fast) */
+        if (tx_end_time > 0 && now_ms() - tx_end_time < 100) {
+            baseline = brightness;
+            baseline_set = 1;
+            last_change_ms = now_ms();
+            usleep(POLL_INTERVAL_US);
+            continue;
+        }
+        tx_end_time = 0;
+
+        if (!baseline_set) {
+            baseline = brightness;
+            baseline_set = 1;
+            last_change_ms = now_ms();
+            fprintf(stderr, "RX: baseline set to %d\n", baseline);
+        }
+
+        if (debug_count < 10) {
+            fprintf(stderr, "RX: [%d] brightness=%d baseline=%d diff=%d\n",
+                    debug_count, brightness, baseline,
+                    ((int)brightness - (int)baseline) < 0 ?
+                    -((int)brightness - (int)baseline) :
+                    ((int)brightness - (int)baseline));
+            debug_count++;
+        }
+
+        int diff = (int)brightness - (int)baseline;
+        if (diff < 0) diff = -diff;
+
+        switch (state) {
+        case IDLE:
+            if (diff >= MIN_BRIGHTNESS_DELTA) {
+                active_count++;
+                if (active_count >= 3) {  /* require 3 consecutive frames (~100ms) */
+                    fprintf(stderr, "RX: activity detected (baseline=%d, now=%d, delta=%d)\n",
+                            baseline, brightness, diff);
+                    state = ACTIVE;
+                    n_samples = 0;
+                    samples[n_samples].ts_ms = ts_ms - SYMBOL_MS;
+                    samples[n_samples].brightness = baseline;
+                    n_samples++;
+                }
+            } else {
+                active_count = 0;
+                baseline = (uint8_t)(((int)baseline * 7 + (int)brightness + 4) / 8);
+            }
+            break;
+
+        case ACTIVE:
+            if (n_samples < MAX_SAMPLES) {
+                samples[n_samples].ts_ms = ts_ms;
+                samples[n_samples].brightness = brightness;
+                n_samples++;
+            }
+
+            if (diff >= MIN_BRIGHTNESS_DELTA)
+                last_change_ms = now_ms();
+
+            if (now_ms() - last_change_ms > SETTLE_MS) {
+                fprintf(stderr, "RX: end of TX (%d samples)\n", n_samples);
+
+                rx_message_t msg;
+                memset(&msg, 0, sizeof(msg));
+                if (decode_samples(samples, n_samples, &msg) == 0) {
+                    const char *names[] = {
+                        [0]="?", [MSG_SYN]="SYN", [MSG_SYN_ACK]="SYN_ACK",
+                        [MSG_ACK]="ACK", [MSG_DATA]="DATA",
+                        [MSG_CAL_REQ]="CAL_REQ", [MSG_CAL_ACK]="CAL_ACK",
+                        [MSG_CAL_DONE]="CAL_DONE",
+                        [MSG_PING]="PING", [MSG_PONG]="PONG"
+                    };
+                    const char *n = (msg.msg_type <= MSG_PONG) ? names[msg.msg_type] : "?";
+                    fprintf(stderr, "RX: <<< %s seq=%d len=%d >>>\n",
+                            n, msg.seq, msg.data_len);
+
+                    if (msg.msg_type == MSG_DATA && msg.data_len > 0) {
+                        msg.data[msg.data_len] = '\0';
+                        printf("MSG: %s\n", (char *)msg.data);
+                        fflush(stdout);
+                    }
+
+                    /* Signal the protocol thread */
+                    pthread_mutex_lock(&rx_mutex);
+                    rx_msg = msg;
+                    pthread_cond_signal(&rx_cond);
+                    pthread_mutex_unlock(&rx_mutex);
+                } else {
+                    fprintf(stderr, "RX: decode failed\n");
+                }
+
+                state = IDLE;
+                baseline = brightness;
+                last_change_ms = now_ms();
+                n_samples = 0;
+            }
+            break;
+        }
+
+        usleep(POLL_INTERVAL_US);
+    }
+
+    fprintf(stderr, "RX: thread stopped\n");
+    return NULL;
+}
+
+/* ---- Wait for a specific message type (with timeout) ---- */
+
+static int wait_for_msg(uint8_t expected_type, rx_message_t *out, int timeout_ms)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (timeout_ms % 1000) * 1000000;
+    if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000;
+    }
+
+    pthread_mutex_lock(&rx_mutex);
+    while (running) {
+        if (rx_msg.valid && rx_msg.msg_type == expected_type) {
+            *out = rx_msg;
+            rx_msg.valid = 0;
+            pthread_mutex_unlock(&rx_mutex);
+            return 0;
+        }
+        rx_msg.valid = 0;  /* consume stale messages */
+
+        int ret = pthread_cond_timedwait(&rx_cond, &rx_mutex, &ts);
+        if (ret == ETIMEDOUT) {
+            pthread_mutex_unlock(&rx_mutex);
+            return -1;
+        }
+    }
+    pthread_mutex_unlock(&rx_mutex);
+    return -1;
+}
+
+/* ---- Wait for any message (with timeout) ---- */
+
+static int wait_for_any_msg(rx_message_t *out, int timeout_ms)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (timeout_ms % 1000) * 1000000;
+    if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000;
+    }
+
+    pthread_mutex_lock(&rx_mutex);
+    while (running) {
+        if (rx_msg.valid) {
+            *out = rx_msg;
+            rx_msg.valid = 0;
+            pthread_mutex_unlock(&rx_mutex);
+            return 0;
+        }
+
+        int ret = pthread_cond_timedwait(&rx_cond, &rx_mutex, &ts);
+        if (ret == ETIMEDOUT) {
+            pthread_mutex_unlock(&rx_mutex);
+            return -1;
+        }
+    }
+    pthread_mutex_unlock(&rx_mutex);
+    return -1;
+}
+
+/* ================================================================
+ *  Protocol Commands
+ * ================================================================ */
+
+/* ---- Connect: initiate handshake ---- */
+
+static int do_connect(void)
+{
+    fprintf(stderr, "PROTO: initiating connection (SYN)...\n");
+
+    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        send_message(MSG_SYN, 0, NULL, 0);
+
+        fprintf(stderr, "PROTO: waiting for SYN_ACK...\n");
+        rx_message_t reply;
+        if (wait_for_msg(MSG_SYN_ACK, &reply, ACK_TIMEOUT_MS) == 0) {
+            fprintf(stderr, "PROTO: got SYN_ACK! Sending ACK...\n");
+            send_message(MSG_ACK, 0, NULL, 0);
+            fprintf(stderr, "PROTO: connected!\n");
+            return 0;
+        }
+        fprintf(stderr, "PROTO: SYN_ACK timeout, retry %d/%d\n",
+                attempt + 1, MAX_RETRIES);
+    }
+
+    fprintf(stderr, "PROTO: connection failed after %d attempts\n", MAX_RETRIES);
+    return -1;
+}
+
+/* ---- Listen: wait for incoming connection ---- */
+
+static int do_listen(void)
+{
+    fprintf(stderr, "PROTO: listening for SYN...\n");
+
+    while (running) {
+        rx_message_t msg;
+        /* Wait indefinitely (60s chunks to check running flag) */
+        if (wait_for_msg(MSG_SYN, &msg, 60000) == 0) {
+            fprintf(stderr, "PROTO: got SYN! Sending SYN_ACK...\n");
+            send_message(MSG_SYN_ACK, 0, NULL, 0);
+
+            fprintf(stderr, "PROTO: waiting for ACK...\n");
+            rx_message_t ack;
+            if (wait_for_msg(MSG_ACK, &ack, ACK_TIMEOUT_MS) == 0) {
+                fprintf(stderr, "PROTO: connected!\n");
+                return 0;
+            }
+            fprintf(stderr, "PROTO: ACK timeout, back to listening\n");
+        }
+    }
+    return -1;
+}
+
+/* ---- Send data with ACK ---- */
+
+static int do_send(const char *text)
+{
+    int len = strlen(text);
+    if (len > MAX_PAYLOAD - 2) {
+        fprintf(stderr, "PROTO: message too long (%d, max %d)\n", len, MAX_PAYLOAD - 2);
+        return -1;
+    }
+
+    static uint8_t seq = 1;
+
+    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        send_message(MSG_DATA, seq, (const uint8_t *)text, len);
+
+        fprintf(stderr, "PROTO: waiting for ACK seq=%d...\n", seq);
+        rx_message_t reply;
+        if (wait_for_msg(MSG_ACK, &reply, ACK_TIMEOUT_MS) == 0) {
+            if (reply.seq == seq) {
+                fprintf(stderr, "PROTO: ACK received for seq=%d\n", seq);
+                seq++;
+                return 0;
+            }
+            fprintf(stderr, "PROTO: ACK seq mismatch (got %d, want %d)\n",
+                    reply.seq, seq);
+        }
+        fprintf(stderr, "PROTO: ACK timeout, retry %d/%d\n",
+                attempt + 1, MAX_RETRIES);
+    }
+
+    fprintf(stderr, "PROTO: send failed after %d retries\n", MAX_RETRIES);
+    return -1;
+}
+
+/* ---- Calibrate over the link ---- */
+
+static int do_cal_request(void)
+{
+    /* We need the peer to hold their IR LED ON so we can find the block.
+       Send CAL_REQ, wait for CAL_ACK, then scan grid, send CAL_DONE. */
+
+    fprintf(stderr, "PROTO: requesting calibration...\n");
+
+    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        send_message(MSG_CAL_REQ, 0, NULL, 0);
+
+        rx_message_t reply;
+        if (wait_for_msg(MSG_CAL_ACK, &reply, ACK_TIMEOUT_MS) == 0) {
+            fprintf(stderr, "PROTO: peer acknowledged, scanning...\n");
+            /* Peer is now holding LED ON — run calibration */
+            int block = calibrate();
+            if (block >= 0) {
+                tracked_block = block;
+                fprintf(stderr, "PROTO: calibrated to block %d\n", block);
+            } else {
+                fprintf(stderr, "PROTO: calibration scan failed\n");
+            }
+            send_message(MSG_CAL_DONE, 0, NULL, 0);
+            return block;
+        }
+        fprintf(stderr, "PROTO: CAL_ACK timeout, retry %d/%d\n",
+                attempt + 1, MAX_RETRIES);
+    }
+    return -1;
+}
+
+/* ---- Handle incoming calibration request ---- */
+
+static void handle_cal_request(void)
+{
+    fprintf(stderr, "PROTO: peer requested calibration, holding LED ON for 5s...\n");
+    send_message(MSG_CAL_ACK, 0, NULL, 0);
+
+    /* Hold LED toggling for 5 seconds so peer can calibrate */
+    pthread_mutex_lock(&tx_mutex);
+    tx_active = 1;
+    for (int i = 0; i < 10 && running; i++) {
+        gpio_set(1);
+        usleep(250000);  /* 250ms ON */
+        gpio_set(0);
+        usleep(250000);  /* 250ms OFF */
+    }
+    gpio_set(0);
+    tx_active = 0;
+    pthread_mutex_unlock(&tx_mutex);
+
+    /* Wait for CAL_DONE */
+    rx_message_t msg;
+    if (wait_for_msg(MSG_CAL_DONE, &msg, 10000) == 0) {
+        fprintf(stderr, "PROTO: peer calibration complete\n");
+    } else {
+        fprintf(stderr, "PROTO: CAL_DONE timeout\n");
+    }
+}
+
+/* ================================================================
+ *  Interactive mode: RX thread + protocol event loop
+ * ================================================================ */
+
+static int interactive_mode(int is_listener)
+{
+    /* Start RX thread */
+    pthread_t rx_tid;
+    if (pthread_create(&rx_tid, NULL, rx_thread, NULL) != 0) {
+        perror("pthread_create");
+        return 1;
+    }
+
+    /* Handshake */
+    int connected;
+    if (is_listener) {
+        connected = do_listen();
+    } else {
+        connected = do_connect();
+    }
+
+    if (connected != 0) {
+        fprintf(stderr, "PROTO: handshake failed\n");
+        running = 0;
+        pthread_join(rx_tid, NULL);
+        return 1;
+    }
+
+    /* Event loop: read stdin commands, handle incoming messages */
+    fprintf(stderr, "\nirlink: connected! Commands:\n");
+    fprintf(stderr, "  send <text>    — send data message\n");
+    fprintf(stderr, "  ping           — measure round-trip time\n");
+    fprintf(stderr, "  cal            — request peer calibration\n");
+    fprintf(stderr, "  quit           — exit\n\n");
+
+    char line[512];
+    while (running && fgets(line, sizeof(line), stdin)) {
+        /* Strip newline */
+        int len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+            line[--len] = '\0';
+
+        if (strncmp(line, "send ", 5) == 0) {
+            do_send(line + 5);
+        } else if (strcmp(line, "ping") == 0) {
+            int64_t t0 = now_ms();
+            send_message(MSG_PING, 0, NULL, 0);
+            rx_message_t reply;
+            if (wait_for_msg(MSG_PONG, &reply, ACK_TIMEOUT_MS) == 0) {
+                int64_t rtt = now_ms() - t0;
+                fprintf(stderr, "PING: pong received, RTT=%lld ms\n", (long long)rtt);
+                printf("PONG: RTT=%lld ms\n", (long long)rtt);
+                fflush(stdout);
+            } else {
+                fprintf(stderr, "PING: timeout\n");
+            }
+        } else if (strcmp(line, "cal") == 0) {
+            do_cal_request();
+        } else if (strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0) {
+            break;
+        } else if (len > 0) {
+            fprintf(stderr, "Unknown command: %s\n", line);
+        }
+
+        /* Check for incoming messages that arrived while we were sending */
+        pthread_mutex_lock(&rx_mutex);
+        if (rx_msg.valid) {
+            if (rx_msg.msg_type == MSG_DATA) {
+                uint8_t seq = rx_msg.seq;
+                rx_msg.valid = 0;
+                pthread_mutex_unlock(&rx_mutex);
+                send_message(MSG_ACK, seq, NULL, 0);
+            } else if (rx_msg.msg_type == MSG_CAL_REQ) {
+                rx_msg.valid = 0;
+                pthread_mutex_unlock(&rx_mutex);
+                handle_cal_request();
+            } else if (rx_msg.msg_type == MSG_PING) {
+                rx_msg.valid = 0;
+                pthread_mutex_unlock(&rx_mutex);
+                fprintf(stderr, "PROTO: responding to PING\n");
+                send_message(MSG_PONG, 0, NULL, 0);
+            } else {
+                rx_msg.valid = 0;
+                pthread_mutex_unlock(&rx_mutex);
+            }
+        } else {
+            pthread_mutex_unlock(&rx_mutex);
+        }
+    }
+
+    running = 0;
+    pthread_join(rx_tid, NULL);
+    return 0;
+}
+
+/* ================================================================
+ *  Daemon mode: auto-ACK + handle CAL_REQ, print DATA to stdout
+ * ================================================================ */
+
+static int daemon_mode(int is_listener)
+{
+    pthread_t rx_tid;
+    if (pthread_create(&rx_tid, NULL, rx_thread, NULL) != 0) {
+        perror("pthread_create");
+        return 1;
+    }
+
+    /* Handshake */
+    int connected;
+    if (is_listener) {
+        connected = do_listen();
+    } else {
+        connected = do_connect();
+    }
+
+    if (connected != 0) {
+        fprintf(stderr, "PROTO: handshake failed\n");
+        running = 0;
+        pthread_join(rx_tid, NULL);
+        return 1;
+    }
+
+    fprintf(stderr, "PROTO: connected, entering daemon mode\n");
+
+    /* Event loop: just handle incoming messages */
+    while (running) {
+        rx_message_t msg;
+        if (wait_for_any_msg(&msg, 1000) == 0) {
+            switch (msg.msg_type) {
+            case MSG_DATA:
+                send_message(MSG_ACK, msg.seq, NULL, 0);
+                break;
+            case MSG_CAL_REQ:
+                handle_cal_request();
+                break;
+            case MSG_PING:
+                send_message(MSG_PONG, 0, NULL, 0);
+                break;
+            case MSG_SYN:
+                send_message(MSG_SYN_ACK, 0, NULL, 0);
+                break;
+            default:
+                break;
+            }
+        }
+    }
+
+    pthread_join(rx_tid, NULL);
+    return 0;
+}
+
+/* ================================================================
+ *  Main
+ * ================================================================ */
+
+int main(int argc, char *argv[])
+{
+    /* Unbuffered stderr for real-time logging with nohup/redirect */
+    setbuf(stderr, NULL);
+    setbuf(stdout, NULL);
+
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <command> [options]\n", argv[0]);
+        fprintf(stderr, "Commands:\n");
+        fprintf(stderr, "  listen [--block N]     — wait for connection\n");
+        fprintf(stderr, "  connect [--block N]    — initiate connection\n");
+        fprintf(stderr, "  daemon-listen [--block N] — listen + auto-respond\n");
+        fprintf(stderr, "  daemon-connect [--block N] — connect + auto-respond\n");
+        fprintf(stderr, "  send <text> [--block N]  — connect, send, exit\n");
+        fprintf(stderr, "  calibrate              — manual ROI calibration\n");
+        return 1;
+    }
+
+    /* Parse --block from any position */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--block") == 0 && i + 1 < argc) {
+            tracked_block = atoi(argv[i + 1]);
+            fprintf(stderr, "irlink: tracking block %d\n", tracked_block);
+        }
+    }
+
+    signal(SIGINT, sighandler);
+    signal(SIGTERM, sighandler);
+
+    /* Init GPIO */
+    if (gpio_init(IR_GPIO) < 0) {
+        fprintf(stderr, "irlink: GPIO init failed (are you root?)\n");
+        return 1;
+    }
+    gpio_set(0);
+
+    const char *cmd = argv[1];
+
+    if (strcmp(cmd, "calibrate") == 0) {
+        /* AE stays active during calibration — we need it to stabilize */
+        int block = calibrate();
+        if (block >= 0) {
+            printf("%d\n", block);
+            return 0;
+        }
+        return 1;
+    }
+
+    /* All communication modes: freeze AE first, unfreeze on exit */
+
+    if (strcmp(cmd, "listen") == 0) {
+        set_ae_freeze(1);
+        usleep(200000); /* 200ms for last AE update to apply */
+        int ret = interactive_mode(1);
+        set_ae_freeze(0);
+        return ret;
+    }
+
+    if (strcmp(cmd, "connect") == 0) {
+        set_ae_freeze(1);
+        usleep(200000);
+        int ret = interactive_mode(0);
+        set_ae_freeze(0);
+        return ret;
+    }
+
+    if (strcmp(cmd, "daemon-listen") == 0) {
+        set_ae_freeze(1);
+        usleep(200000);
+        int ret = daemon_mode(1);
+        set_ae_freeze(0);
+        return ret;
+    }
+
+    if (strcmp(cmd, "daemon-connect") == 0) {
+        set_ae_freeze(1);
+        usleep(200000);
+        int ret = daemon_mode(0);
+        set_ae_freeze(0);
+        return ret;
+    }
+
+    if (strcmp(cmd, "send") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: irlink send <text> [--block N]\n");
+            return 1;
+        }
+        /* Find the text argument (skip --block N) */
+        const char *text = NULL;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--block") == 0) {
+                i++; /* skip value */
+                continue;
+            }
+            text = argv[i];
+            break;
+        }
+        if (!text) {
+            fprintf(stderr, "No message text provided\n");
+            return 1;
+        }
+
+        set_ae_freeze(1);
+        usleep(200000);
+
+        /* Start RX, connect, send, done */
+        pthread_t rx_tid;
+        pthread_create(&rx_tid, NULL, rx_thread, NULL);
+
+        if (do_connect() == 0) {
+            do_send(text);
+        }
+
+        running = 0;
+        pthread_join(rx_tid, NULL);
+        set_ae_freeze(0);
+        return 0;
+    }
+
+    fprintf(stderr, "Unknown command: %s\n", cmd);
+    return 1;
+}

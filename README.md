@@ -4,7 +4,7 @@ IR light communication between Wyze V3 cameras using their built-in infrared ill
 
 ## What is this?
 
-An experimental system that turns Wyze V3 security cameras into IR Li-Fi transceivers. One camera transmits data by modulating its 940nm IR LEDs; another camera receives by analyzing brightness changes in its video feed. Uses Manchester encoding with CRC-8 error detection for reliable data transfer.
+An experimental system that turns Wyze V3 security cameras into IR Li-Fi transceivers. One camera transmits data by modulating its 940nm IR LEDs; another camera receives by analyzing brightness changes in its video feed. Uses Manchester encoding with CRC-8 error detection, a TCP-like half-duplex protocol (SYN/ACK handshake, retransmit), and ISP auto-exposure freeze for reliable data transfer.
 
 ## How it works
 
@@ -13,10 +13,11 @@ An experimental system that turns Wyze V3 security cameras into IR Li-Fi transce
                          tx/rx    ~3 bps      tx/rx
 ```
 
-1. **Transmitter**: C binary on camera toggles 940nm IR LEDs via sysfs GPIO with precise timing
-2. **Receiver**: On-camera C binary reads brightness from patched prudynt-t, decodes Manchester symbols using ROI tracking with AE residual cancellation
-3. **Protocol**: Manchester encoding (self-clocking) + CRC-8 checksums + frame sync
-4. **Host PC**: Orchestrates TX/RX, can also run host-side RTSP decoder
+1. **Transceiver**: On-camera C binary (`irlink`) handles both TX (GPIO LED toggle) and RX (brightness grid from patched prudynt-t)
+2. **Protocol**: TCP-like half-duplex — SYN/SYN_ACK/ACK handshake, DATA with ACK/retransmit, PING/PONG, over-the-link calibration
+3. **Encoding**: Manchester (self-clocking) + CRC-8 checksums + frame sync
+4. **AE Freeze**: Locks ISP auto-exposure during communication for stable raw pixel detection
+5. **Host PC**: Orchestrates TX/RX, can also run host-side RTSP decoder
 
 ## Current Status
 
@@ -27,7 +28,9 @@ An experimental system that turns Wyze V3 security cameras into IR Li-Fi transce
 | Phase 2 (C GPIO transmitter) | ~3 bps | Done |
 | On-camera brightness monitor | N/A | Working (prudynt-t patch) |
 | On-camera receiver (irlink_rx) | ~3 bps | Working (ROI + AE residual) |
-| Duplex protocol (ACK/retransmit) | TBD | In progress |
+| Half-duplex protocol (irlink) | ~3 bps | Working (SYN/ACK + AE freeze) |
+| Over-the-link calibration | N/A | Implemented (CAL_REQ/ACK/DONE) |
+| PING/PONG RTT measurement | N/A | Implemented |
 
 ## Requirements
 
@@ -56,20 +59,24 @@ ssh-copy-id root@192.168.50.141   # da-camera2
 ssh da-camera1 "ircut off; killall daynightd"
 ssh da-camera2 "ircut off; killall daynightd"
 
-# 4. Send a message via IR light
-conda activate light
-python -m host.send_message "HELLO"
+# 4. Calibrate (toggle other camera's LED during 5s window)
+ssh da-camera2 "irlink calibrate"    # outputs block index, e.g. 45
 
-# 5. Run tests
+# 5. Send a message via IR light (on-camera protocol)
+ssh da-camera2 "irlink daemon-listen --block 45 &"
+ssh da-camera1 "irlink send 'HELLO' --block 45"
+
+# 6. Run tests
 pytest tests/ -v
 ```
 
 ## Project Structure
 
 ```
+irlink/        — Combined half-duplex transceiver with protocol layer (C, MIPS)
 protocol/      — Manchester encoding, CRC-8, frame encode/decode
 transmitter/   — TX: shell scripts (Phase 1), C GPIO binary (Phase 2)
-receiver/      — RX: on-camera decoder (irlink_rx.c) + host-side RTSP decoder
+receiver/      — RX: standalone on-camera decoder + host-side RTSP decoder
 host/          — SSH orchestration, config, end-to-end CLI
 tests/         — 26 pytest tests (protocol layer)
 ```

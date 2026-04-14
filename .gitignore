@@ -32,6 +32,7 @@ rx_debug.*
 transmitter/tx_pwm
 transmitter/test_luma
 receiver/irlink_rx
+irlink/irlink
 
 # Thingino firmware build tree (large, has its own repo)
 thingino-firmware/

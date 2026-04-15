@@ -22,7 +22,7 @@ This project builds **custom firmware** on top of Thingino (https://github.com/t
 ### Custom Firmware Changes
 
 - **USB CDC-NCM networking** — added `BR2_PACKAGE_USBNET=y` and `BR2_PACKAGE_USBNET_USB_DIRECT_NCM=y` to defconfig (requires USB data cable, not yet tested)
-- **BrightnessMonitor** — patched prudynt-t to expose per-frame brightness via `/run/prudynt/brightness` and per-block grid via `/run/prudynt/brightness_grid` using `IMP_FrameSource_SnapFrame` API
+- **BrightnessMonitor** — patched prudynt-t to expose per-frame brightness via `/run/prudynt/brightness`, per-block grid via `/run/prudynt/brightness_grid`, and pixel-level ROI via `/run/prudynt/brightness_roi` using `IMP_FrameSource_SnapFrame` API
 - **AE Freeze control** — BrightnessMonitor reads `/run/prudynt/ae_freeze` and calls `IMP_ISP_Tuning_SetAeFreeze` to lock/unlock auto-exposure. Written by irlink during communication.
 
 ### BrightnessMonitor Output Files
@@ -30,10 +30,12 @@ This project builds **custom firmware** on top of Thingino (https://github.com/t
 | File | Format | Purpose |
 |------|--------|---------|
 | `/run/prudynt/brightness` | `<timestamp_ms> <mean> <max_block>` | Whole-frame brightness (fast reads) |
-| `/run/prudynt/brightness_grid` | `<timestamp_ms> <b0> <b1> ... <b59>` | 10x6 block grid (ROI detection) |
+| `/run/prudynt/brightness_grid` | `<timestamp_ms> <b0> <b1> ... <b239>` | 20x12 block grid (legacy ROI detection) |
+| `/run/prudynt/brightness_roi` | `<timestamp_ms> <mean>` | Pixel-level ROI brightness (high SNR) |
+| `/run/prudynt/roi_config` | `<x> <y> <size>` | Control: set pixel ROI center and size (written by irlink) |
 | `/run/prudynt/ae_freeze` | `0` or `1` | Write `1` to freeze AE, `0` to unfreeze |
 
-The grid divides the 640x360 frame into 240 blocks (20x12, 32x30 pixels each). The `irlink` receiver uses the grid to find and track the specific block containing the transmitter's IR LEDs. The host-side `pixel_rx.py` bypasses the grid entirely and reads the RTSP stream at exact pixel coordinates for much higher signal-to-noise ratio.
+The grid divides the 640x360 frame into 240 blocks (20x12, 32x30 pixels each). The pixel ROI reads a small square (default 15x15 pixels) around the calibrated transmitter position, sampling every pixel (no subsampling). Delta comparison: grid block gives +10-15 at 10-20ft, pixel ROI gives +120-150 at the same distance. The `irlink --pixel` mode and host-side `pixel_rx.py` both use pixel-level ROI for reliable decoding.
 
 ### Why Thingino
 
@@ -102,16 +104,18 @@ Self-clocking — the receiver can never lose sync.
 | Phase 1 | Shell `gpio set` + `usleep` | ~1 bps | Done, reliable |
 | Phase 2 | C binary, sysfs GPIO | ~3 bps | Done, reliable |
 | Phase 2+ | Hardware PWM ioctls | TBD | PWM_ENABLE fails — needs investigation |
-| On-camera RX | irlink_rx + BrightnessMonitor | ~3 bps | Working (ROI + AE residual) |
+| On-camera RX (grid) | irlink_rx + BrightnessMonitor grid | ~3 bps | Working (ROI + AE residual) |
+| On-camera RX (pixel) | irlink --pixel + DPLL decode | ~4.2 bps | Working (120ms/symbol, delta 120+) |
 | Half-duplex link | irlink (TX+RX+protocol) | ~3 bps | Working (AE freeze + raw block) |
 | Dual LED TX | irlink (850nm + 940nm together) | ~3 bps | Working, 2x signal at distance |
-| Host pixel RX | pixel_rx.py (RTSP + pixel ROI) | ~3 bps | In progress (delta 200+ at 10-20ft) |
+| Host pixel RX | pixel_rx.py (RTSP + pixel ROI + DPLL) | ~4.2 bps | Working (120ms/symbol, delta 150+) |
+| Raw TX | irlink tx (no handshake) | ~4.2 bps | Working (for pixel_rx or passive monitoring) |
 
 ## Project Structure
 
 ```
 irlink/            — Combined half-duplex transceiver with protocol layer
-  irlink.c         — TX+RX threads, SYN/ACK/DATA/PING/CAL protocol (C, MIPS)
+  irlink.c         — TX+RX threads, SYN/ACK/DATA/PING/CAL protocol, DPLL decode, pixel ROI (C, MIPS)
   Makefile         — Cross-compilation, deploy to both cameras
 protocol/          — Manchester encoding, CRC-8, frame encode/decode (pure Python)
 transmitter/       — TX code: shell scripts, C GPIO binary, Makefile
@@ -128,7 +132,7 @@ host/              — Host-side orchestration: SSH, config, end-to-end CLI
   cam_setup.sh     — Camera pre-flight: night mode, ircut, LEDs, prudynt, AE freeze
   cal_procedure.py — Pixel-level calibration: diff LED-on/off RTSP frames to find TX
   calibration.json — Saved calibration data (TX pixel coords per camera pair)
-  pixel_rx.py      — Host-side RTSP pixel receiver (reads exact TX pixel ROI)
+  pixel_rx.py      — Host-side RTSP pixel receiver (DPLL decode, 120ms/symbol)
 photos/            — Calibration images, debug snapshots, calibration.html viewer
   find_transmitter.py — One-shot TX locator with bounding box
   grab_grid.py     — RTSP frame grab with brightness grid overlay
@@ -248,6 +252,12 @@ BOARD=wyze_cam3_t31x_gc2053_atbm6031 make prudynt-t-rebuild
 - **Grid-based brightness (20x12 blocks) dilutes IR signal at distance**. At 10-20 feet, the IR LED spot is ~10-20 pixels across but the grid block is 32x30 pixels. The spot's +200 pixel delta gets averaged down to +10-15 in the block. Host-side pixel-level RTSP reading (`pixel_rx.py`) gives the full undiluted delta.
 - **Dual LED TX (850nm + 940nm) doubles signal**. `irlink` now toggles both GPIO 47 and 49 simultaneously. At 10-20 feet: single LED gives +15 grid delta, dual gives +23. At pixel level: +200 for both.
 - **Camera setup order matters**. The `cam_setup.sh` script must: (1) start prudynt, (2) kill daynightd, (3) set night/monochrome mode, (4) turn off LEDs, (5) set ircut filter LAST (because other commands re-close it).
+- **RTSP first frames are black**. When opening a fresh RTSP stream, the first 5-15 frames are often completely black (codec init / ISP startup). Always flush 10-15 frames before using data. The calibration code does this (`grab_frames(cap, n=10)`), and pixel_rx flushes 15 frames on startup.
+- **Calibration coordinates shift when cameras move**. Pixel calibration is position-sensitive — even a small camera bump invalidates the (x,y) coordinates. Re-run `python -m host.cal_procedure --no-interactive` after any physical change. Stale coordinates point at dark pixels, giving baseline=0 and failed decodes.
+- **30fps RTSP caps symbol rate at ~120ms minimum**. At 30fps, frames arrive every ~33ms with occasional gaps up to 200ms. At 120ms/symbol, most symbols get 3+ samples. At 100ms, too many symbols fall entirely in frame gaps. The DPLL clock recovery handles jitter but cannot recover symbols with zero samples.
+- **DPLL must work on raw sample times, not interpolated grid**. Linear interpolation between sparse RTSP samples (33ms apart) creates fake transitions during frame gaps. The DPLL must detect edges in the actual sample timestamps, not in the interpolated 1ms signal. The brute-force t0 search on the interpolated grid is kept as a fallback.
+- **On-camera frame rate is ~18fps (not 30)**. BrightnessMonitor's `IMP_FrameSource_SnapFrame` on channel 1 (640x360) runs at ~18fps. Combined with the DPLL, 120ms/symbol still works (2+ samples per symbol). The host-side RTSP stream gives ~30fps — better oversampling.
+- **`irlink --pixel` writes ROI config to `/run/prudynt/roi_config`**. BrightnessMonitor reads this every frame and outputs pixel ROI to `/run/prudynt/brightness_roi`. The config persists until overwritten or prudynt restarts. If you switch between `--pixel` and `--block` modes, the old ROI config file may still exist — harmless, since `read_brightness()` checks `pixel_x >= 0` first.
 
 ## On-Camera Transceiver (irlink)
 
@@ -276,21 +286,28 @@ Frame payload format: `[msg_type] [seq_num] [data...]`
 irlink calibrate
 # Output: block index (e.g., 212)
 
-# Listen for incoming connection (daemon mode, auto-responds)
-irlink daemon-listen --block 212
+# Listen with pixel-level ROI (recommended, requires host calibration first)
+irlink listen --pixel 385,178 --speed 120
 
-# Connect and send a message
-irlink send "HELLO" --block 212
-
-# Interactive mode (type commands after handshake)
-irlink connect --block 212
-# Then: send <text>, ping, cal, quit
-
-# One-shot listen
+# Listen with grid block (legacy, lower SNR)
 irlink listen --block 212
 
-# Adjust symbol speed (default 160ms, use --speed)
-irlink connect --block 212 --speed 200
+# Raw TX — no handshake, for use with pixel_rx or passive monitoring
+irlink tx "HELLO" --speed 120
+irlink tx "HELLO" --pixel 385,178 --speed 120
+
+# Connect and send a message (with protocol handshake)
+irlink send "HELLO" --pixel 385,178 --speed 120
+
+# Daemon mode (auto-responds to incoming connections)
+irlink daemon-listen --pixel 385,178 --speed 120
+
+# Interactive mode (type commands after handshake)
+irlink connect --pixel 385,178 --speed 120
+# Then: send <text>, ping, cal, quit
+
+# Adjust ROI size (default 15, range 3-31)
+irlink listen --pixel 385,178 --roi-size 21 --speed 120
 ```
 
 ### AE Freeze During Communication
@@ -307,21 +324,23 @@ The freeze is controlled via `/run/prudynt/ae_freeze` — irlink writes `1` befo
 
 Two calibration methods:
 
-**On-camera (grid-based):** The 20x12 grid (240 blocks) finds the transmitter's block:
+**On-camera (grid-based, legacy):** The 20x12 grid (240 blocks) finds the transmitter's block:
 ```bash
 irlink calibrate    # toggle peer LED during 4s window
 ```
 
-**Host-side (pixel-level, recommended for distance):** Frame differencing finds the exact TX pixel:
+**Host-side (pixel-level, recommended):** Frame differencing finds the exact TX pixel:
 ```bash
 conda activate light
 python -m host.cal_procedure              # both directions, interactive
 python -m host.cal_procedure --no-interactive  # automated
 python -m host.cal_procedure --show        # show saved calibration
 ```
-Saves results to `host/calibration.json`. The pixel RX loads calibration automatically.
+Saves results to `host/calibration.json`. The pixel coordinates are used by:
+- `pixel_rx.py` — loads calibration automatically from the JSON file
+- `irlink --pixel x,y` — pass the coordinates from calibration to the on-camera receiver
 
-The host-side method gives +200 delta at 10-20 feet vs +10-15 with the grid method at the same distance.
+The host-side method gives delta +120-150 on-camera (via pixel ROI) and +200 via RTSP, vs +10-15 with the grid method at the same distance.
 
 ### Boot Automation
 
@@ -360,11 +379,14 @@ For long-distance communication (10-20 feet) where the grid-based on-camera RX h
 ```bash
 conda activate light
 python -m host.cal_procedure --no-interactive  # calibrate first
-python -m host.pixel_rx --cam cam2             # auto-loads calibration
-python -m host.pixel_rx --cam cam2 --tx-pos 384,178  # manual position
+python -m host.pixel_rx --cam cam2             # auto-loads calibration, 160ms default
+python -m host.pixel_rx --cam cam2 --symbol-ms 120  # faster speed
+python -m host.pixel_rx --cam cam2 --tx-pos 385,178  # manual position
 ```
 
-Reads the RTSP stream directly and tracks a small pixel ROI (15x15) around the calibrated TX position. Gets delta +200 at 10-20 feet vs +10-15 with the grid.
+Reads the RTSP stream directly and tracks a small pixel ROI (15x15) around the calibrated TX position. Uses DPLL clock recovery with early-late gate for robust symbol extraction. Gets delta +150-200 at 10-20 feet vs +10-15 with the grid. Reliable at 120ms/symbol (~4.2 bps).
+
+**Decoder architecture**: Two-pass decode — DPLL on raw sample timestamps first (handles irregular frame timing), brute-force t0 search on interpolated signal as fallback. The DPLL works directly with irregular RTSP sample times to avoid interpolation artifacts from frame gaps.
 
 ### After Fresh Firmware Flash
 
@@ -393,15 +415,21 @@ pytest tests/ -v
 # 2. Calibrate (find TX pixel locations)
 conda activate light
 python -m host.cal_procedure --no-interactive
+python -m host.cal_procedure --show    # verify calibration
 
-# 3a. On-camera communication (short distance, ~3 bps)
+# 3a. On-camera pixel RX (recommended, ~4.2 bps)
+# Use pixel coords from calibration (e.g., cam2 sees cam1 at 385,178)
+# On cam2: irlink listen --pixel 385,178 --speed 120
+# On cam1: irlink tx "HELLO" --speed 120
+# Or with protocol: irlink send "HELLO" --pixel <coords> --speed 120
+
+# 3b. Host-side pixel RX (~4.2 bps, best SNR)
+python -m host.pixel_rx --cam cam2 --symbol-ms 120    # auto-loads calibration
+# Then trigger TX from cam1: ssh da-camera1 "/opt/bin/irlink tx HELLO --speed 120"
+
+# 3c. On-camera grid RX (legacy, ~3 bps)
 # On cam1: irlink listen --block 212
-# On cam2: irlink connect --block 113
 # On cam2: irlink send "HELLO" --block 113
-
-# 3b. Host-side pixel RX (long distance, ~3 bps)
-python -m host.pixel_rx --cam cam2    # listens using calibration
-# Then trigger TX from cam1: ssh da-camera1 "/opt/bin/irlink connect --block 212"
 
 # Legacy: send via Python host orchestration
 python -m host.send_message "HELLO"

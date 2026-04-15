@@ -3,30 +3,30 @@
     "rx_cam": "cam2",
     "tx_cam": "cam1",
     "tx_pixel": [
-      384,
+      385,
       178
     ],
     "frame_size": [
       640,
       360
     ],
-    "off_value": 37,
-    "on_value": 251,
-    "delta": 214,
-    "peak_blurred": 185,
-    "timestamp": "20260414_191935",
+    "off_value": 94,
+    "on_value": 252,
+    "delta": 158,
+    "peak_blurred": 170,
+    "timestamp": "20260414_201711",
     "images": {
-      "box": "/data/python/light-cam-canto/photos/cal_cam2_sees_cam1_box_20260414_191935.png",
-      "diff": "/data/python/light-cam-canto/photos/cal_cam2_sees_cam1_diff_20260414_191935.png",
-      "zoom": "/data/python/light-cam-canto/photos/cal_cam2_sees_cam1_zoom_20260414_191935.png"
+      "box": "/data/python/light-cam-canto/photos/cal_cam2_sees_cam1_box_20260414_201711.png",
+      "diff": "/data/python/light-cam-canto/photos/cal_cam2_sees_cam1_diff_20260414_201711.png",
+      "zoom": "/data/python/light-cam-canto/photos/cal_cam2_sees_cam1_zoom_20260414_201711.png"
     }
   },
   "cam1_sees_cam2": {
     "rx_cam": "cam1",
     "tx_cam": "cam2",
     "tx_pixel": [
-      248,
-      179
+      247,
+      187
     ],
     "frame_size": [
       640,
@@ -35,12 +35,12 @@
     "off_value": 52,
     "on_value": 255,
     "delta": 203,
-    "peak_blurred": 195,
-    "timestamp": "20260414_192010",
+    "peak_blurred": 201,
+    "timestamp": "20260414_201724",
     "images": {
-      "box": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_box_20260414_192010.png",
-      "diff": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_diff_20260414_192010.png",
-      "zoom": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_zoom_20260414_192010.png"
+      "box": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_box_20260414_201724.png",
+      "diff": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_diff_20260414_201724.png",
+      "zoom": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_zoom_20260414_201724.png"
     }
   }
 }

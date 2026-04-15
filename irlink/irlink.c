@@ -37,6 +37,8 @@
 #define BRIGHTNESS_PATH     "/run/prudynt/brightness"
 #define GRID_PATH           "/run/prudynt/brightness_grid"
 #define AE_FREEZE_PATH      "/run/prudynt/ae_freeze"
+#define ROI_CONFIG_PATH     "/run/prudynt/roi_config"
+#define ROI_PATH            "/run/prudynt/brightness_roi"
 #define POLL_INTERVAL_US    5000
 #define MAX_SAMPLES         8192
 #define MAX_SYMBOLS         4096
@@ -74,6 +76,8 @@ static const uint8_t SYNC_WORD[] = {1,1,0,0,1,0,1,1};
 static volatile int running = 1;
 static volatile int tx_active = 0;  /* suppress RX during TX */
 static int tracked_block = -1;
+static int pixel_x = -1, pixel_y = -1;  /* pixel-level ROI center (-1 = disabled) */
+static int pixel_roi_size = 15;          /* ROI square size */
 static pthread_mutex_t tx_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* RX callback: called when a complete message is decoded */
@@ -353,10 +357,50 @@ static int read_grid(int64_t *ts_ms, uint8_t *blocks, int max_blocks)
     return count;
 }
 
-/* ---- Read brightness: raw block value (AE frozen during comms) ---- */
+/* ---- Write pixel ROI config for BrightnessMonitor ---- */
+
+static void write_roi_config(int x, int y, int size)
+{
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%d %d %d\n", x, y, size);
+    int fd = open(ROI_CONFIG_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        (void)write(fd, buf, len);
+        close(fd);
+    }
+}
+
+/* ---- Read pixel ROI brightness from BrightnessMonitor ---- */
+
+static int read_roi(int64_t *ts_ms, uint8_t *brightness)
+{
+    char buf[64];
+    int fd = open(ROI_PATH, O_RDONLY);
+    if (fd < 0) return -1;
+    int n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+
+    long long ts;
+    unsigned val;
+    if (sscanf(buf, "%lld %u", &ts, &val) == 2) {
+        *ts_ms = (int64_t)ts;
+        *brightness = (uint8_t)(val > 255 ? 255 : val);
+        return 0;
+    }
+    return -1;
+}
+
+/* ---- Read brightness: pixel ROI, grid block, or global ---- */
 
 static int read_brightness(int64_t *ts_ms, uint8_t *brightness)
 {
+    /* Prefer pixel ROI if configured */
+    if (pixel_x >= 0 && pixel_y >= 0) {
+        return read_roi(ts_ms, brightness);
+    }
+
     if (tracked_block >= 0) {
         uint8_t blocks[GRID_BLOCKS];
         int64_t grid_ts;
@@ -463,7 +507,154 @@ static int parse_frame(const uint8_t *bits, int n_bits, rx_message_t *msg)
     return length;
 }
 
-/* ---- Decode collected samples ---- */
+/* ---- DPLL decode: track clock from raw sample edges ---- */
+
+static int decode_samples_dpll(sample_t *samp, int n, rx_message_t *msg)
+{
+    if (n < 10) return -1;
+
+    uint8_t bmin = 255, bmax = 0;
+    for (int i = 1; i < n; i++) {
+        if (samp[i].brightness < bmin) bmin = samp[i].brightness;
+        if (samp[i].brightness > bmax) bmax = samp[i].brightness;
+    }
+
+    int delta = bmax - bmin;
+    if (delta < MIN_BRIGHTNESS_DELTA) return -1;
+
+    uint8_t threshold = (bmin + bmax) / 2;
+
+    fprintf(stderr, "RX: DPLL %d samples, brightness %d-%d, delta %d, threshold %d\n",
+            n, bmin, bmax, delta, threshold);
+
+    /* Digitize raw samples */
+    int8_t dig[MAX_SAMPLES];
+    for (int i = 0; i < n; i++)
+        dig[i] = samp[i].brightness >= threshold ? 1 : 0;
+
+    /* Find first rising edge */
+    int64_t first_edge_t = -1;
+    for (int i = 1; i < n; i++) {
+        if (dig[i] == 1 && dig[i-1] == 0) {
+            first_edge_t = (samp[i-1].ts_ms + samp[i].ts_ms) / 2;
+            break;
+        }
+    }
+    if (first_edge_t < 0) return -1;
+
+    double T = (double)symbol_ms;
+    static const double gains[] = {0.15, 0.25, 0.35};
+    static const double phase_offs[] = {0.5, 0.3, 0.7};
+
+    for (int gi = 0; gi < 3; gi++) {
+        for (int pi = 0; pi < 3; pi++) {
+            double gain = gains[gi];
+            double phase = first_edge_t + T * phase_offs[pi];
+
+            uint8_t symbols[MAX_SYMBOLS];
+            int n_sym = 0;
+            int64_t last_ts = samp[n-1].ts_ms;
+
+            while (phase < last_ts - T * 0.3 && n_sym < MAX_SYMBOLS) {
+                /* Collect raw samples in center 60% of symbol window */
+                double w_lo = phase - T * 0.3;
+                double w_hi = phase + T * 0.3;
+
+                int sum = 0, count = 0;
+                for (int i = 0; i < n; i++) {
+                    if (samp[i].ts_ms >= w_lo && samp[i].ts_ms <= w_hi) {
+                        sum += dig[i];
+                        count++;
+                    }
+                }
+
+                if (count == 0) {
+                    /* No samples — use nearest */
+                    int best_i = 0;
+                    int64_t best_dist = llabs(samp[0].ts_ms - (int64_t)phase);
+                    for (int i = 1; i < n; i++) {
+                        int64_t dist = llabs(samp[i].ts_ms - (int64_t)phase);
+                        if (dist < best_dist) {
+                            best_dist = dist;
+                            best_i = i;
+                        }
+                    }
+                    symbols[n_sym++] = dig[best_i];
+                } else {
+                    symbols[n_sym++] = (sum * 2 >= count) ? 1 : 0;
+                }
+
+                /* Phase correction: find nearest transition near boundary */
+                double boundary = phase + T * 0.5;
+                double search_lo = boundary - T * 0.4;
+                double search_hi = boundary + T * 0.4;
+
+                double best_edge = 0;
+                double best_dist = T * 0.4 + 1;
+                int found_edge = 0;
+
+                for (int j = 1; j < n; j++) {
+                    if (samp[j].ts_ms < search_lo || samp[j-1].ts_ms > search_hi)
+                        continue;
+                    if (dig[j] != dig[j-1]) {
+                        double edge_t = (samp[j-1].ts_ms + samp[j].ts_ms) / 2.0;
+                        double dist = edge_t > boundary ? edge_t - boundary : boundary - edge_t;
+                        if (dist < best_dist) {
+                            best_dist = dist;
+                            best_edge = edge_t;
+                            found_edge = 1;
+                        }
+                    }
+                }
+
+                if (found_edge) {
+                    double error = best_edge - boundary;
+                    phase += T + gain * error;
+                } else {
+                    phase += T;
+                }
+            }
+
+            if (n_sym < 20) continue;
+
+            /* Try decode with trims and both polarities */
+            for (int inv = 0; inv < 2; inv++) {
+                uint8_t *syms = symbols;
+                if (inv) {
+                    for (int i = 0; i < n_sym; i++)
+                        symbols[i] = symbols[i] ? 0 : 1;
+                }
+
+                for (int trim_s = 0; trim_s < 16; trim_s++) {
+                    for (int trim_e = 0; trim_e < 16; trim_e++) {
+                        int sc = n_sym - trim_s - trim_e;
+                        if (sc < 20 || sc % 2 != 0) continue;
+
+                        uint8_t bits[MAX_SYMBOLS / 2];
+                        int nb = manchester_decode(syms + trim_s, sc, bits);
+                        if (nb < 0) continue;
+
+                        if (parse_frame(bits, nb, msg) > 0) {
+                            fprintf(stderr, "RX: DPLL decoded (gain=%.2f, phase_off=%.1f, trim [%d:%d]%s)\n",
+                                    gain, phase_offs[pi], trim_s, trim_e, inv ? " inv" : "");
+                            return 0;
+                        }
+                    }
+                }
+
+                /* Undo inversion for next loop iteration */
+                if (inv) {
+                    for (int i = 0; i < n_sym; i++)
+                        symbols[i] = symbols[i] ? 0 : 1;
+                }
+            }
+        }
+    }
+
+    return -1;
+}
+
+/* ---- Decode collected samples (fixed-grid, original method) ---- */
 
 static int decode_samples(sample_t *samp, int n, rx_message_t *msg)
 {
@@ -816,7 +1007,8 @@ static void *rx_thread(void *arg)
 
                 rx_message_t msg;
                 memset(&msg, 0, sizeof(msg));
-                if (decode_samples(samples, n_samples, &msg) == 0) {
+                if (decode_samples_dpll(samples, n_samples, &msg) == 0 ||
+                    decode_samples(samples, n_samples, &msg) == 0) {
                     const char *names[] = {
                         [0]="?", [MSG_SYN]="SYN", [MSG_SYN_ACK]="SYN_ACK",
                         [MSG_ACK]="ACK", [MSG_DATA]="DATA",
@@ -1248,11 +1440,24 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* Parse --block and --speed from any position */
+    /* Parse --block, --pixel, and --speed from any position */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--block") == 0 && i + 1 < argc) {
             tracked_block = atoi(argv[i + 1]);
             fprintf(stderr, "irlink: tracking block %d\n", tracked_block);
+        } else if (strcmp(argv[i], "--pixel") == 0 && i + 1 < argc) {
+            if (sscanf(argv[i + 1], "%d,%d", &pixel_x, &pixel_y) != 2) {
+                fprintf(stderr, "irlink: --pixel must be x,y (e.g. --pixel 385,178)\n");
+                return 1;
+            }
+            fprintf(stderr, "irlink: pixel ROI at (%d, %d) size %d\n",
+                    pixel_x, pixel_y, pixel_roi_size);
+        } else if (strcmp(argv[i], "--roi-size") == 0 && i + 1 < argc) {
+            pixel_roi_size = atoi(argv[i + 1]);
+            if (pixel_roi_size < 3 || pixel_roi_size > 31) {
+                fprintf(stderr, "irlink: --roi-size must be 3-31\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "--speed") == 0 && i + 1 < argc) {
             symbol_ms = atoi(argv[i + 1]);
             if (symbol_ms < 40 || symbol_ms > 2000) {
@@ -1261,6 +1466,12 @@ int main(int argc, char *argv[])
             }
             fprintf(stderr, "irlink: symbol speed %d ms\n", symbol_ms);
         }
+    }
+
+    /* If pixel mode, write ROI config for BrightnessMonitor */
+    if (pixel_x >= 0 && pixel_y >= 0) {
+        write_roi_config(pixel_x, pixel_y, pixel_roi_size);
+        fprintf(stderr, "irlink: ROI config written to %s\n", ROI_CONFIG_PATH);
     }
 
     /* Scale ACK timeout to symbol speed: 3x max frame round-trip
@@ -1359,6 +1570,46 @@ int main(int argc, char *argv[])
 
         running = 0;
         pthread_join(rx_tid, NULL);
+        set_ae_freeze(0);
+        return 0;
+    }
+
+    if (strcmp(cmd, "tx") == 0) {
+        /* Raw TX: blast a Manchester DATA frame with no handshake or RX.
+           For use with host-side pixel_rx which decodes from the RTSP stream. */
+        if (argc < 3) {
+            fprintf(stderr, "Usage: irlink tx <text> [--speed N]\n");
+            return 1;
+        }
+        const char *text = NULL;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--speed") == 0 && i + 1 < argc) {
+                i++;
+                continue;
+            }
+            if (strcmp(argv[i], "--block") == 0 && i + 1 < argc) {
+                i++;
+                continue;
+            }
+            text = argv[i];
+            break;
+        }
+        if (!text) {
+            fprintf(stderr, "No message text provided\n");
+            return 1;
+        }
+
+        set_ae_freeze(1);
+        usleep(1000000);
+
+        int len = strlen(text);
+        if (len > MAX_PAYLOAD - 2) len = MAX_PAYLOAD - 2;
+
+        fprintf(stderr, "TX: raw send \"%s\" (%d bytes, speed=%dms)\n",
+                text, len, symbol_ms);
+        send_message(MSG_DATA, 1, (const uint8_t *)text, len);
+        fprintf(stderr, "TX: done\n");
+
         set_ae_freeze(0);
         return 0;
     }

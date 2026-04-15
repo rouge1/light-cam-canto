@@ -323,6 +323,13 @@ def get_tx_position(rx_name, tx_name):
     return entry["tx_pixel"][0], entry["tx_pixel"][1]
 
 
+def get_calibration_entry(rx_name, tx_name):
+    """Get full calibration entry for a given RX/TX pair."""
+    cal = load_calibration()
+    key = f"{rx_name}_sees_{tx_name}"
+    return cal.get(key)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="IR transmitter calibration")
     parser.add_argument("--rx", help="Receiver camera (cam1 or cam2)")

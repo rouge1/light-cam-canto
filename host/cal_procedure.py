@@ -33,6 +33,7 @@ CAM_PASSWORD = "password"
 
 PHOTOS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "photos")
 CAL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration.json")
+HTML_FILE = os.path.join(PHOTOS_DIR, "calibration.html")
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -296,6 +297,89 @@ def save_calibration(cal_data):
     with open(CAL_FILE, "w") as f:
         json.dump(cal_data, f, indent=2)
     print(f"\nCalibration saved to {CAL_FILE}")
+    write_html(cal_data)
+    print(f"HTML viewer updated: {HTML_FILE}")
+
+
+def _fmt_ts(ts):
+    """Format '20260421_165801' → '2026-04-21 16:58:01'."""
+    try:
+        return datetime.strptime(ts, "%Y%m%d_%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return ts or "unknown"
+
+
+def write_html(cal_data):
+    """Regenerate photos/calibration.html from calibration data."""
+    generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    rows = []
+    sections = []
+    for key, entry in cal_data.items():
+        rx, tx = entry["rx_cam"], entry["tx_cam"]
+        px, py = entry["tx_pixel"]
+        delta = entry["delta"]
+        off_v, on_v = entry["off_value"], entry["on_value"]
+        ts_human = _fmt_ts(entry.get("timestamp"))
+        box = os.path.basename(entry["images"]["box"])
+        diff = os.path.basename(entry["images"]["diff"])
+        zoom = os.path.basename(entry["images"]["zoom"])
+
+        rows.append(
+            f'<tr><td>{rx.upper()} sees {tx.upper()}</td>'
+            f'<td style="color:#0ff">({px}, {py})</td>'
+            f'<td style="color:#0f0">+{delta}</td>'
+            f'<td>{off_v}</td><td>{on_v}</td>'
+            f'<td style="color:#aaa">{ts_human}</td></tr>'
+        )
+
+        sections.append(f"""<div class="pair">
+<h2>{rx.upper()} sees {tx.upper()}</h2>
+<p class="summary">TX at <span>({px}, {py})</span> | Delta: <span>+{delta}</span> | <span style="color:#aaa;font-size:14px">{ts_human}</span></p>
+<h3>Analysis</h3>
+<div class="row">
+<figure><img src="{box}" width="320"><figcaption>Peak pixel marked</figcaption></figure>
+<figure><img src="{diff}" width="320"><figcaption>Diff heatmap</figcaption></figure>
+</div>
+<h3>Zoomed Peak (8x)</h3>
+<div class="row"><figure><img src="{zoom}" width="100%"><figcaption>OFF | ON | DIFF</figcaption></figure></div>
+</div>""")
+
+    if not rows:
+        rows.append('<tr><td colspan="6" style="color:#aaa">No calibration data</td></tr>')
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head><title>IR Calibration</title>
+<style>
+body{{background:#1a1a2e;color:#eee;font-family:sans-serif;margin:20px}}
+h1{{color:#e94560;margin-bottom:5px}} h2{{color:#fff;background:#e94560;display:inline-block;padding:5px 15px;border-radius:4px}}
+h3{{color:#aaa;margin-top:20px}}
+.pair{{margin:30px 0;padding:20px;background:#16213e;border-radius:8px}}
+.summary{{font-size:18px;margin:10px 0}} .summary span{{color:#0ff;font-weight:bold}}
+.row{{display:flex;gap:10px;flex-wrap:wrap;margin:15px 0}}
+.row figure{{margin:0;text-align:center}}
+.row figcaption{{color:#aaa;font-size:13px;margin-top:5px}}
+.row img{{border:2px solid #333;border-radius:4px}}
+table{{border-collapse:collapse;margin:15px 0}}
+td,th{{padding:8px 16px;border:1px solid #333;text-align:left}}
+th{{background:#0f3460}}
+.generated{{color:#888;font-size:13px;margin:0 0 20px 0}}
+</style></head><body>
+<h1>IR Calibration Results</h1>
+<p class="generated">Page generated: <span style="color:#0ff">{generated}</span></p>
+<table>
+<tr><th>Direction</th><th>TX Pixel</th><th>Delta</th><th>OFF</th><th>ON</th><th>Calibrated</th></tr>
+{chr(10).join(rows)}
+</table>
+
+{chr(10).join(sections)}
+
+</body></html>
+"""
+    os.makedirs(PHOTOS_DIR, exist_ok=True)
+    with open(HTML_FILE, "w") as f:
+        f.write(html)
 
 
 def show_calibration():

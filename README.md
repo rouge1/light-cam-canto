@@ -39,7 +39,7 @@ An experimental system that turns Wyze V3 security cameras into IR Li-Fi transce
 ### Hardware
 - 2x Wyze Cam V3 with [Thingino](https://github.com/themactep/thingino-firmware) firmware
 - Host PC (Linux)
-- WiFi network (cameras and PC on same subnet)
+- Connection to cameras: either (a) WiFi on a shared subnet, or (b) USB CDC-NCM direct to the PC (cam1 at `172.16.1.1`, cam2 at `172.16.2.1`) — see [CLAUDE.md → Networking](CLAUDE.md#networking-usb--wifi)
 
 ### Software
 ```bash

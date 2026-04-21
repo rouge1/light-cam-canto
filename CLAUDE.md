@@ -21,7 +21,7 @@ This project builds **custom firmware** on top of Thingino (https://github.com/t
 
 ### Custom Firmware Changes
 
-- **USB CDC-NCM networking** — added `BR2_PACKAGE_USBNET=y` and `BR2_PACKAGE_USBNET_USB_DIRECT_NCM=y` to defconfig (requires USB data cable, not yet tested)
+- **USB CDC-NCM networking** — `BR2_PACKAGE_USBNET=y` + `BR2_PACKAGE_USBNET_USB_DIRECT_NCM=y` in defconfig. Working on both cameras. See [Networking](#networking-usb--wifi) for IPs, SSH aliases, and the JFFS2 patches that are not yet baked into firmware source.
 - **BrightnessMonitor** — patched prudynt-t to expose per-frame brightness via `/run/prudynt/brightness`, per-block grid via `/run/prudynt/brightness_grid`, and pixel-level ROI via `/run/prudynt/brightness_roi` using `IMP_FrameSource_SnapFrame` API
 - **AE Freeze control** — BrightnessMonitor reads `/run/prudynt/ae_freeze` and calls `IMP_ISP_Tuning_SetAeFreeze` to lock/unlock auto-exposure. Written by irlink during communication.
 
@@ -168,7 +168,19 @@ Host da-camera2
     HostName 192.168.50.141
     User root
     IdentityFile ~/.ssh/cam_key
+
+Host usb-cam1
+    HostName 172.16.1.1
+    User root
+    IdentityFile ~/.ssh/cam_key
+
+Host usb-cam2
+    HostName 172.16.2.1
+    User root
+    IdentityFile ~/.ssh/cam_key
 ```
+
+See [Networking](#networking-usb--wifi) for how the USB IPs get assigned.
 
 ### Code Deployment to Camera
 ```bash
@@ -212,6 +224,32 @@ BOARD=wyze_cam3_t31x_gc2053_atbm6031 make prudynt-t-rebuild
 | `/usr/bin/`, `/usr/lib/` | SquashFS | Read-only | Stock firmware |
 | `/tmp/` | RAM | No | Temp files |
 | `/run/prudynt/` | RAM | No | Prudynt runtime data |
+
+## Networking (USB + WiFi)
+
+Each camera exposes both WiFi and a USB CDC-NCM gadget. Both come up at boot and coexist.
+
+| Camera | WiFi | USB gadget | SSH alias |
+|--------|------|-----------|-----------|
+| cam1 | 192.168.50.110 | 172.16.1.1 (/24) | `da-camera1`, `usb-cam1` |
+| cam2 | 192.168.50.141 | 172.16.2.1 (/24) | `da-camera2`, `usb-cam2` |
+
+On the USB side: camera has static IP on `usb0` and runs `udhcpd` + `dnsd`. The PC's USB-NCM interface (named `enx<camera_ethaddr>`) gets `172.16.X.2` via DHCP automatically.
+
+### On-camera JFFS2 patches (not yet in firmware source)
+
+Four on-camera files were edited directly to get this working. Originals saved as `*.orig` next to each.
+
+- `/etc/init.d/S36cdcnet` — at the top of `start()`, add `ethaddr=$(fw_printenv -n ethaddr)` so `decrement_mac` works (stock script fails silently at boot). Set `CNET=172.16.X.1` per camera. Add `ifconfig usb0 $CNET netmask 255.255.255.0 up` after `usb-role -m device`.
+- `/etc/udhcpd.conf` — set `start 172.16.X.2`, `end 172.16.X.254`, `opt dns 172.16.X.1`.
+- `/etc/dnsd.conf` — set `thingino.local 172.16.X.1`.
+- `/etc/init.d/S38wpa_supplicant` — delete the `if iface_exists "usb0"; then … exit 1; fi` block (~lines 251-254). This guard exists in stock Thingino to skip WiFi when the USB gadget is used for captive-portal setup; we want both running.
+
+These live only in each camera's JFFS2 `/etc`. A reflash wipes them. Firmware source locations and two bake-in plans are documented but not applied — see memory note.
+
+### Web UI WiFi toggle still works
+
+Disabling WiFi via the web UI writes `#auto wlan0` to `/etc/network/interfaces.d/wlan0`. `S38wpa_supplicant` still honors that check — it's independent of our `usb0` patch. Once disabled that way, WiFi stays off across reboots until re-enabled in the web UI.
 
 ## Common Pitfalls
 
@@ -258,6 +296,12 @@ BOARD=wyze_cam3_t31x_gc2053_atbm6031 make prudynt-t-rebuild
 - **DPLL must work on raw sample times, not interpolated grid**. Linear interpolation between sparse RTSP samples (33ms apart) creates fake transitions during frame gaps. The DPLL must detect edges in the actual sample timestamps, not in the interpolated 1ms signal. The brute-force t0 search on the interpolated grid is kept as a fallback.
 - **On-camera frame rate is ~18fps (not 30)**. BrightnessMonitor's `IMP_FrameSource_SnapFrame` on channel 1 (640x360) runs at ~18fps. Combined with the DPLL, 120ms/symbol still works (2+ samples per symbol). The host-side RTSP stream gives ~30fps — better oversampling.
 - **`irlink --pixel` writes ROI config to `/run/prudynt/roi_config`**. BrightnessMonitor reads this every frame and outputs pixel ROI to `/run/prudynt/brightness_roi`. The config persists until overwritten or prudynt restarts. If you switch between `--pixel` and `--block` modes, the old ROI config file may still exist — harmless, since `read_brightness()` checks `pixel_x >= 0` first.
+- **Wyze V3 USB port carries power AND data on one physical connector.** Every USB cable change is a hard reboot of the camera — wait ~60s for it to come back on WiFi before reconnecting via SSH.
+- **Direct USB-A plug can fail enumeration.** Plugging the camera directly into a motherboard USB-A port sometimes produces `dwc2 … session end detected!` and `gadget pullup defered, current mode: host` in the camera's `dmesg`, and no USB device on the PC. Going through a USB-C dock (Genesys Logic hub inside a common USB-C hub) gives clean enumeration with zero errors. Working dmesg line on the camera: `g_ncm gadget: high-speed config #1: CDC Ethernet (NCM)`.
+- **Stock `S36cdcnet` fails silently at boot.** The script calls `decrement_mac`, which reads `$ethaddr` as a shell variable that's never set. Result: g_ncm never loads, no USB networking, no error visible in `logread`. Workaround is to add `ethaddr=$(fw_printenv -n ethaddr)` at the top of `start()` — see [Networking](#networking-usb--wifi).
+- **Stock `S36cdcnet` doesn't assign an IP to `usb0`**. Even when the module loads, `usb0` has no address — `udhcpd` binds to its `-I` address, but packets never flow. Must be added manually.
+- **Stock `S38wpa_supplicant` refuses to start WiFi if `usb0` exists.** A deliberate design choice in Thingino (USB gadget = "captive portal" mode). Remove the `iface_exists "usb0"` exit block to have both paths live. Web UI's own disable-WiFi control uses a different check (`#auto wlan0` in `/etc/network/interfaces.d/wlan0`) and still works correctly.
+- **Two cameras on the same PC need different USB subnets.** Both cameras ship with `172.16.0.0/24` on `udhcpd`. If you plug both in, the host ends up with two interfaces on the same /24 and routing to `172.16.0.1` is ambiguous. Current workaround: patch each camera's config to use `172.16.1.0/24` (cam1) and `172.16.2.0/24` (cam2).
 
 ## On-Camera Transceiver (irlink)
 

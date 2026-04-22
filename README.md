@@ -33,6 +33,8 @@ An experimental system that turns Wyze V3 security cameras into IR Li-Fi transce
 | Half-duplex protocol | ~3 bps | Working (SYN/ACK + AE freeze) |
 | Host-side pixel calibration | N/A | Working (frame diff, saves to calibration.json) |
 | Raw TX mode | ~4.2 bps | Working (`irlink tx` — no handshake, for pixel_rx) |
+| Application layer | — | Working (`protocol/app.py` — typed messages on top of DATA, fragmentation for >16B) |
+| Session orchestrator | — | Working (`host/session.py` — handshake + bilateral HELLO/META/META_ACK; carrier-aware ACK + send-complete serialization handle the back-to-back multi-message case) |
 
 ## Requirements
 
@@ -72,23 +74,31 @@ ssh da-camera1 "irlink tx 'HELLO' --speed 120"              # TX
 python -m host.pixel_rx --cam cam2 --symbol-ms 120          # RX
 ssh da-camera1 "/opt/bin/irlink tx 'HELLO' --speed 120"     # TX
 
+# 5c. App-layer session orchestrator (laptop drives both cams over SSH)
+python -m host.session --dry-run                            # offline pack/unpack check
+python -m host.session --handshake-only --symbol-ms 160     # SSH + handshake
+python -m host.session --symbol-ms 160 --text "HI"          # full HELLO→META→CAL→TEXT→BYE
+
 # 6. Run tests
-pytest tests/ -v
+pytest tests/ -v   # 50 tests: protocol + app layer
 ```
 
 ## Project Structure
 
 ```
 irlink/        — Combined half-duplex transceiver: TX+RX, DPLL decode, pixel ROI (C, MIPS)
+                 interactive cmds: send / send-hex / ping / cal / stats / quit
 protocol/      — Manchester encoding, CRC-8, frame encode/decode (Python)
+  app.py            — Typed app-layer messages on top of DATA: HELLO/META/CAL_RESULT/STATS/TEXT/BYE/CHUNK/NACK + fragment/reassemble
 host/          — Calibration, pixel RX, SSH orchestration, camera setup
   cal_procedure.py  — Pixel-level calibration via RTSP frame differencing
   pixel_rx.py       — Host-side RTSP pixel receiver with DPLL clock recovery
   cam_setup.sh      — Camera pre-flight: night mode, ircut, LEDs, prudynt
+  session.py        — App-layer orchestrator: SSH-driven HELLO→META→CAL→TEXT→BYE flow
 transmitter/   — TX: shell scripts (Phase 1), C GPIO binary (Phase 2)
 receiver/      — RX: standalone on-camera decoder + legacy host-side RTSP decoder
 photos/        — Calibration images, calibration.html viewer
-tests/         — 23 pytest tests (protocol layer)
+tests/         — 50 pytest tests (protocol + app layers)
 ```
 
 See [CLAUDE.md](CLAUDE.md) for detailed hardware docs, GPIO pinouts, firmware build instructions, and common pitfalls.

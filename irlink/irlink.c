@@ -93,6 +93,22 @@ static rx_message_t rx_msg;
 static pthread_mutex_t rx_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t rx_cond = PTHREAD_COND_INITIALIZER;
 
+/* ---- Link counters (reported via `stats` command) ---- */
+static int tx_count = 0;
+static int rx_count = 0;
+static int crc_fail_count = 0;
+static int retransmit_count = 0;
+static int dpll_loss_count = 0;
+
+/* ---- Carrier-aware ACK timeout ----
+ * Timestamp of last peer-carrier sample seen by rx_thread (rx_thread is gated
+ * by `tx_active`, so updates only happen when we're not transmitting).
+ * Used by wait_for_msg() to extend ACK deadline while peer is mid-TX, instead
+ * of timing out and retransmitting on top of an in-flight peer DATA. */
+static volatile int64_t last_carrier_ms = 0;
+#define CARRIER_RECENT_MS    1500   /* "peer is TXing now" if seen within this window */
+#define ACK_HARD_CEILING_X   3      /* hard ceiling = ACK_HARD_CEILING_X * ack_timeout_ms */
+
 /* ---- Signal handler ---- */
 
 static void sighandler(int sig)
@@ -315,6 +331,7 @@ static void send_message(uint8_t msg_type, uint8_t seq,
     const char *name = (msg_type <= MSG_PONG) ? type_names[msg_type] : "???";
     fprintf(stderr, "TX: %s seq=%d (%d symbols)\n", name, seq, n);
 
+    tx_count++;
     transmit_symbols(symbols, n);
 }
 
@@ -942,15 +959,31 @@ static void *rx_thread(void *arg)
         }
         last_ts = ts_ms;
 
-        /* After TX ends, briefly update baseline (AE is frozen, so fast) */
+        /* After self-TX ends, observe a 500ms settling window.
+           Track MIN (assumed-quiet: LED off) rather than last-sample, so
+           that if the peer starts TXing during this window (fast turnaround
+           in half-duplex), we don't mistake the peer's bright state for
+           baseline. Emit baseline = min after the window closes. */
+        static uint8_t settle_min = 255;
+        static uint8_t settle_max = 0;
         if (tx_end_time > 0 && now_ms() - tx_end_time < 500) {
-            baseline = brightness;
-            baseline_set = 1;
-            last_change_ms = now_ms();
+            if (brightness < settle_min) settle_min = brightness;
+            if (brightness > settle_max) settle_max = brightness;
             usleep(POLL_INTERVAL_US);
             continue;
         }
-        tx_end_time = 0;
+        if (tx_end_time > 0) {
+            /* Window closed — commit baseline using min seen. */
+            baseline = settle_min;
+            baseline_set = 1;
+            last_change_ms = now_ms();
+            fprintf(stderr, "RX: post-TX baseline=%d (min over 500ms, range=%d)\n",
+                    baseline, (int)settle_max - (int)settle_min);
+            settle_min = 255;
+            settle_max = 0;
+            tx_end_time = 0;
+            debug_count = 0;  /* re-arm brightness debug */
+        }
 
         if (!baseline_set) {
             baseline = brightness;
@@ -975,6 +1008,10 @@ static void *rx_thread(void *arg)
         case IDLE:
             if (diff >= MIN_BRIGHTNESS_DELTA) {
                 active_count++;
+                /* Carrier hint: even a single above-threshold sample is enough
+                   to bump the ACK-wait deadline — false positives only delay,
+                   never lose data. */
+                last_carrier_ms = now_ms();
                 if (active_count >= 2) {  /* require 2 consecutive frames (AE frozen = clean signal) */
                     fprintf(stderr, "RX: activity detected (baseline=%d, now=%d, delta=%d)\n",
                             baseline, brightness, diff);
@@ -996,6 +1033,8 @@ static void *rx_thread(void *arg)
                 samples[n_samples].brightness = brightness;
                 n_samples++;
             }
+            /* Carrier confirmed — keep extending the ACK deadline. */
+            last_carrier_ms = now_ms();
 
             /* Use higher threshold to keep settle timer running —
              * only reset on strong signal, not baseline drift */
@@ -1007,8 +1046,14 @@ static void *rx_thread(void *arg)
 
                 rx_message_t msg;
                 memset(&msg, 0, sizeof(msg));
-                if (decode_samples_dpll(samples, n_samples, &msg) == 0 ||
-                    decode_samples(samples, n_samples, &msg) == 0) {
+                int dpll_ok = (decode_samples_dpll(samples, n_samples, &msg) == 0);
+                int decoded = dpll_ok;
+                if (!decoded) {
+                    decoded = (decode_samples(samples, n_samples, &msg) == 0);
+                    if (decoded) dpll_loss_count++;
+                }
+                if (decoded) {
+                    rx_count++;
                     const char *names[] = {
                         [0]="?", [MSG_SYN]="SYN", [MSG_SYN_ACK]="SYN_ACK",
                         [MSG_ACK]="ACK", [MSG_DATA]="DATA",
@@ -1021,6 +1066,12 @@ static void *rx_thread(void *arg)
                             n, msg.seq, msg.data_len);
 
                     if (msg.msg_type == MSG_DATA && msg.data_len > 0) {
+                        /* Hex form is binary-safe (app-layer payloads may contain \0).
+                           Text form kept for legacy/human use but will truncate at \0. */
+                        printf("MSG-HEX: ");
+                        for (int i = 0; i < msg.data_len; i++)
+                            printf("%02x", msg.data[i]);
+                        printf("\n");
                         msg.data[msg.data_len] = '\0';
                         printf("MSG: %s\n", (char *)msg.data);
                         fflush(stdout);
@@ -1031,7 +1082,22 @@ static void *rx_thread(void *arg)
                     rx_msg = msg;
                     pthread_cond_signal(&rx_cond);
                     pthread_mutex_unlock(&rx_mutex);
+
+                    /* Auto-ACK DATA / auto-PONG PING from rx_thread.
+                       The interactive_mode main loop blocks in fgets() with no
+                       way to be woken by rx_cond — without this, an incoming
+                       DATA sits in rx_msg until the orchestrator's NEXT stdin
+                       command arrives, deadlocking any wait=True send_app on
+                       the peer side. wait_for_msg consumers still see the
+                       message; they just no longer need to ACK it themselves.
+                       CAL_REQ stays main-handled (needs LED-on hold). */
+                    if (msg.msg_type == MSG_DATA) {
+                        send_message(MSG_ACK, msg.seq, NULL, 0);
+                    } else if (msg.msg_type == MSG_PING) {
+                        send_message(MSG_PONG, 0, NULL, 0);
+                    }
                 } else {
+                    crc_fail_count++;
                     fprintf(stderr, "RX: decode failed\n");
                 }
 
@@ -1054,14 +1120,17 @@ static void *rx_thread(void *arg)
 
 static int wait_for_msg(uint8_t expected_type, rx_message_t *out, int timeout_ms)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += timeout_ms / 1000;
-    ts.tv_nsec += (timeout_ms % 1000) * 1000000;
-    if (ts.tv_nsec >= 1000000000) {
-        ts.tv_sec++;
-        ts.tv_nsec -= 1000000000;
-    }
+    /* Carrier-aware deadline:
+     *   - base deadline = now + timeout_ms
+     *   - hard ceiling  = now + ACK_HARD_CEILING_X * timeout_ms
+     *   On each timeout, if rx_thread observed peer carrier within
+     *   CARRIER_RECENT_MS, push the deadline out by another `timeout_ms` (capped
+     *   at hard ceiling). Prevents premature retransmit on top of an in-flight
+     *   peer DATA frame, while still failing fast on a truly dead link. */
+    int64_t start_ms = now_ms();
+    int64_t hard_deadline_ms = start_ms + (int64_t)timeout_ms * ACK_HARD_CEILING_X;
+    int64_t deadline_ms = start_ms + timeout_ms;
+    int extensions = 0;
 
     pthread_mutex_lock(&rx_mutex);
     while (running) {
@@ -1071,10 +1140,42 @@ static int wait_for_msg(uint8_t expected_type, rx_message_t *out, int timeout_ms
             pthread_mutex_unlock(&rx_mutex);
             return 0;
         }
-        rx_msg.valid = 0;  /* consume stale messages */
+        if (rx_msg.valid) {
+            /* Non-matching message — rx_thread already auto-ACKed/auto-PONGed
+               DATA/PING, so just consume here and keep waiting for the
+               expected reply. CAL_REQ is left for main-loop handling. */
+            rx_msg.valid = 0;
+            continue;
+        }
 
-        int ret = pthread_cond_timedwait(&rx_cond, &rx_mutex, &ts);
+        /* Compute REALTIME timespec for this iteration's deadline. */
+        struct timespec ts_realtime;
+        clock_gettime(CLOCK_REALTIME, &ts_realtime);
+        int64_t now_mono = now_ms();
+        int64_t remaining_ms = deadline_ms - now_mono;
+        if (remaining_ms < 0) remaining_ms = 0;
+        ts_realtime.tv_sec += remaining_ms / 1000;
+        ts_realtime.tv_nsec += (remaining_ms % 1000) * 1000000L;
+        if (ts_realtime.tv_nsec >= 1000000000L) {
+            ts_realtime.tv_sec++;
+            ts_realtime.tv_nsec -= 1000000000L;
+        }
+
+        int ret = pthread_cond_timedwait(&rx_cond, &rx_mutex, &ts_realtime);
         if (ret == ETIMEDOUT) {
+            int64_t now2 = now_ms();
+            int64_t since_carrier = now2 - last_carrier_ms;
+            if (now2 < hard_deadline_ms && since_carrier < CARRIER_RECENT_MS) {
+                /* Peer is still TXing — extend deadline. */
+                deadline_ms = now2 + timeout_ms;
+                if (deadline_ms > hard_deadline_ms) deadline_ms = hard_deadline_ms;
+                extensions++;
+                fprintf(stderr,
+                        "PROTO: ACK wait extended (peer carrier %lldms ago, ext=%d, %lldms left to ceiling)\n",
+                        (long long)since_carrier, extensions,
+                        (long long)(hard_deadline_ms - now2));
+                continue;
+            }
             pthread_mutex_unlock(&rx_mutex);
             return -1;
         }
@@ -1171,9 +1272,8 @@ static int do_listen(void)
 
 /* ---- Send data with ACK ---- */
 
-static int do_send(const char *text)
+static int do_send_bytes(const uint8_t *data, int len)
 {
-    int len = strlen(text);
     if (len > MAX_PAYLOAD - 2) {
         fprintf(stderr, "PROTO: message too long (%d, max %d)\n", len, MAX_PAYLOAD - 2);
         return -1;
@@ -1182,7 +1282,8 @@ static int do_send(const char *text)
     static uint8_t seq = 1;
 
     for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-        send_message(MSG_DATA, seq, (const uint8_t *)text, len);
+        if (attempt > 0) retransmit_count++;
+        send_message(MSG_DATA, seq, data, len);
 
         fprintf(stderr, "PROTO: waiting for ACK seq=%d...\n", seq);
         rx_message_t reply;
@@ -1201,6 +1302,36 @@ static int do_send(const char *text)
 
     fprintf(stderr, "PROTO: send failed after %d retries\n", MAX_RETRIES);
     return -1;
+}
+
+static int do_send(const char *text)
+{
+    return do_send_bytes((const uint8_t *)text, strlen(text));
+}
+
+/* Decode an ASCII hex string into raw bytes. Allows spaces between bytes.
+   Returns number of bytes written, or -1 on malformed input. */
+static int hex_decode(const char *hex, uint8_t *out, int max_out)
+{
+    int n = 0;
+    while (*hex && n < max_out) {
+        while (*hex == ' ' || *hex == '\t') hex++;
+        if (!*hex) break;
+        int hi, lo;
+        char c = *hex++;
+        if      (c >= '0' && c <= '9') hi = c - '0';
+        else if (c >= 'a' && c <= 'f') hi = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') hi = c - 'A' + 10;
+        else return -1;
+        c = *hex++;
+        if (!c) return -1;
+        if      (c >= '0' && c <= '9') lo = c - '0';
+        else if (c >= 'a' && c <= 'f') lo = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') lo = c - 'A' + 10;
+        else return -1;
+        out[n++] = (uint8_t)((hi << 4) | lo);
+    }
+    return n;
 }
 
 /* ---- Calibrate over the link ---- */
@@ -1294,20 +1425,35 @@ static int interactive_mode(int is_listener)
 
     /* Event loop: read stdin commands, handle incoming messages */
     fprintf(stderr, "\nirlink: connected! Commands:\n");
-    fprintf(stderr, "  send <text>    — send data message\n");
-    fprintf(stderr, "  ping           — measure round-trip time\n");
-    fprintf(stderr, "  cal            — request peer calibration\n");
-    fprintf(stderr, "  quit           — exit\n\n");
+    fprintf(stderr, "  send <text>        — send data message (text, stops at NUL)\n");
+    fprintf(stderr, "  send-hex <hex>     — send binary-safe DATA (hex-encoded)\n");
+    fprintf(stderr, "  ping               — measure round-trip time\n");
+    fprintf(stderr, "  cal                — request peer calibration\n");
+    fprintf(stderr, "  stats              — print link counters\n");
+    fprintf(stderr, "  quit               — exit\n\n");
 
-    char line[512];
+    char line[1024];
     while (running && fgets(line, sizeof(line), stdin)) {
         /* Strip newline */
         int len = strlen(line);
         while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
             line[--len] = '\0';
 
-        if (strncmp(line, "send ", 5) == 0) {
+        if (strncmp(line, "send-hex ", 9) == 0) {
+            uint8_t buf[MAX_PAYLOAD];
+            int nbytes = hex_decode(line + 9, buf, sizeof(buf));
+            if (nbytes < 0) {
+                fprintf(stderr, "Bad hex: %s\n", line + 9);
+            } else {
+                do_send_bytes(buf, nbytes);
+            }
+        } else if (strncmp(line, "send ", 5) == 0) {
             do_send(line + 5);
+        } else if (strcmp(line, "stats") == 0) {
+            printf("STATS: tx=%d rx=%d crc=%d rtx=%d dll=%d\n",
+                   tx_count, rx_count, crc_fail_count,
+                   retransmit_count, dpll_loss_count);
+            fflush(stdout);
         } else if (strcmp(line, "ping") == 0) {
             int64_t t0 = now_ms();
             send_message(MSG_PING, 0, NULL, 0);
@@ -1328,23 +1474,15 @@ static int interactive_mode(int is_listener)
             fprintf(stderr, "Unknown command: %s\n", line);
         }
 
-        /* Check for incoming messages that arrived while we were sending */
+        /* rx_thread auto-ACKs DATA and auto-PONGs PING. Just drain rx_msg
+           here; CAL_REQ still needs main-thread handling because it has to
+           hold the LED on for several seconds. */
         pthread_mutex_lock(&rx_mutex);
         if (rx_msg.valid) {
-            if (rx_msg.msg_type == MSG_DATA) {
-                uint8_t seq = rx_msg.seq;
-                rx_msg.valid = 0;
-                pthread_mutex_unlock(&rx_mutex);
-                send_message(MSG_ACK, seq, NULL, 0);
-            } else if (rx_msg.msg_type == MSG_CAL_REQ) {
+            if (rx_msg.msg_type == MSG_CAL_REQ) {
                 rx_msg.valid = 0;
                 pthread_mutex_unlock(&rx_mutex);
                 handle_cal_request();
-            } else if (rx_msg.msg_type == MSG_PING) {
-                rx_msg.valid = 0;
-                pthread_mutex_unlock(&rx_mutex);
-                fprintf(stderr, "PROTO: responding to PING\n");
-                send_message(MSG_PONG, 0, NULL, 0);
             } else {
                 rx_msg.valid = 0;
                 pthread_mutex_unlock(&rx_mutex);
@@ -1392,15 +1530,11 @@ static int daemon_mode(int is_listener)
     while (running) {
         rx_message_t msg;
         if (wait_for_any_msg(&msg, 1000) == 0) {
+            /* rx_thread already auto-ACKed DATA and auto-PONGed PING;
+               daemon just needs to handle the heavier protocol cases. */
             switch (msg.msg_type) {
-            case MSG_DATA:
-                send_message(MSG_ACK, msg.seq, NULL, 0);
-                break;
             case MSG_CAL_REQ:
                 handle_cal_request();
-                break;
-            case MSG_PING:
-                send_message(MSG_PONG, 0, NULL, 0);
                 break;
             case MSG_SYN:
                 send_message(MSG_SYN_ACK, 0, NULL, 0);
@@ -1475,10 +1609,19 @@ int main(int argc, char *argv[])
     }
 
     /* Scale ACK timeout to symbol speed: 3x max frame round-trip
-     * Max frame = ~140 symbols (DATA with short payload).
-     * Round-trip = 2 * (frame TX + gap + settle + decode) */
-    ack_timeout_ms = 140 * symbol_ms * 4 + 10000;
-    fprintf(stderr, "irlink: ack timeout %d ms\n", ack_timeout_ms);
+     * One round-trip:
+     *   - max DATA frame (16B app payload, the single-frame ceiling): ~324 sym
+     *     (preamble+sync+length+payload+crc Manchester-encoded + postamble)
+     *   - max ACK frame (1B seq):                                      ~84 sym
+     *   - inter-message gap + AE settle + decode slack                 ~5000 ms
+     *
+     * Carrier-aware extension in wait_for_msg() pushes this out by up to
+     * ACK_HARD_CEILING_X if the rx_thread is still seeing peer carrier — so we
+     * keep the BASE timeout tight (faster retransmit on truly dead links) and
+     * lean on the extension to cover legitimate slow flows. */
+    ack_timeout_ms = 450 * symbol_ms + 5000;
+    fprintf(stderr, "irlink: ack timeout %d ms (hard ceiling %d ms via carrier extension)\n",
+            ack_timeout_ms, ack_timeout_ms * ACK_HARD_CEILING_X);
 
     signal(SIGINT, sighandler);
     signal(SIGTERM, sighandler);

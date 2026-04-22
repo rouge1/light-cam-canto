@@ -116,8 +116,13 @@ Self-clocking — the receiver can never lose sync.
 ```
 irlink/            — Combined half-duplex transceiver with protocol layer
   irlink.c         — TX+RX threads, SYN/ACK/DATA/PING/CAL protocol, DPLL decode, pixel ROI (C, MIPS)
+                     interactive cmds: send, send-hex, ping, cal, stats, quit
+                     stdout: MSG-HEX:<hex> (binary-safe) + MSG:<text> (legacy) for received DATA
   Makefile         — Cross-compilation, deploy to both cameras
 protocol/          — Manchester encoding, CRC-8, frame encode/decode (pure Python)
+  app.py           — Application-layer messages on top of DATA payload:
+                     HELLO/META/META_ACK/CAL_RESULT/STATS/TEXT/BYE/CHUNK/CHUNK_ACK/NACK
+                     fragment()/reassemble() for payloads exceeding 16-byte single-frame budget
 transmitter/       — TX code: shell scripts, C GPIO binary, Makefile
   tx_pwm.c         — Phase 2: C binary using sysfs GPIO, cross-compiled for MIPS
   Makefile         — Cross-compilation via Thingino toolchain
@@ -133,11 +138,14 @@ host/              — Host-side orchestration: SSH, config, end-to-end CLI
   cal_procedure.py — Pixel-level calibration: diff LED-on/off RTSP frames to find TX
   calibration.json — Saved calibration data (TX pixel coords per camera pair)
   pixel_rx.py      — Host-side RTSP pixel receiver (DPLL decode, 120ms/symbol)
+  session.py       — App-layer orchestrator: SSH-driven HELLO→META→CAL→TEXT→BYE flow
+                     (`python -m host.session [--dry-run] [--handshake-only] [--symbol-ms N]`)
 photos/            — Calibration images, debug snapshots, calibration.html viewer
   find_transmitter.py — One-shot TX locator with bounding box
   grab_grid.py     — RTSP frame grab with brightness grid overlay
   calibration.html — Visual calibration report (serve with python -m http.server)
-tests/             — pytest: 26 tests covering protocol layer
+tests/             — pytest: 50 tests covering protocol + app layer
+  test_app.py      — Pack/unpack roundtrip, fragment/reassemble, drift-budget assertions
 thingino-firmware/ — Thingino build tree (not committed, clone separately)
 ```
 
@@ -302,6 +310,19 @@ Disabling WiFi via the web UI writes `#auto wlan0` to `/etc/network/interfaces.d
 - **Stock `S36cdcnet` doesn't assign an IP to `usb0`**. Even when the module loads, `usb0` has no address — `udhcpd` binds to its `-I` address, but packets never flow. Must be added manually.
 - **Stock `S38wpa_supplicant` refuses to start WiFi if `usb0` exists.** A deliberate design choice in Thingino (USB gadget = "captive portal" mode). Remove the `iface_exists "usb0"` exit block to have both paths live. Web UI's own disable-WiFi control uses a different check (`#auto wlan0` in `/etc/network/interfaces.d/wlan0`) and still works correctly.
 - **Two cameras on the same PC need different USB subnets.** Both cameras ship with `172.16.0.0/24` on `udhcpd`. If you plug both in, the host ends up with two interfaces on the same /24 and routing to `172.16.0.1` is ambiguous. Current workaround: patch each camera's config to use `172.16.1.0/24` (cam1) and `172.16.2.0/24` (cam2).
+- **DPLL clock drift, not SNR, is the long-frame failure mode.** Live test at 120ms/sym, indoor, Δ~85: 16-byte payloads decode 100%, 25-byte 50%, 43-byte 0%. Failure mode is "valid Manchester for ~80 syms then illegal pairs mid-frame" — DPLL loses lock, not bit errors from low SNR. **FEC won't help** — it corrects flipped bits, not lost symbol-boundary lock. The fix is **fragment to short frames** (each frame gets a fresh preamble and DPLL re-locks). The 16-byte ceiling is enforced everywhere in `protocol/app.py`.
+- **On-camera DPLL needs a slower symbol rate than RTSP-side.** RTSP runs ~30fps (3.6 samples/sym at 120ms); on-camera BrightnessMonitor runs ~18fps (2.2 samples/sym at 120ms). Same payload that decodes via `pixel_rx.py` at 120ms/sym can fail in `irlink listen --pixel` at 120ms. Bump on-camera flows to **160ms/sym** (default in `host/session.py`).
+- **`irlink` post-TX baseline-capture races peer's TX.** During the 500ms post-self-TX settling window, the original code set `baseline = current_brightness` every sample. If the peer started TXing during that window (fast turnaround in half-duplex protocol), baseline got captured at the peer's BRIGHT state. Then post-peer-TX the brightness returned to ambient ~80 units away, with `diff` permanently above SETTLE_MS reset threshold — RX stuck in ACTIVE state, never decoded. Fixed in irlink.c by tracking **min** over the settle window and committing baseline = min after the window closes (LED-off ambient is the lowest reading in any reasonable scene).
+- **`wait_for_msg` wiped peer DATA as "stale".** When both sides have in-flight DATA sends (laptop orchestrator drives both cams), each side enters `wait_for_msg(MSG_ACK)`. The original code set `rx_msg.valid = 0` for any non-matching message, silently dropping the peer's DATA without ACKing it. Result: mutual deadlock, both sides time out waiting for ACKs. Fixed by **inline-ACKing peer DATA** (and inline-PONGing peer PING) inside `wait_for_msg` before continuing the wait.
+- **`do_send` used `strlen()` on its text arg** — binary app payloads with `\x00` got truncated. Use `do_send_bytes(data, len)` (added) for any caller that may pass binary bytes. The `send-hex` interactive command uses this path.
+- **`irlink` text-form `MSG:` output truncates at `\x00`.** App-layer payloads are binary (start with a 1-byte type code, may contain NULs). The `send-hex` path is paired with a new **`MSG-HEX: <hex>`** stdout line that's binary-safe. The original `MSG: <text>` is still emitted for human/legacy use but should not be parsed by orchestrators handling typed payloads.
+- **Thingino busybox has no `stdbuf`.** Don't try to wrap remote commands in `stdbuf -oL -eL` — the binary doesn't exist. `irlink` calls `fflush(stdout)` after every `MSG-HEX/MSG/STATS/PONG` line; stderr is line-buffered by default, so SSH-driven orchestration works without external buffering tools.
+- **Camera RTC is not synced** — `ls -la` timestamps on the camera filesystem are unreliable for verifying a deploy. Compare `md5sum` instead.
+- **Premature ACK timeout on top of in-flight peer DATA causes mutual collision.** Half-duplex back-to-back flows (e.g. HELLO→META→META_ACK in `host/session.py`) can hit the case where side A is mid-TX of a long DATA frame while side B is in `wait_for_msg(MSG_ACK)` for an earlier send. If B's ACK timeout fires while A is still TXing, B retransmits — and now both sides are TXing at once. Fixed via **carrier-aware ACK timeout**: `irlink.c` exposes `last_carrier_ms` (updated by `rx_thread` whenever it sees `diff >= MIN_BRIGHTNESS_DELTA`), and `wait_for_msg` extends the deadline by another `ack_timeout_ms` (capped at `ACK_HARD_CEILING_X * ack_timeout_ms`, currently 3×) whenever the timeout fires within `CARRIER_RECENT_MS` (1.5s) of a peer carrier sample. Look for `PROTO: ACK wait extended (peer carrier Xms ago, ext=N)` in stderr to see it firing.
+- **session.py must read SSH pipes as bytes, not text.** irlink's legacy `MSG: <text>` line dumps the binary app payload directly to stdout; META and other typed messages contain non-UTF-8 bytes (timestamps, version IDs etc). With `text=True`, Python's stdout reader thread crashes with `UnicodeDecodeError` mid-line and the orchestrator silently stops processing messages from that camera. Open `subprocess.Popen` with `bufsize=0` (no text mode) and decode each line manually with `errors="replace"`.
+- **`interactive_mode` main thread is blocked in `fgets(stdin)` and does NOT wake on `rx_cond`.** Originally the loop processed `rx_msg.valid` only AFTER each stdin command — meaning incoming DATA sat un-ACKed until the orchestrator happened to issue another command to that camera. The previous orchestration accidentally worked because the typical `cam2.send_app(); cam1.wait_for_app(); cam1.send_app()` pattern always sent something to cam1 next, which woke fgets and triggered the queued ACK. With `wait=True` send-complete (which blocks until our irlink prints `ACK received for seq=`), this pattern deadlocks: cam2 waits for cam1's ACK, but cam1's main is in fgets and orchestrator can't issue cam1's next command until cam2.send_app returns. **Fix: `rx_thread` auto-ACKs DATA and auto-PONGs PING** — protocol-layer ACK is now decoupled from main-thread I/O scheduling. Code in `wait_for_msg`, `interactive_mode`, and `daemon_mode` no longer ACKs DATA themselves (would double-ACK). CAL_REQ stays main-handled because it has to hold the LED on for several seconds.
+- **Orchestrator must serialize back-to-back sends.** `CamLink.send_app(payload, wait=True)` (default) blocks until our irlink prints `PROTO: ACK received for seq=` (success) or `PROTO: send failed` (after retries). Without this, the orchestrator's next `send_app()` queues a new DATA via stdin while our irlink is still mid-TX of the previous one — the second `send-hex` line sits in stdin buffer until the first send returns, but if the test issues a *peer* send next (e.g. `cam1.send_app(...)` after `cam2.send_app(...)`) cam1 starts TXing before cam2 has finished its ACK round-trip. Pass `wait=False` only for genuine pipelined sends (none in v1).
+- **`ack_timeout_ms` sized for one max-frame round-trip, not multi-frame.** Formula in `irlink.c`: `450 * symbol_ms + 5000`. At 160ms/sym → ~77s base, with carrier-aware extension up to 3× = ~230s ceiling. Sized for one 16-byte DATA (~324 sym) + one ACK (~84 sym) round-trip with slack for AE settle and decode. Don't bump the base — bump `ACK_HARD_CEILING_X` instead, so dead-link retransmits stay fast while legitimate slow flows still complete.
 
 ## On-Camera Transceiver (irlink)
 
@@ -431,6 +452,54 @@ python -m host.pixel_rx --cam cam2 --tx-pos 385,178  # manual position
 Reads the RTSP stream directly and tracks a small pixel ROI (15x15) around the calibrated TX position. Uses DPLL clock recovery with early-late gate for robust symbol extraction. Gets delta +150-200 at 10-20 feet vs +10-15 with the grid. Reliable at 120ms/symbol (~4.2 bps).
 
 **Decoder architecture**: Two-pass decode — DPLL on raw sample timestamps first (handles irregular frame timing), brute-force t0 search on interpolated signal as fallback. The DPLL works directly with irregular RTSP sample times to avoid interpolation artifacts from frame gaps.
+
+## Application Layer
+
+A typed application protocol sits on top of irlink's `MSG_DATA` frames. Reserves `payload[0]` as an app-msg-type byte; `payload[1:]` is type-specific. No changes to irlink's protocol-layer semantics — just structured content inside DATA.
+
+### Message types (`protocol/app.py`)
+
+| Code | Name | Body | Purpose |
+|------|------|------|---------|
+| 0x01 | APP_HELLO | `name\0` | Initiator announces identity (variable name, ≤14 chars) |
+| 0x02 | APP_META | `ts(4) status(1) ver(2)` | Compact node state — fixed 7B body, no name (carried by HELLO) |
+| 0x03 | APP_META_ACK | `ver(2)` | Receipt for META |
+| 0x04 | APP_CAL_RESULT | `x(2) y(2)` | "I see your LED at this pixel"; cross-checks `calibration.json` |
+| 0x05 | APP_STATS | `tx(2) rx(2) crc(2) rtx(2) dll(2) baseline(1) delta(1)` | Periodic link-health snapshot |
+| 0x06 | APP_TEXT | UTF-8 (≤15B) | Single-frame app payload |
+| 0x07 | APP_BYE | optional reason | Clean teardown |
+| 0x08 | APP_CHUNK | `msg_id(1) seq(1) total(1) data(≤12)` | Fragment of a longer payload |
+| 0x09 | APP_CHUNK_ACK | `msg_id(1) bitmap(...)` | Selective ACK — bitmap of received chunk seqs |
+| 0xFE | APP_NACK | `rejected_type(1) reason(1)` | Receiver rejected the message |
+
+### Drift-budget rule (16-byte single-frame ceiling)
+
+Every single-frame app message must fit in **16 bytes total** (1 type byte + ≤15 data bytes). This is the empirical on-camera DPLL lock budget at 120ms/sym — see [Common Pitfalls → DPLL clock drift dominates...]. Larger payloads call `fragment()` which produces APP_CHUNK frames sized exactly to the budget; receiver reassembles via `reassemble()` and ACKs missing chunks via the bitmap.
+
+The pack functions enforce the budget — `pack_text("..." * 20)` raises `ValueError`. Tests in `tests/test_app.py` assert every single-frame type stays ≤16B.
+
+### Orchestrator (`host/session.py`)
+
+Laptop-side driver that runs both cameras in `irlink listen/connect` interactive mode over SSH:
+
+```bash
+conda activate light
+python -m host.session --dry-run                       # exercise pack/unpack/fragment offline
+python -m host.session --handshake-only --symbol-ms 160 # SSH + irlink handshake only
+python -m host.session --symbol-ms 160 --text "HI"     # full HELLO→META→CAL→TEXT→STATS→BYE
+python -m host.session --skip-cal --skip-stats          # subset
+```
+
+Architecture:
+- `IRSession.start()` spawns `ssh -T root@<host> /opt/bin/irlink listen/connect ...` for each cam, parses `MSG-HEX:` lines from stdout, writes `send-hex <hex>` to stdin
+- Calibration runs out-of-band beforehand via `host/cal_procedure.py`; `APP_CAL_RESULT` cross-verifies the in-link reading against the saved RTSP-derived coords
+- All app logic lives on the laptop; cameras run unmodified `irlink`. No camera-side Python required.
+- STATS request prints a parseable line (`STATS: tx=N rx=N crc=N rtx=N dll=N`) to stdout; the orchestrator reads it via the `request_stats()` helper.
+
+### Recommended speeds
+
+- **120ms/sym**: works for host-side `pixel_rx` (RTSP @ 30fps gives 3.6 samples/sym).
+- **160ms/sym**: required for on-camera RX (BrightnessMonitor @ 18fps gives 2.2 samples/sym at 120ms — DPLL marginal). Adds ~33% TX time but reliable. Plan defaults to 160ms for `host/session.py` flows.
 
 ### After Fresh Firmware Flash
 

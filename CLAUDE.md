@@ -2,59 +2,31 @@
 
 ## Project Overview
 
-IR light communication system between Wyze V3 cameras using their built-in IR illuminators. Cameras transmit data by modulating IR LEDs and receive by analyzing video frames for brightness changes. The project builds custom firmware on top of Thingino to enable on-camera TX/RX for a half-duplex reliable link with TCP-like protocol (SYN/ACK handshake, retransmit).
+IR light communication system between Wyze V3 cameras using their built-in IR illuminators. Cameras transmit data by modulating IR LEDs and receive by analyzing video frames for brightness changes. Custom firmware on top of Thingino enables on-camera TX/RX for a half-duplex reliable link with TCP-like protocol (SYN/ACK handshake, retransmit).
+
+## Subsystem Guides (nested CLAUDE.md)
+
+- `irlink/CLAUDE.md` — On-camera transceiver (C, MIPS): protocol, AE freeze, TX/RX threading, carrier-aware ACK
+- `protocol/CLAUDE.md` — Manchester/frame/resync/FEC wire format + app-layer message types + DPLL pitfalls
+- `host/CLAUDE.md` — `pixel_rx.py`, `tx_resync.py`, `session.py`, calibration, `cam_setup.sh`
+- `thingino-firmware/CLAUDE.md` — Firmware build, patched prudynt-t, USB NCM networking, ISP/LED quirks
+
+Nested CLAUDE.md files load only when Claude touches files in that directory. Root stays short.
 
 ## Tech Stack
 
 - **Python 3.10+** — receiver, protocol, benchmarks, test orchestration, calibration
 - **C (cross-compiled for MIPS)** — on-camera GPIO transmitter, brightness monitor
-- **OpenCV** — host-side frame capture, RTSP stream reading, calibration imaging
-- **NumPy** — signal processing and decoding
+- **OpenCV / NumPy** — host-side frame capture, RTSP, signal processing
 - **requests** — Thingino web API control (LED toggle, ISP settings)
-- **Matplotlib** — debug plots
 - **pytest** — testing
 - **Conda env: `light`** — `conda activate light`
 
-## Firmware: Thingino (Custom Build)
-
-This project builds **custom firmware** on top of Thingino (https://github.com/themactep/thingino-firmware). The firmware source is cloned into `thingino-firmware/` (not committed — has its own repo).
-
-### Custom Firmware Changes
-
-- **USB CDC-NCM networking** — `BR2_PACKAGE_USBNET=y` + `BR2_PACKAGE_USBNET_USB_DIRECT_NCM=y` in defconfig. Working on both cameras. See [Networking](#networking-usb--wifi) for IPs, SSH aliases, and the JFFS2 patches that are not yet baked into firmware source.
-- **BrightnessMonitor** — patched prudynt-t to expose per-frame brightness via `/run/prudynt/brightness`, per-block grid via `/run/prudynt/brightness_grid`, and pixel-level ROI via `/run/prudynt/brightness_roi` using `IMP_FrameSource_SnapFrame` API
-- **AE Freeze control** — BrightnessMonitor reads `/run/prudynt/ae_freeze` and calls `IMP_ISP_Tuning_SetAeFreeze` to lock/unlock auto-exposure. Written by irlink during communication.
-
-### BrightnessMonitor Output Files
-
-| File | Format | Purpose |
-|------|--------|---------|
-| `/run/prudynt/brightness` | `<timestamp_ms> <mean> <max_block>` | Whole-frame brightness (fast reads) |
-| `/run/prudynt/brightness_grid` | `<timestamp_ms> <b0> <b1> ... <b239>` | 20x12 block grid (legacy ROI detection) |
-| `/run/prudynt/brightness_roi` | `<timestamp_ms> <mean>` | Pixel-level ROI brightness (high SNR) |
-| `/run/prudynt/roi_config` | `<x> <y> <size>` | Control: set pixel ROI center and size (written by irlink) |
-| `/run/prudynt/ae_freeze` | `0` or `1` | Write `1` to freeze AE, `0` to unfreeze |
-
-The grid divides the 640x360 frame into 240 blocks (20x12, 32x30 pixels each). The pixel ROI reads a small square (default 15x15 pixels) around the calibrated transmitter position, sampling every pixel (no subsampling). Delta comparison: grid block gives +10-15 at 10-20ft, pixel ROI gives +120-150 at the same distance. The `irlink --pixel` mode and host-side `pixel_rx.py` both use pixel-level ROI for reliable decoding.
-
-### Why Thingino
-
-- Full kernel/system control — custom modules, ISP tuning, no cloud
-- Prudynt-T RTSP streamer (dual streams, ONVIF, audio, motion)
-- Writable JFFS2 overlay — SCP binaries that persist across reboots
-- `daynightd` fully controllable or disableable
-
 ## Target Hardware
 
-### Supported: Wyze Cam V3 only
+Wyze Cam V3 only. Both test cameras are the `wyze_cam3_t31x_gc2053_atbm6031` variant (Ingenic T31X SoC, ATBM6031 WiFi, 4x 850nm + 4x 940nm IR LEDs, 15-20 fps). Thingino custom firmware.
 
-| Camera | SoC | IR LEDs | FPS | Firmware |
-|--------|-----|---------|-----|----------|
-| Wyze V3 | Ingenic T31X (MIPS) | 4x 850nm + 4x 940nm | 15-20 | Thingino (custom) |
-
-Both test cameras are the `wyze_cam3_t31x_gc2053_atbm6031` variant (ATBM6031 WiFi, T31X SoC).
-
-## GPIO and PWM Map (Wyze V3 / T31)
+## GPIO Map (Wyze V3 / T31)
 
 ```
 GPIO 47  — 850nm IR LEDs (GPIO only, no PWM, faint visible red glow)
@@ -65,88 +37,51 @@ GPIO 38  — Red status LED (active low)
 GPIO 39  — Blue status LED (active low)
 ```
 
-### IR Cut Filter
-
-**Critical for IR communication.** The IR cut filter physically blocks infrared light from reaching the sensor. Must be opened before any IR reception:
-
+The IR cut filter physically blocks infrared. Must be opened before any IR reception:
 ```bash
 ircut off           # Open filter (night mode) — IR passes through
-ircut on            # Close filter (day mode) — IR blocked
 killall daynightd   # Prevent auto-switching back
 ```
 
-## Protocol Stack
+## Protocol Stack Summary
 
-### Manchester Encoding (IEEE 802.3)
+**Manchester encoding** (IEEE 802.3): `0` → `[1,0]`, `1` → `[0,1]`. Self-clocking.
 
-Every data bit maps to two symbols with a guaranteed mid-bit transition:
-- `0` → `[1, 0]` (falling edge)
-- `1` → `[0, 1]` (rising edge)
+**Classic frame**: `[PREAMBLE 8][SYNC 8][LENGTH 8][PAYLOAD N×8][CRC-8][POSTAMBLE 4]` → Manchester encoded. Sync word `11001011`, CRC-8/CCITT poly 0x07.
 
-Self-clocking — the receiver can never lose sync.
+**Resync framing** (opt-in, long messages): injects 16 raw `1010...` symbols every 48 data symbols to keep DPLL locked. See `protocol/CLAUDE.md`.
 
-### Frame Format
+**RS FEC** (opt-in): `encode_frame_symbols_with_resync_fec`, default RS(15,11), ~36% overhead. See `protocol/CLAUDE.md`.
 
-```
-[PREAMBLE 8] [SYNC 8] [LENGTH 8] [PAYLOAD N×8] [CRC-8] [POSTAMBLE 4] → Manchester encoded
-```
-
-- **Preamble**: `10101010` — clock recovery
-- **Sync word**: `11001011` — frame boundary marker
-- **Length**: payload byte count (0-255)
-- **CRC-8/CCITT**: polynomial 0x07, covers length + payload
-- **Postamble**: `1010` — clean termination
+**Adaptive symbol rate** (on-camera, since 2026-04-22): irlink self-tunes rate within a session via `MSG_RATE_CHANGE=0x0A`. Ladder `[60, 80, 100, 120, 160, 200]` ms. Start rate from calibration Δ → `pick_initial_rate_ms()` → `host/session.py` clamps to ≥160ms for on-camera RX. In-session: probe-up after 5 ACKs, fallback-down after 3 retransmit-exhausted sends, split-brain recovery to slowest rung on `2×ack_timeout_ms` without valid decode. See `irlink/CLAUDE.md` → Adaptive Symbol Rate.
 
 ### Speeds Achieved
 
 | Phase | Method | Speed | Status |
 |-------|--------|-------|--------|
-| Phase 1 | Shell `gpio set` + `usleep` | ~1 bps | Done, reliable |
-| Phase 2 | C binary, sysfs GPIO | ~3 bps | Done, reliable |
-| Phase 2+ | Hardware PWM ioctls | TBD | PWM_ENABLE fails — needs investigation |
-| On-camera RX (grid) | irlink_rx + BrightnessMonitor grid | ~3 bps | Working (ROI + AE residual) |
-| On-camera RX (pixel) | irlink --pixel + DPLL decode | ~4.2 bps | Working (120ms/symbol, delta 120+) |
+| Phase 1 | Shell `gpio set` + `usleep` | ~1 bps | Done |
+| Phase 2 | C binary, sysfs GPIO | ~3 bps | Done |
+| On-camera RX (grid) | irlink + BrightnessMonitor grid | ~3 bps | Working |
+| On-camera RX (pixel) | irlink --pixel + DPLL | ~4.2 bps | Working (120ms/sym, delta 120+) |
 | Half-duplex link | irlink (TX+RX+protocol) | ~3 bps | Working (AE freeze + raw block) |
-| Dual LED TX | irlink (850nm + 940nm together) | ~3 bps | Working, 2x signal at distance |
-| Host pixel RX | pixel_rx.py (RTSP + pixel ROI + DPLL) | ~4.2 bps | Working (120ms/symbol, delta 150+) |
-| Raw TX | irlink tx (no handshake) | ~4.2 bps | Working (for pixel_rx or passive monitoring) |
+| Host pixel RX | pixel_rx.py (RTSP + pixel ROI + DPLL) | ~4.2 bps | Working (120ms/sym, delta 150+) |
+| Resync-framed RX (host) | pixel_rx --decoder resync | **4.91 bps @ 70ms/sym** | Single-frame ≤50-char, beats drift |
+| FEC-wrapped RX (host) | pixel_rx --decoder resync-fec | ~3.3 bps @ 80ms | RS(15,11), erasure-aware, decodes 82-char at Δ≈95 |
+| **Adaptive rate (on-camera)** | irlink probe-up / fallback / split-brain | 2–5 bps, self-tuning | **Working** — starts at cal-picked rate (≥160ms), ramps up/down with SNR |
 
 ## Project Structure
 
 ```
-irlink/            — Combined half-duplex transceiver with protocol layer
-  irlink.c         — TX+RX threads, SYN/ACK/DATA/PING/CAL protocol, DPLL decode, pixel ROI (C, MIPS)
-                     interactive cmds: send, send-hex, ping, cal, stats, quit
-                     stdout: MSG-HEX:<hex> (binary-safe) + MSG:<text> (legacy) for received DATA
-  Makefile         — Cross-compilation, deploy to both cameras
-protocol/          — Manchester encoding, CRC-8, frame encode/decode (pure Python)
-  app.py           — Application-layer messages on top of DATA payload:
-                     HELLO/META/META_ACK/CAL_RESULT/STATS/TEXT/BYE/CHUNK/CHUNK_ACK/NACK
-                     fragment()/reassemble() for payloads exceeding 16-byte single-frame budget
-transmitter/       — TX code: shell scripts, C GPIO binary, Makefile
-  tx_pwm.c         — Phase 2: C binary using sysfs GPIO, cross-compiled for MIPS
-  Makefile         — Cross-compilation via Thingino toolchain
-receiver/          — RX code: standalone on-camera decoder + host-side RTSP decoder
-  irlink_rx.c      — Standalone Manchester decoder with ROI tracking (C, MIPS)
-  rx_stream.py     — Host-side RTSP brightness capture + dual-strategy decoder
-  Makefile         — Cross-compilation for irlink_rx
-host/              — Host-side orchestration: SSH, config, end-to-end CLI
-  config.py        — Camera IPs, GPIO pins, timing constants
-  ssh.py           — SSH/SCP wrappers (uses `scp -O` for Thingino compatibility)
-  send_message.py  — CLI: `python -m host.send_message "HELLO"`
-  cam_setup.sh     — Camera pre-flight: night mode, ircut, LEDs, prudynt, AE freeze
-  cal_procedure.py — Pixel-level calibration: diff LED-on/off RTSP frames to find TX
-  calibration.json — Saved calibration data (TX pixel coords per camera pair)
-  pixel_rx.py      — Host-side RTSP pixel receiver (DPLL decode, 120ms/symbol)
-  session.py       — App-layer orchestrator: SSH-driven HELLO→META→CAL→TEXT→BYE flow
-                     (`python -m host.session [--dry-run] [--handshake-only] [--symbol-ms N]`)
-photos/            — Calibration images, debug snapshots, calibration.html viewer
-  find_transmitter.py — One-shot TX locator with bounding box
-  grab_grid.py     — RTSP frame grab with brightness grid overlay
-  calibration.html — Visual calibration report (serve with python -m http.server)
-tests/             — pytest: 50 tests covering protocol + app layer
-  test_app.py      — Pack/unpack roundtrip, fragment/reassemble, drift-budget assertions
-thingino-firmware/ — Thingino build tree (not committed, clone separately)
+irlink/            — Combined half-duplex transceiver (C, MIPS). See irlink/CLAUDE.md
+protocol/          — Manchester/frame/app-layer (pure Python). See protocol/CLAUDE.md
+host/              — Host orchestration, RX, calibration, TX driver. See host/CLAUDE.md
+experiments/       — Offline decoders, replay.py, debug_capture.py
+photos/            — Calibration images, calibration.html viewer
+runs/              — JSONL captures from pixel_rx --dump-samples
+tests/             — pytest (protocol + app layer + resync framing)
+transmitter/       — Legacy Phase 2 C TX binary
+receiver/          — Legacy standalone on-camera decoder + rx_stream.py
+thingino-firmware/ — Firmware build tree (not committed). See thingino-firmware/CLAUDE.md
 ```
 
 ## Setup
@@ -158,7 +93,7 @@ conda activate light
 pip install opencv-python numpy paramiko matplotlib pytest requests
 ```
 
-### Camera SSH Setup
+### Camera SSH
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/cam_key
 ssh-copy-id -i ~/.ssh/cam_key root@192.168.50.110
@@ -171,394 +106,96 @@ Host da-camera1
     HostName 192.168.50.110
     User root
     IdentityFile ~/.ssh/cam_key
-
 Host da-camera2
     HostName 192.168.50.141
     User root
     IdentityFile ~/.ssh/cam_key
-
 Host usb-cam1
     HostName 172.16.1.1
     User root
     IdentityFile ~/.ssh/cam_key
-
 Host usb-cam2
     HostName 172.16.2.1
     User root
     IdentityFile ~/.ssh/cam_key
 ```
 
-See [Networking](#networking-usb--wifi) for how the USB IPs get assigned.
-
-### Code Deployment to Camera
+### Code Deployment
 ```bash
-# Use scp -O (legacy mode) — Thingino lacks sftp-server
-scp -O my_program root@da-camera1:/opt/bin/
-ssh da-camera1 "chmod +x /opt/bin/my_program && /opt/bin/my_program"
+scp -O my_program root@da-camera1:/opt/bin/       # Thingino lacks sftp-server → use -O
+ssh da-camera1 "chmod +x /opt/bin/my_program"
 ```
 
 ### Cross-Compilation (C for MIPS)
 ```bash
-cd transmitter && make        # Uses Thingino's Buildroot toolchain
-make deploy                   # SCP to da-camera1
+cd irlink && make           # or transmitter/ or receiver/
+make deploy
 ```
 
-Toolchain path: `thingino-firmware/output/stable/wyze_cam3_t31x_gc2053_atbm6031-3.10.14-musl/host/bin/mipsel-linux-gcc`
+Toolchain: `thingino-firmware/output/stable/wyze_cam3_t31x_gc2053_atbm6031-3.10.14-musl/host/bin/mipsel-linux-gcc`. Building firmware itself and patched prudynt: see `thingino-firmware/CLAUDE.md`.
 
-### Building Custom Firmware
-```bash
-cd thingino-firmware
-BOARD=wyze_cam3_t31x_gc2053_atbm6031 make defconfig
-BOARD=wyze_cam3_t31x_gc2053_atbm6031 make
-# Output: output/stable/.../images/thingino-wyze_cam3_t31x_gc2053_atbm6031.bin
-# Flash: copy to SD card as autoupdate-full.bin, boot camera
-```
-
-### Rebuilding Patched Prudynt-T
-```bash
-# Edit source in dl/prudynt-t/git/src/ AND copy to build dir:
-# output/stable/.../build/prudynt-t-<hash>/src/
-# Then:
-BOARD=wyze_cam3_t31x_gc2053_atbm6031 make prudynt-t-rebuild
-# Deploy: scp -O .../per-package/prudynt-t/target/usr/bin/prudynt root@<cam>:/opt/bin/prudynt-patched
-```
-
-## Camera Filesystem
-
-| Path | Type | Persists | Use |
-|------|------|----------|-----|
-| `/opt/` | JFFS2 (extras) | Yes, ~8MB | Deploy binaries here |
-| `/etc/` | JFFS2 (config) | Yes, ~224KB | Config files (very small!) |
-| `/usr/bin/`, `/usr/lib/` | SquashFS | Read-only | Stock firmware |
-| `/tmp/` | RAM | No | Temp files |
-| `/run/prudynt/` | RAM | No | Prudynt runtime data |
-
-## Networking (USB + WiFi)
-
-Each camera exposes both WiFi and a USB CDC-NCM gadget. Both come up at boot and coexist.
-
-| Camera | WiFi | USB gadget | SSH alias |
-|--------|------|-----------|-----------|
-| cam1 | 192.168.50.110 | 172.16.1.1 (/24) | `da-camera1`, `usb-cam1` |
-| cam2 | 192.168.50.141 | 172.16.2.1 (/24) | `da-camera2`, `usb-cam2` |
-
-On the USB side: camera has static IP on `usb0` and runs `udhcpd` + `dnsd`. The PC's USB-NCM interface (named `enx<camera_ethaddr>`) gets `172.16.X.2` via DHCP automatically.
-
-### On-camera JFFS2 patches (not yet in firmware source)
-
-Four on-camera files were edited directly to get this working. Originals saved as `*.orig` next to each.
-
-- `/etc/init.d/S36cdcnet` — at the top of `start()`, add `ethaddr=$(fw_printenv -n ethaddr)` so `decrement_mac` works (stock script fails silently at boot). Set `CNET=172.16.X.1` per camera. Add `ifconfig usb0 $CNET netmask 255.255.255.0 up` after `usb-role -m device`.
-- `/etc/udhcpd.conf` — set `start 172.16.X.2`, `end 172.16.X.254`, `opt dns 172.16.X.1`.
-- `/etc/dnsd.conf` — set `thingino.local 172.16.X.1`.
-- `/etc/init.d/S38wpa_supplicant` — delete the `if iface_exists "usb0"; then … exit 1; fi` block (~lines 251-254). This guard exists in stock Thingino to skip WiFi when the USB gadget is used for captive-portal setup; we want both running.
-
-These live only in each camera's JFFS2 `/etc`. A reflash wipes them. Firmware source locations and two bake-in plans are documented but not applied — see memory note.
-
-### Web UI WiFi toggle still works
-
-Disabling WiFi via the web UI writes `#auto wlan0` to `/etc/network/interfaces.d/wlan0`. `S38wpa_supplicant` still honors that check — it's independent of our `usb0` patch. Once disabled that way, WiFi stays off across reboots until re-enabled in the web UI.
-
-## Common Pitfalls
-
-- **IR cut filter must be open** (`ircut off`). Without this, IR is physically blocked — no amount of software can detect it. After every reboot, the filter resets to day mode (closed). Kill `daynightd` to prevent auto-switching.
-- **940nm is invisible**. Use a phone camera to verify, or check the other camera's RTSP stream. 850nm (GPIO 47) has a faint visible red glow for quick sanity checks.
-- **Auto-exposure fights the signal**. The ISP compensates for brightness changes within ~200ms. This means sustained brightness levels are unreliable — use edge detection or transition-based decoding instead.
-- **SCP needs `-O` flag**. Thingino doesn't have `sftp-server`. Use `scp -O` (legacy SCP protocol).
-- **RTSP creds**: `thingino/thingino`. Web UI creds: `root/<your_password>`.
-- **Overlay filesystem is tiny** (~224KB config + 8MB /opt). Don't try to `cp` large files to `/usr/bin/` — it will fill the overlay and corrupt the binary. Deploy to `/opt/bin/` instead.
-- **Corrupted overlay recovery**: If you accidentally filled the overlay (e.g., failed `cp`), remove the overlay file: `rm /overlay/usr/bin/<file>` and reboot.
-- **PWM hardware doesn't work** (as of current firmware). `ioctl(fd, PWM_ENABLE, channel)` returns "Operation not permitted" and kernel logs "pwm could not work!". The `pwm_device` is NULL — the kernel PWM subsystem doesn't initialize the device. Use sysfs GPIO toggle instead.
-- **GPIO mux state persists**. Running `tx_pwm` switches GPIO 49 to PWM function mode (`gpio-diag PB17 func 0`). If the binary exits without resetting, the pin stays in PWM mode and GPIO commands have no effect. Reset with `gpio-diag PB17 func 1` or reboot.
-- **IMP SDK is per-process**. You cannot call `IMP_ISP_Tuning_*` functions from a separate process — they require ISP initialization done by prudynt-t. The `libimp.so` on camera uses musl libc but was built against uclibc symbols; linking works at runtime but `dlopen` calls that hit ISP tuning will segfault from an uninitialized process.
-- **IMP_ISP_Tuning_GetAeLuma is useless for IR detection**. It returns the auto-exposure's internal luminance estimate, which barely changes when IR LEDs toggle (delta ~3-4 units in daylight). Use raw frame brightness instead.
-- **Prudynt-t BrightnessMonitor uses SnapFrame API**. `IMP_FrameSource_SnapFrame` grabs a single NV12 frame from an already-running channel without needing IVS binding. Works alongside prudynt-t's encoder pipeline.
-- **Buildroot wipes source on rebuild**. Patches to `dl/prudynt-t/git/src/` are NOT used during build. You must also copy changes to `output/stable/.../build/prudynt-t-<hash>/src/`. Use Buildroot's patch system for permanent changes.
-- **Frame rate is the receiver bottleneck**. At 15fps RTSP, each symbol needs ~3+ frames for reliable detection. Maximum practical bps = fps / (2 * samples_per_symbol) ≈ 3-5 bps via RTSP.
-- **OTA sysupgrade can corrupt kernel module state**. The `-update.bin` may not fully update the kernel, leaving `sensor_gc2053_t31.ko` with unresolved symbols. Use full SD card flash (`autoupdate-full.bin`) for reliable firmware updates.
-- **Both cameras must run the same firmware version**. A patched prudynt built against one firmware version will crash on another — config parsing produces garbage values (e.g., `1952542720` for `mic_sample_rate`), encoder initialization fails, and SnapFrame returns -1.
-- **Stock prudynt must be stopped via init script, not kill**. Use `/etc/init.d/S31prudynt stop` to cleanly shut down. Direct `kill` or `killall` can leave the IMP SDK in a bad state (zombie process, locked ISP device). If the IMP state is stuck, reboot.
-- **IR cut filter resets on prudynt restart too**. Not just on boot — restarting prudynt (even the patched version) triggers `daynightd` to re-evaluate and close the filter. Always run `ircut off; killall daynightd` after starting prudynt.
-- **`/opt` may not auto-mount after fresh flash**. The JFFS2 partition at `/dev/mtdblock5` needs `mount -t jffs2 /dev/mtdblock5 /opt`. Check with `mount | grep opt`.
-- **AE over-compensates for IR LEDs**. When the IR LED turns ON, the ISP reduces exposure, making the whole-frame MEAN brightness DROP (inverted from expected). The IR block gets brighter, but everything else gets darker. Use residual-based detection (block - mean) to cancel AE, not absolute brightness.
-- **Whole-frame mean is useless for ROI detection**. At 2-3 feet, the IR LEDs occupy ~1 grid block out of 60. The mean brightness delta is ~1-3 units (noise level), but the specific block delta is 30-100+ units. Always calibrate and track the specific block.
-- **Cameras too close (<6 inches) gives poor signal**. The IR LEDs flood the entire sensor when very close, and the image is out of focus (min focus ~50cm). Best results at 2-3 feet where the LEDs form a focused spot.
-- **AE freeze is required for half-duplex protocol**. Without AE freeze, the camera's own LED reflections cause massive AE swings that take 3-5 seconds to settle after TX ends. With `IMP_ISP_Tuning_SetAeFreeze(ENABLE)`, exposure locks and raw block brightness changes are instantaneous and predictable. Freeze AE before comms, unfreeze after.
-- **Self-reflection dominates raw brightness**. When a camera toggles its own IR LED, reflections off walls/ceiling cause block 45 to change by 8-10 units (vs 23-45 from the peer). With AE frozen, these reflections are small and consistent — not a problem. With AE active, the reflections trigger AE compensation that ruins subsequent reception.
-- **Consecutive-frame filter prevents false activity detection**. Single-frame brightness spikes (from self-reflection or noise) trigger false IDLE→ACTIVE transitions. Requiring 2 consecutive frames above threshold eliminates these (reduced from 3 with AE freeze).
-- **Inter-message gap must exceed SETTLE_MS**. Back-to-back transmissions (ACK immediately followed by DATA) merge into one continuous activity period for the receiver. The gap between messages must be at least SETTLE_MS (400ms) + 100ms margin so the receiver detects "end of TX" and decodes each message separately.
-- **RX thread stack overflow on MIPS/musl**. The default pthread stack (~128KB on musl) overflows with large local arrays. `sample_t samples[8192]` (~128KB) must be declared static, not stack-local.
-- **Boot automation via `/etc/rc.local`**. Both cameras have rc.local that auto-mounts /opt, swaps to patched prudynt, opens IR filter, and kills daynightd. Runs via `S94rc.local` at end of boot sequence.
-- **Prudynt daynight overrides GPIO LED state**. Even after `gpio set 47`, prudynt's daynight daemon can immediately turn it off. You MUST disable daynight before toggling LEDs: `echo '{"daynight":{"enabled":false}}' | prudyntctl json -`. The `light` command is the reliable LED control: `light ir850 on`, `light ir940 on`, `light ir850 read` (returns 0 or 1). This is what the web UI uses internally.
-- **`color status` and `imp-control ispmode` lie**. The `color` CLI reads a stale file (`/tmp/colormode.txt`), not actual ISP state. `imp-control ispmode 1` may silently fail. Use the Thingino web API instead: `POST /x/json-imp.cgi {"cmd":"color","val":1}`. Verify via heartbeat: `GET /x/json-heartbeat.cgi` (SSE, use `--max-time`) returns `color_mode` (0=color, 1=mono).
-- **Thingino web API requires session cookies**. Login with `POST /x/login.cgi {"username":"root","password":"password"}` to get a session cookie. Cookies expire — always re-login before commands. The API endpoint is `/x/json-imp.cgi` with commands: `daynight`, `color`, `ircut`, `ir850`, `ir940`.
-- **ircut_state semantics are inverted from what you'd expect**. In the heartbeat API: `ircut_state=0` means filter REMOVED (night mode, IR passes through = GOOD). `ircut_state=1` means filter SET (day mode, IR blocked = BAD). The `daynight night` API command sometimes re-closes the ircut filter — always set ircut as the LAST step after all other mode changes.
-- **RTSP stream buffers stale frames**. When toggling LEDs and capturing via RTSP, the OpenCV VideoCapture buffer contains frames from before the LED state changed. Opening a fresh stream after the state change (rather than flushing frames on an existing stream) is the reliable approach.
-- **OSD timestamp changes create false calibration peaks**. The on-screen timestamp (top-left corner) changes every second, creating large brightness deltas that can be mistaken for IR LEDs during frame differencing. Mask out the top 30 and bottom 30 pixel rows when searching for the TX peak.
-- **Grid-based brightness (20x12 blocks) dilutes IR signal at distance**. At 10-20 feet, the IR LED spot is ~10-20 pixels across but the grid block is 32x30 pixels. The spot's +200 pixel delta gets averaged down to +10-15 in the block. Host-side pixel-level RTSP reading (`pixel_rx.py`) gives the full undiluted delta.
-- **Dual LED TX (850nm + 940nm) doubles signal**. `irlink` now toggles both GPIO 47 and 49 simultaneously. At 10-20 feet: single LED gives +15 grid delta, dual gives +23. At pixel level: +200 for both.
-- **Camera setup order matters**. The `cam_setup.sh` script must: (1) start prudynt, (2) kill daynightd, (3) set night/monochrome mode, (4) turn off LEDs, (5) set ircut filter LAST (because other commands re-close it).
-- **RTSP first frames are black**. When opening a fresh RTSP stream, the first 5-15 frames are often completely black (codec init / ISP startup). Always flush 10-15 frames before using data. The calibration code does this (`grab_frames(cap, n=10)`), and pixel_rx flushes 15 frames on startup.
-- **Calibration coordinates shift when cameras move**. Pixel calibration is position-sensitive — even a small camera bump invalidates the (x,y) coordinates. Re-run `python -m host.cal_procedure --no-interactive` after any physical change. Stale coordinates point at dark pixels, giving baseline=0 and failed decodes.
-- **30fps RTSP caps symbol rate at ~120ms minimum**. At 30fps, frames arrive every ~33ms with occasional gaps up to 200ms. At 120ms/symbol, most symbols get 3+ samples. At 100ms, too many symbols fall entirely in frame gaps. The DPLL clock recovery handles jitter but cannot recover symbols with zero samples.
-- **DPLL must work on raw sample times, not interpolated grid**. Linear interpolation between sparse RTSP samples (33ms apart) creates fake transitions during frame gaps. The DPLL must detect edges in the actual sample timestamps, not in the interpolated 1ms signal. The brute-force t0 search on the interpolated grid is kept as a fallback.
-- **On-camera frame rate is ~18fps (not 30)**. BrightnessMonitor's `IMP_FrameSource_SnapFrame` on channel 1 (640x360) runs at ~18fps. Combined with the DPLL, 120ms/symbol still works (2+ samples per symbol). The host-side RTSP stream gives ~30fps — better oversampling.
-- **`irlink --pixel` writes ROI config to `/run/prudynt/roi_config`**. BrightnessMonitor reads this every frame and outputs pixel ROI to `/run/prudynt/brightness_roi`. The config persists until overwritten or prudynt restarts. If you switch between `--pixel` and `--block` modes, the old ROI config file may still exist — harmless, since `read_brightness()` checks `pixel_x >= 0` first.
-- **Wyze V3 USB port carries power AND data on one physical connector.** Every USB cable change is a hard reboot of the camera — wait ~60s for it to come back on WiFi before reconnecting via SSH.
-- **Direct USB-A plug can fail enumeration.** Plugging the camera directly into a motherboard USB-A port sometimes produces `dwc2 … session end detected!` and `gadget pullup defered, current mode: host` in the camera's `dmesg`, and no USB device on the PC. Going through a USB-C dock (Genesys Logic hub inside a common USB-C hub) gives clean enumeration with zero errors. Working dmesg line on the camera: `g_ncm gadget: high-speed config #1: CDC Ethernet (NCM)`.
-- **Stock `S36cdcnet` fails silently at boot.** The script calls `decrement_mac`, which reads `$ethaddr` as a shell variable that's never set. Result: g_ncm never loads, no USB networking, no error visible in `logread`. Workaround is to add `ethaddr=$(fw_printenv -n ethaddr)` at the top of `start()` — see [Networking](#networking-usb--wifi).
-- **Stock `S36cdcnet` doesn't assign an IP to `usb0`**. Even when the module loads, `usb0` has no address — `udhcpd` binds to its `-I` address, but packets never flow. Must be added manually.
-- **Stock `S38wpa_supplicant` refuses to start WiFi if `usb0` exists.** A deliberate design choice in Thingino (USB gadget = "captive portal" mode). Remove the `iface_exists "usb0"` exit block to have both paths live. Web UI's own disable-WiFi control uses a different check (`#auto wlan0` in `/etc/network/interfaces.d/wlan0`) and still works correctly.
-- **Two cameras on the same PC need different USB subnets.** Both cameras ship with `172.16.0.0/24` on `udhcpd`. If you plug both in, the host ends up with two interfaces on the same /24 and routing to `172.16.0.1` is ambiguous. Current workaround: patch each camera's config to use `172.16.1.0/24` (cam1) and `172.16.2.0/24` (cam2).
-- **DPLL clock drift, not SNR, is the long-frame failure mode.** Live test at 120ms/sym, indoor, Δ~85: 16-byte payloads decode 100%, 25-byte 50%, 43-byte 0%. Failure mode is "valid Manchester for ~80 syms then illegal pairs mid-frame" — DPLL loses lock, not bit errors from low SNR. **FEC won't help** — it corrects flipped bits, not lost symbol-boundary lock. The fix is **fragment to short frames** (each frame gets a fresh preamble and DPLL re-locks). The 16-byte ceiling is enforced everywhere in `protocol/app.py`.
-- **On-camera DPLL needs a slower symbol rate than RTSP-side.** RTSP runs ~30fps (3.6 samples/sym at 120ms); on-camera BrightnessMonitor runs ~18fps (2.2 samples/sym at 120ms). Same payload that decodes via `pixel_rx.py` at 120ms/sym can fail in `irlink listen --pixel` at 120ms. Bump on-camera flows to **160ms/sym** (default in `host/session.py`).
-- **`irlink` post-TX baseline-capture races peer's TX.** During the 500ms post-self-TX settling window, the original code set `baseline = current_brightness` every sample. If the peer started TXing during that window (fast turnaround in half-duplex protocol), baseline got captured at the peer's BRIGHT state. Then post-peer-TX the brightness returned to ambient ~80 units away, with `diff` permanently above SETTLE_MS reset threshold — RX stuck in ACTIVE state, never decoded. Fixed in irlink.c by tracking **min** over the settle window and committing baseline = min after the window closes (LED-off ambient is the lowest reading in any reasonable scene).
-- **`wait_for_msg` wiped peer DATA as "stale".** When both sides have in-flight DATA sends (laptop orchestrator drives both cams), each side enters `wait_for_msg(MSG_ACK)`. The original code set `rx_msg.valid = 0` for any non-matching message, silently dropping the peer's DATA without ACKing it. Result: mutual deadlock, both sides time out waiting for ACKs. Fixed by **inline-ACKing peer DATA** (and inline-PONGing peer PING) inside `wait_for_msg` before continuing the wait.
-- **`do_send` used `strlen()` on its text arg** — binary app payloads with `\x00` got truncated. Use `do_send_bytes(data, len)` (added) for any caller that may pass binary bytes. The `send-hex` interactive command uses this path.
-- **`irlink` text-form `MSG:` output truncates at `\x00`.** App-layer payloads are binary (start with a 1-byte type code, may contain NULs). The `send-hex` path is paired with a new **`MSG-HEX: <hex>`** stdout line that's binary-safe. The original `MSG: <text>` is still emitted for human/legacy use but should not be parsed by orchestrators handling typed payloads.
-- **Thingino busybox has no `stdbuf`.** Don't try to wrap remote commands in `stdbuf -oL -eL` — the binary doesn't exist. `irlink` calls `fflush(stdout)` after every `MSG-HEX/MSG/STATS/PONG` line; stderr is line-buffered by default, so SSH-driven orchestration works without external buffering tools.
-- **Camera RTC is not synced** — `ls -la` timestamps on the camera filesystem are unreliable for verifying a deploy. Compare `md5sum` instead.
-- **Premature ACK timeout on top of in-flight peer DATA causes mutual collision.** Half-duplex back-to-back flows (e.g. HELLO→META→META_ACK in `host/session.py`) can hit the case where side A is mid-TX of a long DATA frame while side B is in `wait_for_msg(MSG_ACK)` for an earlier send. If B's ACK timeout fires while A is still TXing, B retransmits — and now both sides are TXing at once. Fixed via **carrier-aware ACK timeout**: `irlink.c` exposes `last_carrier_ms` (updated by `rx_thread` whenever it sees `diff >= MIN_BRIGHTNESS_DELTA`), and `wait_for_msg` extends the deadline by another `ack_timeout_ms` (capped at `ACK_HARD_CEILING_X * ack_timeout_ms`, currently 3×) whenever the timeout fires within `CARRIER_RECENT_MS` (1.5s) of a peer carrier sample. Look for `PROTO: ACK wait extended (peer carrier Xms ago, ext=N)` in stderr to see it firing.
-- **session.py must read SSH pipes as bytes, not text.** irlink's legacy `MSG: <text>` line dumps the binary app payload directly to stdout; META and other typed messages contain non-UTF-8 bytes (timestamps, version IDs etc). With `text=True`, Python's stdout reader thread crashes with `UnicodeDecodeError` mid-line and the orchestrator silently stops processing messages from that camera. Open `subprocess.Popen` with `bufsize=0` (no text mode) and decode each line manually with `errors="replace"`.
-- **`interactive_mode` main thread is blocked in `fgets(stdin)` and does NOT wake on `rx_cond`.** Originally the loop processed `rx_msg.valid` only AFTER each stdin command — meaning incoming DATA sat un-ACKed until the orchestrator happened to issue another command to that camera. The previous orchestration accidentally worked because the typical `cam2.send_app(); cam1.wait_for_app(); cam1.send_app()` pattern always sent something to cam1 next, which woke fgets and triggered the queued ACK. With `wait=True` send-complete (which blocks until our irlink prints `ACK received for seq=`), this pattern deadlocks: cam2 waits for cam1's ACK, but cam1's main is in fgets and orchestrator can't issue cam1's next command until cam2.send_app returns. **Fix: `rx_thread` auto-ACKs DATA and auto-PONGs PING** — protocol-layer ACK is now decoupled from main-thread I/O scheduling. Code in `wait_for_msg`, `interactive_mode`, and `daemon_mode` no longer ACKs DATA themselves (would double-ACK). CAL_REQ stays main-handled because it has to hold the LED on for several seconds.
-- **Orchestrator must serialize back-to-back sends.** `CamLink.send_app(payload, wait=True)` (default) blocks until our irlink prints `PROTO: ACK received for seq=` (success) or `PROTO: send failed` (after retries). Without this, the orchestrator's next `send_app()` queues a new DATA via stdin while our irlink is still mid-TX of the previous one — the second `send-hex` line sits in stdin buffer until the first send returns, but if the test issues a *peer* send next (e.g. `cam1.send_app(...)` after `cam2.send_app(...)`) cam1 starts TXing before cam2 has finished its ACK round-trip. Pass `wait=False` only for genuine pipelined sends (none in v1).
-- **`ack_timeout_ms` sized for one max-frame round-trip, not multi-frame.** Formula in `irlink.c`: `450 * symbol_ms + 5000`. At 160ms/sym → ~77s base, with carrier-aware extension up to 3× = ~230s ceiling. Sized for one 16-byte DATA (~324 sym) + one ACK (~84 sym) round-trip with slack for AE settle and decode. Don't bump the base — bump `ACK_HARD_CEILING_X` instead, so dead-link retransmits stay fast while legitimate slow flows still complete.
-
-## On-Camera Transceiver (irlink)
-
-The `irlink` binary is the combined half-duplex transceiver with a TCP-like protocol layer. It runs on-camera, reading brightness from BrightnessMonitor and toggling both IR LEDs (850nm + 940nm) simultaneously via sysfs GPIO for maximum signal strength.
-
-### Protocol Message Types
-
-| Type | Code | Purpose |
-|------|------|---------|
-| SYN | 0x01 | Initiate connection |
-| SYN_ACK | 0x02 | Acknowledge connection |
-| ACK | 0x03 | Acknowledge data (with seq number) |
-| DATA | 0x04 | Payload data |
-| CAL_REQ | 0x05 | Request calibration |
-| CAL_ACK | 0x06 | Acknowledge calibration |
-| CAL_DONE | 0x07 | Calibration complete |
-| PING | 0x08 | Measure RTT |
-| PONG | 0x09 | Ping response |
-
-Frame payload format: `[msg_type] [seq_num] [data...]`
-
-### Usage
+## Usage
 
 ```bash
-# Calibrate: toggle the other camera's LED during the 4-second window
-irlink calibrate
-# Output: block index (e.g., 212)
+# 1. Setup cameras (after every reboot)
+./host/cam_setup.sh
 
-# Listen with pixel-level ROI (recommended, requires host calibration first)
-irlink listen --pixel 385,178 --speed 120
-
-# Listen with grid block (legacy, lower SNR)
-irlink listen --block 212
-
-# Raw TX — no handshake, for use with pixel_rx or passive monitoring
-irlink tx "HELLO" --speed 120
-irlink tx "HELLO" --pixel 385,178 --speed 120
-
-# Connect and send a message (with protocol handshake)
-irlink send "HELLO" --pixel 385,178 --speed 120
-
-# Daemon mode (auto-responds to incoming connections)
-irlink daemon-listen --pixel 385,178 --speed 120
-
-# Interactive mode (type commands after handshake)
-irlink connect --pixel 385,178 --speed 120
-# Then: send <text>, ping, cal, quit
-
-# Adjust ROI size (default 15, range 3-31)
-irlink listen --pixel 385,178 --roi-size 21 --speed 120
-```
-
-### AE Freeze During Communication
-
-irlink freezes auto-exposure before any protocol exchange and unfreezes after. This is critical because:
-- The camera's own LED reflections cause massive AE swings (3-5s settle time)
-- With AE frozen, raw block brightness is stable and predictable
-- The peer's IR LED causes a clean delta (23-45 units) on the tracked block
-- Between communications, AE runs normally to adapt to ambient light
-
-The freeze is controlled via `/run/prudynt/ae_freeze` — irlink writes `1` before starting, `0` when done. BrightnessMonitor in prudynt calls `IMP_ISP_Tuning_SetAeFreeze()`.
-
-### ROI Calibration
-
-Two calibration methods:
-
-**On-camera (grid-based, legacy):** The 20x12 grid (240 blocks) finds the transmitter's block:
-```bash
-irlink calibrate    # toggle peer LED during 4s window
-```
-
-**Host-side (pixel-level, recommended):** Frame differencing finds the exact TX pixel:
-```bash
+# 2. Calibrate (find TX pixel locations)
 conda activate light
-python -m host.cal_procedure              # both directions, interactive
-python -m host.cal_procedure --no-interactive  # automated
-python -m host.cal_procedure --show        # show saved calibration
-```
-Saves results to `host/calibration.json`. The pixel coordinates are used by:
-- `pixel_rx.py` — loads calibration automatically from the JSON file
-- `irlink --pixel x,y` — pass the coordinates from calibration to the on-camera receiver
+python -m host.cal_procedure --no-interactive
+python -m host.cal_procedure --show             # verify calibration
 
-The host-side method gives delta +120-150 on-camera (via pixel ROI) and +200 via RTSP, vs +10-15 with the grid method at the same distance.
+# 3a. On-camera pixel RX (recommended, ~4.2 bps)
+# On cam2: irlink listen --pixel 385,178 --speed 120
+# On cam1: irlink tx "HELLO" --speed 120
+# With protocol: irlink send "HELLO" --pixel <coords> --speed 120
 
-### Boot Automation
+# 3b. Host-side pixel RX (~4.2 bps, best SNR)
+python -m host.pixel_rx --cam cam2 --symbol-ms 120
+# Trigger TX from cam1: ssh da-camera1 "/opt/bin/irlink tx HELLO --speed 120"
 
-Both cameras run `/etc/rc.local` at boot (via `S94rc.local`):
-1. Mounts `/opt` JFFS2 partition if not mounted
-2. Stops stock prudynt, starts patched version
-3. Opens IR cut filter, kills daynightd
+# 3c. Resync-framed long messages (~4.9 bps @ 70ms/sym)
+python -m host.pixel_rx --cam cam2 --symbol-ms 80 --decoder resync \
+    --dump-samples runs/capture.jsonl &
+python -m host.tx_resync --cam cam1 --speed 80 \
+    "The quick brown fox jumps over the lazy dog"
 
-### Deploying
+# 3d. Offline replay of a dumped capture
+python -m experiments.replay runs/capture.jsonl --decoder baseline
+python -m experiments.replay runs/capture.jsonl --decoder resync -v
 
-```bash
-# Build and deploy irlink to both cameras
-cd irlink && make deploy
-
-# Rebuild and deploy patched prudynt (with AE freeze + BrightnessMonitor)
-cd thingino-firmware
-BOARD=wyze_cam3_t31x_gc2053_atbm6031 make prudynt-t-rebuild
-scp -O .../per-package/prudynt-t/target/usr/bin/prudynt root@<cam>:/opt/bin/prudynt-patched
-# Restart prudynt on camera, then: ircut off; killall daynightd
+# 4. Multi-app orchestration (HELLO→META→CAL→TEXT→BYE)
+python -m host.session --symbol-ms 160 --text "HI"
 ```
 
-### Camera Setup Script
-
-Run before any calibration or communication to ensure cameras are in the correct state:
+### Calibration Viewer
 ```bash
-./host/cam_setup.sh                  # setup both cameras
-./host/cam_setup.sh da-camera1       # one camera only
-./host/cam_setup.sh --check          # verify only, don't fix
-```
-
-Checks and fixes: patched prudynt, night/monochrome mode, IR cut filter, daynightd killed, LEDs off, AE freeze idle, brightness grid active, irlink deployed. Uses Thingino web API (curl) for ISP controls, SSH for GPIO and process management. Sets ircut filter LAST because other commands re-close it.
-
-### Host-side Pixel Receiver
-
-For long-distance communication (10-20 feet) where the grid-based on-camera RX has insufficient signal:
-```bash
-conda activate light
-python -m host.cal_procedure --no-interactive  # calibrate first
-python -m host.pixel_rx --cam cam2             # auto-loads calibration, 160ms default
-python -m host.pixel_rx --cam cam2 --symbol-ms 120  # faster speed
-python -m host.pixel_rx --cam cam2 --tx-pos 385,178  # manual position
-```
-
-Reads the RTSP stream directly and tracks a small pixel ROI (15x15) around the calibrated TX position. Uses DPLL clock recovery with early-late gate for robust symbol extraction. Gets delta +150-200 at 10-20 feet vs +10-15 with the grid. Reliable at 120ms/symbol (~4.2 bps).
-
-**Decoder architecture**: Two-pass decode — DPLL on raw sample timestamps first (handles irregular frame timing), brute-force t0 search on interpolated signal as fallback. The DPLL works directly with irregular RTSP sample times to avoid interpolation artifacts from frame gaps.
-
-## Application Layer
-
-A typed application protocol sits on top of irlink's `MSG_DATA` frames. Reserves `payload[0]` as an app-msg-type byte; `payload[1:]` is type-specific. No changes to irlink's protocol-layer semantics — just structured content inside DATA.
-
-### Message types (`protocol/app.py`)
-
-| Code | Name | Body | Purpose |
-|------|------|------|---------|
-| 0x01 | APP_HELLO | `name\0` | Initiator announces identity (variable name, ≤14 chars) |
-| 0x02 | APP_META | `ts(4) status(1) ver(2)` | Compact node state — fixed 7B body, no name (carried by HELLO) |
-| 0x03 | APP_META_ACK | `ver(2)` | Receipt for META |
-| 0x04 | APP_CAL_RESULT | `x(2) y(2)` | "I see your LED at this pixel"; cross-checks `calibration.json` |
-| 0x05 | APP_STATS | `tx(2) rx(2) crc(2) rtx(2) dll(2) baseline(1) delta(1)` | Periodic link-health snapshot |
-| 0x06 | APP_TEXT | UTF-8 (≤15B) | Single-frame app payload |
-| 0x07 | APP_BYE | optional reason | Clean teardown |
-| 0x08 | APP_CHUNK | `msg_id(1) seq(1) total(1) data(≤12)` | Fragment of a longer payload |
-| 0x09 | APP_CHUNK_ACK | `msg_id(1) bitmap(...)` | Selective ACK — bitmap of received chunk seqs |
-| 0xFE | APP_NACK | `rejected_type(1) reason(1)` | Receiver rejected the message |
-
-### Drift-budget rule (16-byte single-frame ceiling)
-
-Every single-frame app message must fit in **16 bytes total** (1 type byte + ≤15 data bytes). This is the empirical on-camera DPLL lock budget at 120ms/sym — see [Common Pitfalls → DPLL clock drift dominates...]. Larger payloads call `fragment()` which produces APP_CHUNK frames sized exactly to the budget; receiver reassembles via `reassemble()` and ACKs missing chunks via the bitmap.
-
-The pack functions enforce the budget — `pack_text("..." * 20)` raises `ValueError`. Tests in `tests/test_app.py` assert every single-frame type stays ≤16B.
-
-### Orchestrator (`host/session.py`)
-
-Laptop-side driver that runs both cameras in `irlink listen/connect` interactive mode over SSH:
-
-```bash
-conda activate light
-python -m host.session --dry-run                       # exercise pack/unpack/fragment offline
-python -m host.session --handshake-only --symbol-ms 160 # SSH + irlink handshake only
-python -m host.session --symbol-ms 160 --text "HI"     # full HELLO→META→CAL→TEXT→STATS→BYE
-python -m host.session --skip-cal --skip-stats          # subset
-```
-
-Architecture:
-- `IRSession.start()` spawns `ssh -T root@<host> /opt/bin/irlink listen/connect ...` for each cam, parses `MSG-HEX:` lines from stdout, writes `send-hex <hex>` to stdin
-- Calibration runs out-of-band beforehand via `host/cal_procedure.py`; `APP_CAL_RESULT` cross-verifies the in-link reading against the saved RTSP-derived coords
-- All app logic lives on the laptop; cameras run unmodified `irlink`. No camera-side Python required.
-- STATS request prints a parseable line (`STATS: tx=N rx=N crc=N rtx=N dll=N`) to stdout; the orchestrator reads it via the `request_stats()` helper.
-
-### Recommended speeds
-
-- **120ms/sym**: works for host-side `pixel_rx` (RTSP @ 30fps gives 3.6 samples/sym).
-- **160ms/sym**: required for on-camera RX (BrightnessMonitor @ 18fps gives 2.2 samples/sym at 120ms — DPLL marginal). Adds ~33% TX time but reliable. Plan defaults to 160ms for `host/session.py` flows.
-
-### After Fresh Firmware Flash
-
-The `/opt` JFFS2 partition may not auto-mount after a fresh SD card flash:
-
-```bash
-mount -t jffs2 /dev/mtdblock5 /opt
-mkdir -p /opt/bin
-# Then SCP binaries to /opt/bin/
+cd photos && python -m http.server 8888
+# Open http://localhost:8888/calibration.html
 ```
 
 ## Running Tests
 
 ```bash
 conda activate light
-cd /data/python/light-cam-canto
 pytest tests/ -v
 ```
 
-## Usage
+## Cross-Cutting Gotchas
 
-```bash
-# 1. Setup cameras (run after every reboot)
-./host/cam_setup.sh
+The few that bite regardless of which subsystem you're in. Subsystem-specific pitfalls live in the nested CLAUDE.md files.
 
-# 2. Calibrate (find TX pixel locations)
-conda activate light
-python -m host.cal_procedure --no-interactive
-python -m host.cal_procedure --show    # verify calibration
-
-# 3a. On-camera pixel RX (recommended, ~4.2 bps)
-# Use pixel coords from calibration (e.g., cam2 sees cam1 at 385,178)
-# On cam2: irlink listen --pixel 385,178 --speed 120
-# On cam1: irlink tx "HELLO" --speed 120
-# Or with protocol: irlink send "HELLO" --pixel <coords> --speed 120
-
-# 3b. Host-side pixel RX (~4.2 bps, best SNR)
-python -m host.pixel_rx --cam cam2 --symbol-ms 120    # auto-loads calibration
-# Then trigger TX from cam1: ssh da-camera1 "/opt/bin/irlink tx HELLO --speed 120"
-
-# 3c. On-camera grid RX (legacy, ~3 bps)
-# On cam1: irlink listen --block 212
-# On cam2: irlink send "HELLO" --block 113
-
-# Legacy: send via Python host orchestration
-python -m host.send_message "HELLO"
-```
-
-### Calibration Viewer
-
-```bash
-cd photos && python -m http.server 8888
-# Open http://localhost:8888/calibration.html
-```
+- **IR cut filter must be open** (`ircut off`). Without this, IR is physically blocked — no amount of software can detect it. After every reboot, the filter resets to day mode. Kill `daynightd` to prevent auto-switching. The filter ALSO resets when prudynt restarts.
+- **SCP needs `-O` flag** (legacy protocol). Thingino lacks `sftp-server`.
+- **940nm is invisible.** Use a phone camera or the other camera's RTSP stream to verify TX. 850nm has a faint visible red glow for sanity checks.
+- **Overlay filesystem is tiny** (~224KB `/etc` + 8MB `/opt`). Never `cp` large files to `/usr/bin/` — it will fill the overlay and corrupt the binary. Deploy to `/opt/bin/`.
+- **Wyze V3 USB port carries power AND data** — every USB cable change is a hard camera reboot. Wait ~60s for WiFi to come back before SSHing.
+- **AE freeze is required for half-duplex protocol.** Without it, the camera's own LED reflections cause massive AE swings (3-5s settle). `irlink` handles this via `/run/prudynt/ae_freeze`. See `irlink/CLAUDE.md`.
+- **Calibration coordinates shift when cameras move** — even a small bump invalidates pixel coordinates. Re-run `host.cal_procedure --no-interactive` after any physical change.
 
 ## Key References
 
 - Thingino firmware: https://github.com/themactep/thingino-firmware
 - Prudynt-T streamer: https://github.com/gtxaspec/prudynt-t
 - ingenic-pwm: https://github.com/gtxaspec/ingenic-pwm
-- Ingenic T31 datasheet: search "Ingenic T31 programming manual"
 - Rolling shutter OCC research: https://pmc.ncbi.nlm.nih.gov/articles/PMC7061997/

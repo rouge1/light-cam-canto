@@ -33,6 +33,12 @@ transmitter/tx_pwm
 transmitter/test_luma
 receiver/irlink_rx
 irlink/irlink
+irlink/irlink_rs_tx
+irlink/irlink_rs_rx
+irlink/rs_toggle_test
+
+# Hardware capture dumps from pixel_rx --dump-samples (regenerated per run)
+runs/
 
 # Thingino firmware build tree (large, has its own repo)
 thingino-firmware/

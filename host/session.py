@@ -116,6 +116,10 @@ class CamLink:
                 stats = _parse_stats_line(line)
                 self.log(f"[{self.label}] stats: {stats}")
                 self._stats_queue.put(stats)
+            elif line.startswith("RATE:"):
+                # Emitted by irlink whenever it changes symbol_ms (probe-up,
+                # fallback-down, or split-brain recovery). Format: "RATE: ms=120 rung=3 reason=<why>"
+                self.log(f"[{self.label}] {line}")
             elif line.startswith("PONG:"):
                 self.log(f"[{self.label}] {line}")
             elif line.startswith("MSG:"):
@@ -270,6 +274,31 @@ class SessionConfig:
     symbol_ms: int = 120
     handshake_timeout: float = 180.0
     msg_timeout: float = 180.0
+
+
+_DEFAULT_SYMBOL_MS = 160  # fallback when calibration lacks recommended_rate_ms
+_ON_CAMERA_MIN_MS = 160   # on-camera BrightnessMonitor ~18fps → floor for initial rate;
+                          # in-session probe-up adapts faster when conditions allow.
+
+
+def _pick_symbol_ms_from_cal(cal: dict) -> int:
+    """Pick a conservative starting rate from calibration.
+
+    The Δ→rate table in host/config.py was tuned for host-side RTSP at 30fps.
+    On-camera RX uses BrightnessMonitor at ~18fps, so we clamp the picked rate
+    to at least _ON_CAMERA_MIN_MS. The adaptive probe-up logic in irlink will
+    push it faster within the session if the link supports it.
+    """
+    rates = [
+        entry.get("recommended_rate_ms")
+        for entry in cal.values()
+        if isinstance(entry, dict)
+    ]
+    rates = [r for r in rates if isinstance(r, int)]
+    if not rates:
+        return _DEFAULT_SYMBOL_MS
+    picked = max(rates)  # pick the slower of the two
+    return max(picked, _ON_CAMERA_MIN_MS)
 
 
 class IRSession:
@@ -466,7 +495,9 @@ def dry_run():
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--symbol-ms", type=int, default=120)
+    p.add_argument("--symbol-ms", type=int, default=None,
+                   help="override symbol rate (ms). Default: from calibration.json's "
+                        "recommended_rate_ms, or 160ms if absent.")
     p.add_argument("--text", default="HELLO")
     p.add_argument("--cam1-host", default="da-camera1")
     p.add_argument("--cam2-host", default="da-camera2")
@@ -487,10 +518,23 @@ def main():
     def log(msg: str):
         print(f"{_ts()} {msg}", flush=True)
 
+    # Pick symbol rate: explicit CLI flag > calibration recommendation > 160ms fallback.
+    if args.symbol_ms is not None:
+        symbol_ms = args.symbol_ms
+        log(f"[session] symbol_ms={symbol_ms} (from --symbol-ms)")
+    else:
+        try:
+            cal = _load_calibration()
+            symbol_ms = _pick_symbol_ms_from_cal(cal)
+            log(f"[session] symbol_ms={symbol_ms} (from calibration)")
+        except FileNotFoundError:
+            symbol_ms = _DEFAULT_SYMBOL_MS
+            log(f"[session] symbol_ms={symbol_ms} (no calibration, using default)")
+
     cfg = SessionConfig(
         cam1_host=args.cam1_host, cam2_host=args.cam2_host,
         cam1_name=args.cam1_name, cam2_name=args.cam2_name,
-        symbol_ms=args.symbol_ms,
+        symbol_ms=symbol_ms,
     )
     sess = IRSession(cfg, log_fn=log)
     try:

@@ -17,6 +17,9 @@ import subprocess
 import sys
 import time
 import argparse
+import json
+import os
+from datetime import datetime
 from protocol.manchester import manchester_decode
 from protocol.frame import parse_frame_bits, SYNC_WORD
 
@@ -75,7 +78,8 @@ def auto_detect_tx(rx_name, tx_name, roi_size=15):
 
 
 def run_rx(rx_name, tx_x, tx_y, roi_size=15, symbol_ms=160, settle_ms=400, min_delta=10,
-           cal_frame_size=None):
+           cal_frame_size=None, dump_path=None, decoder="baseline",
+           chunk_syms=None, resync_syms=None, rs_n=None, rs_k=None):
     """Monitor RTSP stream and decode Manchester frames from pixel brightness."""
     rx_ip = CAMERAS[rx_name]
     rtsp_url = f"rtsp://thingino:thingino@{rx_ip}:554/ch1"
@@ -184,9 +188,47 @@ def run_rx(rx_name, tx_x, tx_y, roi_size=15, symbol_ms=160, settle_ms=400, min_d
                 print(f"RX: end of TX ({len(samples)} samples over {samples[-1][0] - samples[0][0]}ms)")
 
                 # Try to decode
-                result = decode_samples(samples, symbol_ms, min_delta)
+                from protocol.frame import (
+                    DEFAULT_CHUNK_SYMS, DEFAULT_RESYNC_SYMS,
+                    DEFAULT_RS_N, DEFAULT_RS_K,
+                )
+                if decoder == "resync":
+                    from experiments.resync_decoder import decode_samples_resync
+                    result = decode_samples_resync(
+                        samples, symbol_ms, min_delta,
+                        chunk_syms=chunk_syms or DEFAULT_CHUNK_SYMS,
+                        resync_syms=resync_syms or DEFAULT_RESYNC_SYMS,
+                    )
+                elif decoder == "resync-fec":
+                    from experiments.resync_decoder import decode_samples_resync_fec
+                    result = decode_samples_resync_fec(
+                        samples, symbol_ms, min_delta,
+                        chunk_syms=chunk_syms or DEFAULT_CHUNK_SYMS,
+                        resync_syms=resync_syms or DEFAULT_RESYNC_SYMS,
+                        rs_n=rs_n or DEFAULT_RS_N,
+                        rs_k=rs_k or DEFAULT_RS_K,
+                    )
+                else:
+                    result = decode_samples(samples, symbol_ms, min_delta)
                 if result:
                     print(f"\n*** DECODED: {result} ***\n")
+
+                # Dump raw samples for offline replay
+                if dump_path is not None:
+                    record = {
+                        "ts": datetime.now().isoformat(timespec="seconds"),
+                        "rx_cam": rx_name,
+                        "tx_pixel": [tx_x, tx_y],
+                        "roi_size": roi_size,
+                        "symbol_ms": symbol_ms,
+                        "min_delta": min_delta,
+                        "baseline_at_start": samples[0][1] if samples else None,
+                        "samples": samples,
+                        "decoded": result,
+                    }
+                    with open(dump_path, "a") as f:
+                        f.write(json.dumps(record) + "\n")
+                    print(f"RX: dumped {len(samples)} samples to {dump_path}")
 
                 # Reset
                 state = IDLE
@@ -377,6 +419,15 @@ if __name__ == "__main__":
     parser.add_argument("--symbol-ms", type=int, default=160, help="Symbol duration in ms")
     parser.add_argument("--settle-ms", type=int, default=400, help="Settle time in ms")
     parser.add_argument("--min-delta", type=int, default=10, help="Min brightness delta")
+    parser.add_argument("--dump-samples", help="Append raw samples per capture as JSONL to this file")
+    parser.add_argument("--decoder", default="baseline",
+                        choices=["baseline", "resync", "resync-fec"],
+                        help="Decoder variant (resync: mid-frame resync markers; "
+                             "resync-fec: resync + Reed-Solomon error correction)")
+    parser.add_argument("--chunk-syms", type=int, help="resync: data symbols per chunk (default 48)")
+    parser.add_argument("--resync-syms", type=int, help="resync: symbols per resync block (default 16)")
+    parser.add_argument("--rs-n", type=int, help="resync-fec: RS codeword length (default 15)")
+    parser.add_argument("--rs-k", type=int, help="resync-fec: RS message length per block (default 11)")
     args = parser.parse_args()
 
     if args.auto_detect:
@@ -403,4 +454,10 @@ if __name__ == "__main__":
            symbol_ms=args.symbol_ms,
            settle_ms=args.settle_ms,
            min_delta=args.min_delta,
-           cal_frame_size=cal_frame_size if 'cal_frame_size' in dir() else None)
+           cal_frame_size=cal_frame_size if 'cal_frame_size' in dir() else None,
+           dump_path=args.dump_samples,
+           decoder=args.decoder,
+           chunk_syms=args.chunk_syms,
+           resync_syms=args.resync_syms,
+           rs_n=args.rs_n,
+           rs_k=args.rs_k)

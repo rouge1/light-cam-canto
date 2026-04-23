@@ -25,6 +25,8 @@ import os
 import argparse
 from datetime import datetime
 
+from host.config import pick_initial_rate_ms
+
 CAMERAS = {
     "cam1": "192.168.50.110",
     "cam2": "192.168.50.141",
@@ -275,6 +277,7 @@ def calibrate_pair(rx_name, tx_name, interactive=True):
         "on_value": on_val,
         "delta": delta,
         "peak_blurred": peak_blurred,
+        "recommended_rate_ms": pick_initial_rate_ms(delta),
         "timestamp": ts,
         "images": {
             "box": box_path,
@@ -394,6 +397,8 @@ def show_calibration():
         print(f"  TX pixel: ({entry['tx_pixel'][0]}, {entry['tx_pixel'][1]})")
         print(f"  Delta: {entry['delta']} (OFF={entry['off_value']}, ON={entry['on_value']})")
         print(f"  Peak (blurred): {entry['peak_blurred']}")
+        if "recommended_rate_ms" in entry:
+            print(f"  Recommended rate: {entry['recommended_rate_ms']}ms/sym")
         print(f"  Calibrated: {entry['timestamp']}")
 
 

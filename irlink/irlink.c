@@ -48,11 +48,28 @@
 #define GRID_BLOCKS         240     /* 20x12 grid (32x30 pixel blocks) */
 #define MAX_RETRIES         3
 
-/* Runtime-configurable speed */
+/* Runtime-configurable speed — updated at runtime by rate adaptation. */
 static int symbol_ms = 160;        /* default: 160ms/symbol (~3 bps after Manchester, ~3 frames/symbol at 18fps) */
 
-/* Computed from symbol_ms at startup */
-static int ack_timeout_ms = 60000; /* auto-scaled to 3x max frame round-trip */
+/* Computed from symbol_ms — recomputed on every rate change via recompute_ack_timeout(). */
+static int ack_timeout_ms = 60000;
+
+/* ---- Adaptive symbol rate ladder (mirrors host/config.py RATE_LADDER_MS) ---- */
+static const int RATE_LADDER_MS[] = {60, 80, 100, 120, 160, 200};
+#define RATE_LADDER_LEN ((int)(sizeof(RATE_LADDER_MS) / sizeof(RATE_LADDER_MS[0])))
+
+static int current_rung = 3;            /* default to 120ms (index 3) until --speed sets it */
+static int success_at_rate = 0;         /* consecutive ACKed DATA sends at current rate */
+static int fail_at_rate = 0;            /* consecutive retransmit-exhausted sends at current rate */
+static int probe_in_progress = 0;       /* true while testing a faster rate post-probe-up */
+static int pre_probe_rung = -1;         /* rung to restore on failed probe */
+static int64_t last_valid_frame_ms = 0; /* for split-brain recovery */
+static int64_t failed_probe_cooldown_ms[RATE_LADDER_LEN] = {0};
+
+#define PROBE_UP_AFTER          5       /* successful ACKs before probing faster */
+#define FALLBACK_AFTER          3       /* retransmit-exhausted sends before stepping slower */
+#define SPLIT_BRAIN_TIMEOUT_MS  15000
+#define PROBE_COOLDOWN_MS       30000
 
 /* ---- Message types ---- */
 
@@ -65,6 +82,7 @@ static int ack_timeout_ms = 60000; /* auto-scaled to 3x max frame round-trip */
 #define MSG_CAL_DONE    0x07
 #define MSG_PING        0x08
 #define MSG_PONG        0x09
+#define MSG_RATE_CHANGE 0x0A
 
 /* ---- Sync word ---- */
 
@@ -141,6 +159,41 @@ static int64_t now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* ---- Adaptive symbol rate helpers ---- */
+
+static int rung_for_rate_ms(int ms)
+{
+    /* Best-effort: exact match preferred; otherwise clamp to closest rung by value. */
+    int best_idx = 0;
+    int best_diff = 1 << 30;
+    for (int i = 0; i < RATE_LADDER_LEN; i++) {
+        int d = RATE_LADDER_MS[i] - ms;
+        if (d < 0) d = -d;
+        if (d < best_diff) {
+            best_diff = d;
+            best_idx = i;
+        }
+    }
+    return best_idx;
+}
+
+static void recompute_ack_timeout(void)
+{
+    /* Same formula as startup: 450 * symbol_ms + 5000. See comment in main(). */
+    ack_timeout_ms = 450 * symbol_ms + 5000;
+}
+
+static void apply_rate(int new_ms, int new_rung, const char *reason)
+{
+    symbol_ms = new_ms;
+    current_rung = new_rung;
+    recompute_ack_timeout();
+    fprintf(stderr, "RATE: ms=%d rung=%d reason=%s\n", new_ms, new_rung, reason);
+    /* Also surface on stdout so orchestrators can log it. */
+    printf("RATE: ms=%d rung=%d reason=%s\n", new_ms, new_rung, reason);
+    fflush(stdout);
 }
 
 /* ---- AE freeze control (via prudynt BrightnessMonitor) ---- */
@@ -326,9 +379,10 @@ static void send_message(uint8_t msg_type, uint8_t seq,
         [MSG_SYN] = "SYN", [MSG_SYN_ACK] = "SYN_ACK", [MSG_ACK] = "ACK",
         [MSG_DATA] = "DATA", [MSG_CAL_REQ] = "CAL_REQ",
         [MSG_CAL_ACK] = "CAL_ACK", [MSG_CAL_DONE] = "CAL_DONE",
-        [MSG_PING] = "PING", [MSG_PONG] = "PONG"
+        [MSG_PING] = "PING", [MSG_PONG] = "PONG",
+        [MSG_RATE_CHANGE] = "RATE_CHANGE"
     };
-    const char *name = (msg_type <= MSG_PONG) ? type_names[msg_type] : "???";
+    const char *name = (msg_type <= MSG_RATE_CHANGE) ? type_names[msg_type] : "???";
     fprintf(stderr, "TX: %s seq=%d (%d symbols)\n", name, seq, n);
 
     tx_count++;
@@ -926,7 +980,37 @@ static void *rx_thread(void *arg)
     /* Log first few brightness readings for debugging */
     int debug_count = 0;
 
+    /* Split-brain timer is armed only after the first valid frame is seen
+       (last_valid_frame_ms stays 0 until rx_thread decodes something). This
+       prevents the timer from firing during startup while we wait for the
+       peer's first SYN/DATA, which can take longer than SPLIT_BRAIN_TIMEOUT_MS
+       (a 16B DATA at 200ms/sym is ~70s on-air). */
+
     while (running) {
+        /* Split-brain recovery: if we've seen a valid frame before and it's
+           been too long since, AND we're not on the slowest rung → drop to
+           slowest rate. Peer (if alive) will hit this too — both reconverge
+           at the slowest rung. The last_valid_frame_ms>0 guard prevents
+           firing during startup before any decode. Window scales with
+           ack_timeout_ms so handshake flows don't false-trigger.
+           Note: we do NOT require carrier-absence, because a peer stuck at
+           a mismatched rate still produces carrier (we see TX activity) but
+           can never produce a valid decode — that's exactly split-brain. */
+        int split_brain_window_ms = 2 * ack_timeout_ms;
+        if (split_brain_window_ms < SPLIT_BRAIN_TIMEOUT_MS)
+            split_brain_window_ms = SPLIT_BRAIN_TIMEOUT_MS;
+        if (!tx_active && last_valid_frame_ms > 0
+            && current_rung < RATE_LADDER_LEN - 1
+            && now_ms() - last_valid_frame_ms > split_brain_window_ms) {
+            apply_rate(RATE_LADDER_MS[RATE_LADDER_LEN - 1],
+                       RATE_LADDER_LEN - 1, "split-brain-recovery");
+            last_valid_frame_ms = now_ms();  /* reset so we don't immediately refire */
+            success_at_rate = 0;
+            fail_at_rate = 0;
+            probe_in_progress = 0;
+            pre_probe_rung = -1;
+        }
+
         /* Suppress RX during our own TX to avoid self-interference. */
         if (tx_active) {
             if (state == ACTIVE) {
@@ -1059,9 +1143,10 @@ static void *rx_thread(void *arg)
                         [MSG_ACK]="ACK", [MSG_DATA]="DATA",
                         [MSG_CAL_REQ]="CAL_REQ", [MSG_CAL_ACK]="CAL_ACK",
                         [MSG_CAL_DONE]="CAL_DONE",
-                        [MSG_PING]="PING", [MSG_PONG]="PONG"
+                        [MSG_PING]="PING", [MSG_PONG]="PONG",
+                        [MSG_RATE_CHANGE]="RATE_CHANGE"
                     };
-                    const char *n = (msg.msg_type <= MSG_PONG) ? names[msg.msg_type] : "?";
+                    const char *n = (msg.msg_type <= MSG_RATE_CHANGE) ? names[msg.msg_type] : "?";
                     fprintf(stderr, "RX: <<< %s seq=%d len=%d >>>\n",
                             n, msg.seq, msg.data_len);
 
@@ -1090,11 +1175,26 @@ static void *rx_thread(void *arg)
                        command arrives, deadlocking any wait=True send_app on
                        the peer side. wait_for_msg consumers still see the
                        message; they just no longer need to ACK it themselves.
-                       CAL_REQ stays main-handled (needs LED-on hold). */
+                       CAL_REQ stays main-handled (needs LED-on hold).
+                       RATE_CHANGE is also auto-handled: we ACK at the OLD rate,
+                       then switch symbol_ms — keeping both sides in sync. */
                     if (msg.msg_type == MSG_DATA) {
                         send_message(MSG_ACK, msg.seq, NULL, 0);
+                        last_valid_frame_ms = now_ms();
                     } else if (msg.msg_type == MSG_PING) {
                         send_message(MSG_PONG, 0, NULL, 0);
+                        last_valid_frame_ms = now_ms();
+                    } else if (msg.msg_type == MSG_RATE_CHANGE && msg.data_len >= 2) {
+                        int new_ms = ((int)msg.data[0] << 8) | msg.data[1];
+                        send_message(MSG_ACK, msg.seq, NULL, 0);  /* ACK at OLD rate */
+                        if (new_ms >= 40 && new_ms <= 2000) {
+                            apply_rate(new_ms, rung_for_rate_ms(new_ms),
+                                       "peer-initiated");
+                        }
+                        last_valid_frame_ms = now_ms();
+                    } else {
+                        /* All other valid frames still count toward split-brain recovery. */
+                        last_valid_frame_ms = now_ms();
                     }
                 } else {
                     crc_fail_count++;
@@ -1270,6 +1370,75 @@ static int do_listen(void)
     return -1;
 }
 
+/* ---- Rate-change helper: send RATE_CHANGE, wait for ACK, switch on success ---- */
+
+static int do_rate_change(int new_ms, const char *reason)
+{
+    uint8_t payload[2] = { (uint8_t)((new_ms >> 8) & 0xff), (uint8_t)(new_ms & 0xff) };
+    /* Use seq=0 (out-of-band, same as SYN/PING). DATA has its own seq counter. */
+    send_message(MSG_RATE_CHANGE, 0, payload, 2);
+
+    rx_message_t reply;
+    if (wait_for_msg(MSG_ACK, &reply, ack_timeout_ms) == 0) {
+        apply_rate(new_ms, rung_for_rate_ms(new_ms), reason);
+        return 0;
+    }
+    fprintf(stderr, "RATE: change to %dms failed (no ACK)\n", new_ms);
+    return -1;
+}
+
+/* Maybe probe a faster rung before the next DATA send. */
+static void maybe_probe_up(void)
+{
+    if (probe_in_progress) return;
+    if (current_rung <= 0) return;
+    if (success_at_rate < PROBE_UP_AFTER) return;
+
+    int faster_rung = current_rung - 1;
+    int faster_ms = RATE_LADDER_MS[faster_rung];
+    int64_t now = now_ms();
+    if (now - failed_probe_cooldown_ms[faster_rung] < PROBE_COOLDOWN_MS) return;
+
+    fprintf(stderr, "RATE: probing up %dms → %dms (success_at_rate=%d)\n",
+            symbol_ms, faster_ms, success_at_rate);
+    pre_probe_rung = current_rung;
+    if (do_rate_change(faster_ms, "probe-up") == 0) {
+        probe_in_progress = 1;
+        success_at_rate = 0;
+    } else {
+        failed_probe_cooldown_ms[faster_rung] = now;
+        success_at_rate = 0;  /* reset so we don't hammer */
+    }
+}
+
+/* Maybe step to a slower rung after retransmit-exhausted sends. */
+static void maybe_fallback_down(void)
+{
+    if (probe_in_progress && pre_probe_rung >= 0) {
+        /* Failed right after a probe-up — roll back to the known-good rung immediately. */
+        int prev_ms = RATE_LADDER_MS[pre_probe_rung];
+        fprintf(stderr, "RATE: probe failed, rolling back %dms → %dms\n",
+                symbol_ms, prev_ms);
+        failed_probe_cooldown_ms[current_rung] = now_ms();
+        do_rate_change(prev_ms, "probe-rollback");
+        probe_in_progress = 0;
+        pre_probe_rung = -1;
+        fail_at_rate = 0;
+        return;
+    }
+
+    if (fail_at_rate < FALLBACK_AFTER) return;
+    if (current_rung >= RATE_LADDER_LEN - 1) return;
+
+    int slower_ms = RATE_LADDER_MS[current_rung + 1];
+    fprintf(stderr, "RATE: falling back %dms → %dms (fail_at_rate=%d)\n",
+            symbol_ms, slower_ms, fail_at_rate);
+    if (do_rate_change(slower_ms, "fallback") == 0) {
+        fail_at_rate = 0;
+    }
+    /* On RATE_CHANGE timeout: split-brain timer in rx_thread will recover. */
+}
+
 /* ---- Send data with ACK ---- */
 
 static int do_send_bytes(const uint8_t *data, int len)
@@ -1281,6 +1450,9 @@ static int do_send_bytes(const uint8_t *data, int len)
 
     static uint8_t seq = 1;
 
+    /* Before sending, maybe probe a faster rate. */
+    maybe_probe_up();
+
     for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
         if (attempt > 0) retransmit_count++;
         send_message(MSG_DATA, seq, data, len);
@@ -1291,6 +1463,11 @@ static int do_send_bytes(const uint8_t *data, int len)
             if (reply.seq == seq) {
                 fprintf(stderr, "PROTO: ACK received for seq=%d\n", seq);
                 seq++;
+                success_at_rate++;
+                fail_at_rate = 0;
+                /* Probe payload survived — commit to the faster rate. */
+                probe_in_progress = 0;
+                pre_probe_rung = -1;
                 return 0;
             }
             fprintf(stderr, "PROTO: ACK seq mismatch (got %d, want %d)\n",
@@ -1301,6 +1478,9 @@ static int do_send_bytes(const uint8_t *data, int len)
     }
 
     fprintf(stderr, "PROTO: send failed after %d retries\n", MAX_RETRIES);
+    fail_at_rate++;
+    success_at_rate = 0;
+    maybe_fallback_down();
     return -1;
 }
 
@@ -1429,7 +1609,8 @@ static int interactive_mode(int is_listener)
     fprintf(stderr, "  send-hex <hex>     — send binary-safe DATA (hex-encoded)\n");
     fprintf(stderr, "  ping               — measure round-trip time\n");
     fprintf(stderr, "  cal                — request peer calibration\n");
-    fprintf(stderr, "  stats              — print link counters\n");
+    fprintf(stderr, "  rate <ms>          — switch symbol rate (sync'd via RATE_CHANGE)\n");
+    fprintf(stderr, "  stats              — print link counters + current rate\n");
     fprintf(stderr, "  quit               — exit\n\n");
 
     char line[1024];
@@ -1449,10 +1630,18 @@ static int interactive_mode(int is_listener)
             }
         } else if (strncmp(line, "send ", 5) == 0) {
             do_send(line + 5);
+        } else if (strncmp(line, "rate ", 5) == 0) {
+            int new_ms = atoi(line + 5);
+            if (new_ms < 40 || new_ms > 2000) {
+                fprintf(stderr, "rate: ms must be 40-2000\n");
+            } else {
+                do_rate_change(new_ms, "manual");
+            }
         } else if (strcmp(line, "stats") == 0) {
-            printf("STATS: tx=%d rx=%d crc=%d rtx=%d dll=%d\n",
+            printf("STATS: tx=%d rx=%d crc=%d rtx=%d dll=%d rate=%d rung=%d\n",
                    tx_count, rx_count, crc_fail_count,
-                   retransmit_count, dpll_loss_count);
+                   retransmit_count, dpll_loss_count,
+                   symbol_ms, current_rung);
             fflush(stdout);
         } else if (strcmp(line, "ping") == 0) {
             int64_t t0 = now_ms();
@@ -1598,7 +1787,8 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "irlink: --speed must be 40-2000 ms\n");
                 return 1;
             }
-            fprintf(stderr, "irlink: symbol speed %d ms\n", symbol_ms);
+            current_rung = rung_for_rate_ms(symbol_ms);
+            fprintf(stderr, "irlink: symbol speed %d ms (rung %d)\n", symbol_ms, current_rung);
         }
     }
 
@@ -1751,6 +1941,58 @@ int main(int argc, char *argv[])
         fprintf(stderr, "TX: raw send \"%s\" (%d bytes, speed=%dms)\n",
                 text, len, symbol_ms);
         send_message(MSG_DATA, 1, (const uint8_t *)text, len);
+        fprintf(stderr, "TX: done\n");
+
+        set_ae_freeze(0);
+        return 0;
+    }
+
+    if (strcmp(cmd, "tx-symbols") == 0) {
+        /* Raw symbol-stream TX: hex-encoded bits, 8 symbols per byte (MSB first).
+           Bypasses all framing — caller supplies the full on-wire symbol sequence.
+           Used for resync experiments driven from host Python (protocol/frame.py). */
+        if (argc < 3) {
+            fprintf(stderr, "Usage: irlink tx-symbols <hex> [--speed N]\n");
+            return 1;
+        }
+        const char *hex = NULL;
+        for (int i = 2; i < argc; i++) {
+            if ((strcmp(argv[i], "--speed") == 0 ||
+                 strcmp(argv[i], "--block") == 0 ||
+                 strcmp(argv[i], "--pixel") == 0 ||
+                 strcmp(argv[i], "--roi-size") == 0) && i + 1 < argc) {
+                i++;
+                continue;
+            }
+            hex = argv[i];
+            break;
+        }
+        if (!hex) {
+            fprintf(stderr, "No symbol hex provided\n");
+            return 1;
+        }
+
+        uint8_t bytes[MAX_SYMBOLS / 8];
+        int n_bytes = hex_decode(hex, bytes, sizeof(bytes));
+        if (n_bytes < 0) {
+            fprintf(stderr, "Bad hex\n");
+            return 1;
+        }
+
+        static uint8_t syms[MAX_SYMBOLS];
+        int n_syms = 0;
+        for (int b = 0; b < n_bytes; b++) {
+            for (int i = 7; i >= 0 && n_syms < MAX_SYMBOLS; i--) {
+                syms[n_syms++] = (bytes[b] >> i) & 1;
+            }
+        }
+
+        set_ae_freeze(1);
+        usleep(1000000);
+
+        fprintf(stderr, "TX: %d raw symbols, speed=%dms (~%.1fs)\n",
+                n_syms, symbol_ms, (n_syms * symbol_ms) / 1000.0);
+        transmit_symbols(syms, n_syms);
         fprintf(stderr, "TX: done\n");
 
         set_ae_freeze(0);

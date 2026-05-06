@@ -4,7 +4,7 @@
 TX_HOST = "da-camera1"
 TX_IP = "192.168.50.110"
 RX_HOST = "da-camera2"
-RX_IP = "192.168.50.141"
+RX_IP = "192.168.50.143"
 RX_RTSP = f"rtsp://thingino:thingino@{RX_IP}/ch0"
 
 # GPIO pins

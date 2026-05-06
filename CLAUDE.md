@@ -97,7 +97,7 @@ pip install opencv-python numpy paramiko matplotlib pytest requests
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/cam_key
 ssh-copy-id -i ~/.ssh/cam_key root@192.168.50.110
-ssh-copy-id -i ~/.ssh/cam_key root@192.168.50.141
+ssh-copy-id -i ~/.ssh/cam_key root@192.168.50.143
 ```
 
 Add to `~/.ssh/config`:
@@ -107,7 +107,7 @@ Host da-camera1
     User root
     IdentityFile ~/.ssh/cam_key
 Host da-camera2
-    HostName 192.168.50.141
+    HostName 192.168.50.143
     User root
     IdentityFile ~/.ssh/cam_key
 Host usb-cam1

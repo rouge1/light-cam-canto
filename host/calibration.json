@@ -26,23 +26,23 @@
     "rx_cam": "cam1",
     "tx_cam": "cam2",
     "tx_pixel": [
-      232,
-      321
+      316,
+      141
     ],
     "frame_size": [
       640,
       360
     ],
-    "off_value": 71,
+    "off_value": 0,
     "on_value": 255,
-    "delta": 184,
-    "peak_blurred": 165,
+    "delta": 255,
+    "peak_blurred": 157,
     "recommended_rate_ms": 70,
-    "timestamp": "20260422_193126",
+    "timestamp": "20260506_170119",
     "images": {
-      "box": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_box_20260422_193126.png",
-      "diff": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_diff_20260422_193126.png",
-      "zoom": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_zoom_20260422_193126.png"
+      "box": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_box_20260506_170119.png",
+      "diff": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_diff_20260506_170119.png",
+      "zoom": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_zoom_20260506_170119.png"
     }
   }
 }

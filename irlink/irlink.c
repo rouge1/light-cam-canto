@@ -29,6 +29,7 @@
 #include <signal.h>
 #include <pthread.h>
 #include <errno.h>
+#include <sys/stat.h>
 
 /* ---- Configuration ---- */
 
@@ -843,7 +844,16 @@ static int decode_samples(sample_t *samp, int n, rx_message_t *msg)
 
 /* ---- Calibration: AE freeze + raw delta (LED OFF vs LED ON) ---- */
 
-static int calibrate(void)
+typedef struct {
+    int block_idx;     /* peak block in 20x12 grid */
+    int baseline_val;  /* mean brightness at peak block, LED OFF */
+    int active_val;    /* mean brightness at peak block, LED ON */
+    int delta;         /* active - baseline */
+} grid_cal_t;
+
+/* Grid-based coarse calibration: AE freeze, baseline scan, prompt for LED on,
+   active scan, find peak block. Leaves AE FROZEN — caller must unfreeze. */
+static int do_grid_calibration(grid_cal_t *out)
 {
     fprintf(stderr, "CALIBRATE: freezing AE...\n");
     set_ae_freeze(1);
@@ -871,7 +881,6 @@ static int calibrate(void)
 
     if (n_baseline < 5) {
         fprintf(stderr, "CALIBRATE: too few baseline frames (%d)\n", n_baseline);
-        set_ae_freeze(0);
         return -1;
     }
 
@@ -903,7 +912,6 @@ static int calibrate(void)
 
     if (n_led < 5) {
         fprintf(stderr, "CALIBRATE: too few LED-ON frames (%d)\n", n_led);
-        set_ae_freeze(0);
         return -1;
     }
 
@@ -923,8 +931,6 @@ static int calibrate(void)
             best = b;
         }
     }
-
-    set_ae_freeze(0);
 
     if (best < 0 || best_delta < 3) {
         fprintf(stderr, "CALIBRATE: no IR block detected (max delta=%d)\n", best_delta);
@@ -949,8 +955,255 @@ static int calibrate(void)
         fprintf(stderr, "\n");
     }
 
-    printf("%d\n", best);
-    return best;
+    out->block_idx    = best;
+    out->baseline_val = baseline[best];
+    out->active_val   = led_on[best];
+    out->delta        = best_delta;
+    return 0;
+}
+
+static int calibrate(void)
+{
+    grid_cal_t cal;
+    int rc = do_grid_calibration(&cal);
+    set_ae_freeze(0);
+    if (rc < 0) return -1;
+    printf("%d\n", cal.block_idx);
+    return cal.block_idx;
+}
+
+/* ---- Pixel-level refinement: stride-5 ROI sweep within a grid block ---- */
+
+/* Wait for a fresh ROI sample (timestamp != prev_ts). */
+static int read_roi_fresh(int64_t prev_ts, int64_t *out_ts, uint8_t *out_b, int timeout_ms)
+{
+    int64_t deadline = now_ms() + timeout_ms;
+    while (now_ms() < deadline) {
+        int64_t ts;
+        uint8_t b;
+        if (read_roi(&ts, &b) == 0 && ts != prev_ts) {
+            *out_ts = ts;
+            *out_b = b;
+            return 0;
+        }
+        usleep(POLL_INTERVAL_US);
+    }
+    return -1;
+}
+
+/* Sample N fresh ROI frames and return the mean. */
+static int sample_roi_avg(int n_frames, uint8_t *out_avg)
+{
+    int sum = 0, count = 0;
+    int64_t last_ts = 0;
+    for (int i = 0; i < n_frames; i++) {
+        int64_t ts;
+        uint8_t b;
+        if (read_roi_fresh(last_ts, &ts, &b, 300) < 0) break;
+        sum += b;
+        count++;
+        last_ts = ts;
+    }
+    if (count == 0) return -1;
+    *out_avg = (uint8_t)(sum / count);
+    return 0;
+}
+
+/* Sample one ROI position (5x5, averaged over 3 fresh frames after a 2-frame
+   discard for the ROI change to take effect). Updates best_* if brighter. */
+static void scan_pos(int cx, int cy, int *best_x, int *best_y, uint8_t *best_b)
+{
+    write_roi_config(cx, cy, 5);
+    int64_t junk_ts = 0;
+    uint8_t junk_b;
+    read_roi_fresh(0, &junk_ts, &junk_b, 300);
+    read_roi_fresh(junk_ts, &junk_ts, &junk_b, 300);
+
+    uint8_t avg;
+    if (sample_roi_avg(3, &avg) == 0) {
+        fprintf(stderr, "  (%3d,%3d) = %3d\n", cx, cy, avg);
+        if ((int)avg > (int)*best_b) {
+            *best_b = avg;
+            *best_x = cx;
+            *best_y = cy;
+        }
+    }
+}
+
+/* Frame bounds for ROI size 5: center must be in [2, w-3] × [2, h-3].
+   Frame is 640x360 → cx ∈ [2,637], cy ∈ [2,357]. */
+#define ROI_CX_MIN  2
+#define ROI_CX_MAX  637
+#define ROI_CY_MIN  2
+#define ROI_CY_MAX  357
+#define MAX_EDGE_EXPANSIONS 4
+
+/* Find the peak pixel near a grid block via stride-5 ROI sweep. Starts inside
+   the given block; if the peak lands on the swept rectangle's edge, expands
+   by one stride in that direction and rescans only the new positions. Caps
+   expansions to bound runtime when the peak is degenerate (e.g. uniform). */
+static int find_peak_pixel_in_block(int block_idx,
+                                     int *out_x, int *out_y,
+                                     uint8_t *out_brightness)
+{
+    int bx = block_idx % 20;
+    int by = block_idx / 20;
+
+    /* Inclusive bounds of swept ROI-center positions */
+    int xmin = bx * 32 + 2;
+    int xmax = bx * 32 + 27;
+    int ymin = by * 30 + 2;
+    int ymax = by * 30 + 27;
+
+    fprintf(stderr, "PIXEL-CAL: initial sweep block %d (x=%d..%d, y=%d..%d)\n",
+            block_idx, xmin, xmax, ymin, ymax);
+
+    int best_x = -1, best_y = -1;
+    uint8_t best_b = 0;
+
+    for (int y = ymin; y <= ymax; y += 5) {
+        for (int x = xmin; x <= xmax; x += 5)
+            scan_pos(x, y, &best_x, &best_y, &best_b);
+    }
+    if (best_x < 0) return -1;
+
+    /* Edge-peak refinement loop. */
+    for (int iter = 0; iter < MAX_EDGE_EXPANSIONS; iter++) {
+        int new_xmin = xmin, new_xmax = xmax;
+        int new_ymin = ymin, new_ymax = ymax;
+
+        if (best_x == xmin && xmin > ROI_CX_MIN)
+            new_xmin = (xmin - 5 < ROI_CX_MIN) ? ROI_CX_MIN : xmin - 5;
+        if (best_x == xmax && xmax < ROI_CX_MAX)
+            new_xmax = (xmax + 5 > ROI_CX_MAX) ? ROI_CX_MAX : xmax + 5;
+        if (best_y == ymin && ymin > ROI_CY_MIN)
+            new_ymin = (ymin - 5 < ROI_CY_MIN) ? ROI_CY_MIN : ymin - 5;
+        if (best_y == ymax && ymax < ROI_CY_MAX)
+            new_ymax = (ymax + 5 > ROI_CY_MAX) ? ROI_CY_MAX : ymax + 5;
+
+        if (new_xmin == xmin && new_xmax == xmax &&
+            new_ymin == ymin && new_ymax == ymax)
+            break;  /* peak interior — done */
+
+        fprintf(stderr, "PIXEL-CAL: peak at (%d,%d)=%d on edge → expand to "
+                        "x=%d..%d, y=%d..%d\n",
+                best_x, best_y, best_b,
+                new_xmin, new_xmax, new_ymin, new_ymax);
+
+        /* Scan only newly-added positions. Top/bottom strips span the full
+           expanded x range; left/right strips span only the OLD y range so
+           corners aren't double-scanned. */
+        if (new_ymin < ymin) {
+            for (int y = new_ymin; y < ymin; y += 5)
+                for (int x = new_xmin; x <= new_xmax; x += 5)
+                    scan_pos(x, y, &best_x, &best_y, &best_b);
+        }
+        if (new_ymax > ymax) {
+            for (int y = ymax + 5; y <= new_ymax; y += 5)
+                for (int x = new_xmin; x <= new_xmax; x += 5)
+                    scan_pos(x, y, &best_x, &best_y, &best_b);
+        }
+        if (new_xmin < xmin) {
+            for (int x = new_xmin; x < xmin; x += 5)
+                for (int y = ymin; y <= ymax; y += 5)
+                    scan_pos(x, y, &best_x, &best_y, &best_b);
+        }
+        if (new_xmax > xmax) {
+            for (int x = xmax + 5; x <= new_xmax; x += 5)
+                for (int y = ymin; y <= ymax; y += 5)
+                    scan_pos(x, y, &best_x, &best_y, &best_b);
+        }
+
+        xmin = new_xmin; xmax = new_xmax;
+        ymin = new_ymin; ymax = new_ymax;
+    }
+
+    *out_x = best_x;
+    *out_y = best_y;
+    *out_brightness = best_b;
+    return 0;
+}
+
+static void write_calibration_json(int tx_x, int tx_y, int off_val, int on_val,
+                                    int grid_delta, int peak_b)
+{
+    mkdir("/opt/etc", 0755);  /* harmless if already exists */
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf),
+        "{\n"
+        "  \"tx_pixel\": [%d, %d],\n"
+        "  \"frame_size\": [640, 360],\n"
+        "  \"off_value\": %d,\n"
+        "  \"on_value\": %d,\n"
+        "  \"grid_delta\": %d,\n"
+        "  \"peak_brightness\": %d,\n"
+        "  \"timestamp_ms\": %lld,\n"
+        "  \"source\": \"on_camera_pixel_cal\"\n"
+        "}\n",
+        tx_x, tx_y, off_val, on_val, grid_delta, peak_b, (long long)now_ms());
+    int fd = open("/opt/etc/calibration.json", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "PIXEL-CAL: open calibration.json failed: %s\n", strerror(errno));
+        return;
+    }
+    if (write(fd, buf, n) != n)
+        fprintf(stderr, "PIXEL-CAL: write calibration.json short/failed\n");
+    close(fd);
+    fprintf(stderr, "PIXEL-CAL: wrote /opt/etc/calibration.json\n");
+}
+
+typedef struct {
+    int pixel_x, pixel_y;
+    uint8_t peak_b;
+    int grid_delta;
+    int block_idx;
+} pixel_cal_result_t;
+
+/* Two-phase calibration: grid coarse → pixel ROI sweep within peak block.
+   Peer must keep IR LEDs ON for the full ~8s sequence (4s grid + 4s ROI). */
+static int do_calibrate_pixel_to(pixel_cal_result_t *out)
+{
+    grid_cal_t cal;
+    if (do_grid_calibration(&cal) < 0) {
+        set_ae_freeze(0);
+        return 1;
+    }
+
+    /* AE still frozen from do_grid_calibration. Peer should keep LED on. */
+    fprintf(stderr, "PIXEL-CAL: keep peer LED ON, refining within block %d (~4s)...\n",
+            cal.block_idx);
+
+    int px, py;
+    uint8_t pb;
+    int rc = find_peak_pixel_in_block(cal.block_idx, &px, &py, &pb);
+    set_ae_freeze(0);
+
+    if (rc < 0) {
+        fprintf(stderr, "PIXEL-CAL: ROI sweep failed\n");
+        return 1;
+    }
+
+    fprintf(stderr, "PIXEL-CAL: peak at (%d, %d), ROI brightness=%d\n", px, py, pb);
+    write_calibration_json(px, py, cal.baseline_val, cal.active_val, cal.delta, pb);
+
+    out->pixel_x = px;
+    out->pixel_y = py;
+    out->peak_b = pb;
+    out->grid_delta = cal.delta;
+    out->block_idx = cal.block_idx;
+    return 0;
+}
+
+static int do_calibrate_pixel(void)
+{
+    pixel_cal_result_t r;
+    int rc = do_calibrate_pixel_to(&r);
+    if (rc == 0) {
+        /* Stable parseable line for orchestrators */
+        printf("PIXEL: %d %d %d %d %d\n",
+               r.pixel_x, r.pixel_y, (int)r.peak_b, r.grid_delta, r.block_idx);
+    }
+    return rc;
 }
 
 /* ================================================================
@@ -1514,31 +1767,54 @@ static int hex_decode(const char *hex, uint8_t *out, int max_out)
     return n;
 }
 
-/* ---- Calibrate over the link ---- */
+/* ---- Calibrate over the link ----
+   `bidi` flag in CAL_REQ payload[0]: when 1, the responder swaps roles after
+   the initial cycle finishes — it scans the original requestor in reverse,
+   so both sides end up with fresh pixel coords from a single trigger. */
 
-static int do_cal_request(void)
+static int do_cal_request_internal(int bidi);  /* fwd decl for bidi swap */
+static void handle_cal_request(int bidi);      /* fwd decl for bicall */
+
+static int do_cal_request_internal(int bidi)
 {
-    /* We need the peer to hold their IR LED ON so we can find the block.
-       Send CAL_REQ, wait for CAL_ACK, then scan grid, send CAL_DONE. */
-
-    fprintf(stderr, "PROTO: requesting calibration...\n");
+    fprintf(stderr, "PROTO: requesting pixel calibration (bidi=%d)...\n", bidi);
 
     for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-        send_message(MSG_CAL_REQ, 0, NULL, 0);
+        uint8_t req_payload[1] = { (uint8_t)bidi };
+        send_message(MSG_CAL_REQ, 0, req_payload, 1);
 
         rx_message_t reply;
         if (wait_for_msg(MSG_CAL_ACK, &reply, ack_timeout_ms) == 0) {
-            fprintf(stderr, "PROTO: peer acknowledged, scanning...\n");
-            /* Peer is now holding LED ON — run calibration */
-            int block = calibrate();
-            if (block >= 0) {
-                tracked_block = block;
-                fprintf(stderr, "PROTO: calibrated to block %d\n", block);
-            } else {
-                fprintf(stderr, "PROTO: calibration scan failed\n");
+            fprintf(stderr, "PROTO: peer acknowledged, starting pixel cal...\n");
+
+            pixel_cal_result_t r;
+            int rc = do_calibrate_pixel_to(&r);
+
+            uint8_t payload[6];
+            if (rc == 0) {
+                payload[0] = (uint8_t)((r.pixel_x >> 8) & 0xFF);
+                payload[1] = (uint8_t)(r.pixel_x & 0xFF);
+                payload[2] = (uint8_t)((r.pixel_y >> 8) & 0xFF);
+                payload[3] = (uint8_t)(r.pixel_y & 0xFF);
+                payload[4] = r.peak_b;
+                payload[5] = (uint8_t)(r.grid_delta > 255 ? 255
+                                       : (r.grid_delta < 0 ? 0 : r.grid_delta));
+                fprintf(stderr, "PROTO: pixel cal OK, sending CAL_DONE "
+                                "(x=%d y=%d b=%d d=%d)\n",
+                        r.pixel_x, r.pixel_y, r.peak_b, r.grid_delta);
+                /* Stable parseable line for orchestrators (this side's scan
+                   result, i.e. peer's TX position in OUR view). */
+                printf("PIXEL: %d %d %d %d %d\n",
+                       r.pixel_x, r.pixel_y, (int)r.peak_b, r.grid_delta, r.block_idx);
+                fflush(stdout);
+                send_message(MSG_CAL_DONE, 0, payload, 6);
+                return 0;
             }
+
+            /* On failure, send empty CAL_DONE so peer doesn't hang. */
+            fprintf(stderr, "PROTO: pixel cal failed, sending empty CAL_DONE\n");
             send_message(MSG_CAL_DONE, 0, NULL, 0);
-            return block;
+            return -1;
         }
         fprintf(stderr, "PROTO: CAL_ACK timeout, retry %d/%d\n",
                 attempt + 1, MAX_RETRIES);
@@ -1546,32 +1822,89 @@ static int do_cal_request(void)
     return -1;
 }
 
-/* ---- Handle incoming calibration request ---- */
+static int do_cal_request(void) { return do_cal_request_internal(0); }
 
-static void handle_cal_request(void)
+/* Bidirectional cal: scan peer, then swap roles and let peer scan us. After
+   this returns, both /opt/etc/calibration.json files are fresh AND the
+   orchestrator has seen both PIXEL: (our scan) and PEER-CAL: (peer's scan)
+   lines on stdout. */
+static int do_bicall(void)
 {
-    fprintf(stderr, "PROTO: peer requested calibration, holding LED ON for 5s...\n");
+    int rc = do_cal_request_internal(1);
+    if (rc != 0) {
+        fprintf(stderr, "BICAL: phase 1 (forward scan) failed\n");
+        return -1;
+    }
+    fprintf(stderr, "BICAL: phase 1 done; waiting for peer's reverse CAL_REQ...\n");
+    rx_message_t msg;
+    int wait_ms = ack_timeout_ms * 2;
+    if (wait_ms < 60000) wait_ms = 60000;
+    if (wait_for_msg(MSG_CAL_REQ, &msg, wait_ms) != 0) {
+        fprintf(stderr, "BICAL: timeout waiting for reverse CAL_REQ\n");
+        return -1;
+    }
+    fprintf(stderr, "BICAL: got reverse CAL_REQ — now LED-holder, peer is scanner\n");
+    /* Peer's reverse CAL_REQ should have bidi=0 (no further swap). */
+    int peer_bidi = (msg.data_len >= 1 && msg.data[0] == 1) ? 1 : 0;
+    handle_cal_request(peer_bidi);
+    fprintf(stderr, "BICAL: bidirectional cal complete\n");
+    return 0;
+}
+
+/* ---- Handle incoming calibration request ----
+   Peer is the LED holder. Timing must align with peer's do_calibrate_pixel:
+     0..1.5s   LED OFF — peer's AE freeze settle (0.5s) + baseline grid (1s)
+     1.5..14s  LED ON steady — peer's grid active (4s) + ROI sweep (~7-9s
+               with possible edge expansion)
+     14s+      LED OFF — peer wraps up and sends CAL_DONE
+   If `bidi` is set, after the responder phase + receive of peer's CAL_DONE,
+   swap roles: WE become the requestor and scan the peer back. */
+
+static void handle_cal_request(int bidi)
+{
+    fprintf(stderr, "PROTO: peer requested pixel calibration (bidi=%d)\n", bidi);
     send_message(MSG_CAL_ACK, 0, NULL, 0);
 
-    /* Hold LED toggling for 5 seconds so peer can calibrate */
+    /* Phase 1: 1.5s LED OFF — peer's baseline phase needs a clean OFF window. */
+    fprintf(stderr, "PROTO: holding LED OFF 1.5s for peer baseline...\n");
+    usleep(1500000);
+
+    /* Phase 2: 12s LED steady ON — peer's grid active + ROI sweep. */
+    fprintf(stderr, "PROTO: holding LED ON steady for 12s for peer scan...\n");
     pthread_mutex_lock(&tx_mutex);
     tx_active = 1;
-    for (int i = 0; i < 10 && running; i++) {
-        gpio_set(1);
-        usleep(250000);  /* 250ms ON */
-        gpio_set(0);
-        usleep(250000);  /* 250ms OFF */
-    }
+    gpio_set(1);
+    for (int i = 0; i < 120 && running; i++)
+        usleep(100000);  /* 120 * 100ms = 12s, polling running */
     gpio_set(0);
     tx_active = 0;
     pthread_mutex_unlock(&tx_mutex);
 
-    /* Wait for CAL_DONE */
+    /* Phase 3: wait for CAL_DONE with pixel coord payload. */
     rx_message_t msg;
-    if (wait_for_msg(MSG_CAL_DONE, &msg, 10000) == 0) {
-        fprintf(stderr, "PROTO: peer calibration complete\n");
+    if (wait_for_msg(MSG_CAL_DONE, &msg, 30000) == 0) {
+        if (msg.data_len >= 6) {
+            int x = (msg.data[0] << 8) | msg.data[1];
+            int y = (msg.data[2] << 8) | msg.data[3];
+            int peak_b = msg.data[4];
+            int delta = msg.data[5];
+            fprintf(stderr, "PROTO: peer cal complete → x=%d y=%d b=%d d=%d\n",
+                    x, y, peak_b, delta);
+            /* Stable parseable line for orchestrators (peer's view of US). */
+            printf("PEER-CAL: %d %d %d %d\n", x, y, peak_b, delta);
+            fflush(stdout);
+        } else {
+            fprintf(stderr, "PROTO: peer cal returned empty CAL_DONE (failed)\n");
+        }
     } else {
         fprintf(stderr, "PROTO: CAL_DONE timeout\n");
+    }
+
+    /* Phase 4 (bidi only): swap roles. Peer expects us to send CAL_REQ next. */
+    if (bidi) {
+        fprintf(stderr, "PROTO: bidi swap — letting peer settle 2s, then scanning back\n");
+        usleep(2000000);
+        do_cal_request_internal(0);
     }
 }
 
@@ -1608,7 +1941,8 @@ static int interactive_mode(int is_listener)
     fprintf(stderr, "  send <text>        — send data message (text, stops at NUL)\n");
     fprintf(stderr, "  send-hex <hex>     — send binary-safe DATA (hex-encoded)\n");
     fprintf(stderr, "  ping               — measure round-trip time\n");
-    fprintf(stderr, "  cal                — request peer calibration\n");
+    fprintf(stderr, "  cal                — request peer calibration (one-way)\n");
+    fprintf(stderr, "  bicall             — bidirectional cal (we scan, then peer scans us)\n");
     fprintf(stderr, "  rate <ms>          — switch symbol rate (sync'd via RATE_CHANGE)\n");
     fprintf(stderr, "  stats              — print link counters + current rate\n");
     fprintf(stderr, "  quit               — exit\n\n");
@@ -1657,6 +1991,8 @@ static int interactive_mode(int is_listener)
             }
         } else if (strcmp(line, "cal") == 0) {
             do_cal_request();
+        } else if (strcmp(line, "bicall") == 0) {
+            do_bicall();
         } else if (strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0) {
             break;
         } else if (len > 0) {
@@ -1669,9 +2005,12 @@ static int interactive_mode(int is_listener)
         pthread_mutex_lock(&rx_mutex);
         if (rx_msg.valid) {
             if (rx_msg.msg_type == MSG_CAL_REQ) {
+                /* Extract bidi flag before releasing the mutex — rx_thread
+                   might overwrite rx_msg.data once we let go. */
+                int bidi = (rx_msg.data_len >= 1 && rx_msg.data[0] == 1) ? 1 : 0;
                 rx_msg.valid = 0;
                 pthread_mutex_unlock(&rx_mutex);
-                handle_cal_request();
+                handle_cal_request(bidi);
             } else {
                 rx_msg.valid = 0;
                 pthread_mutex_unlock(&rx_mutex);
@@ -1722,9 +2061,11 @@ static int daemon_mode(int is_listener)
             /* rx_thread already auto-ACKed DATA and auto-PONGed PING;
                daemon just needs to handle the heavier protocol cases. */
             switch (msg.msg_type) {
-            case MSG_CAL_REQ:
-                handle_cal_request();
+            case MSG_CAL_REQ: {
+                int bidi = (msg.data_len >= 1 && msg.data[0] == 1) ? 1 : 0;
+                handle_cal_request(bidi);
                 break;
+            }
             case MSG_SYN:
                 send_message(MSG_SYN_ACK, 0, NULL, 0);
                 break;
@@ -1833,6 +2174,10 @@ int main(int argc, char *argv[])
             return 0;
         }
         return 1;
+    }
+
+    if (strcmp(cmd, "calibrate-pixel") == 0) {
+        return do_calibrate_pixel();
     }
 
     /* All communication modes: freeze AE first, unfreeze on exit */

@@ -12,16 +12,16 @@ Related: `../protocol/CLAUDE.md` for frame/app-layer/FEC details; `../host/CLAUD
 | SYN_ACK | 0x02 | Acknowledge connection |
 | ACK | 0x03 | Acknowledge data (with seq number) |
 | DATA | 0x04 | Payload data |
-| CAL_REQ | 0x05 | Request calibration |
+| CAL_REQ | 0x05 | Request calibration. 1-byte payload: `bidi` flag (1 = peer should swap roles + scan back after this cycle) |
 | CAL_ACK | 0x06 | Acknowledge calibration |
-| CAL_DONE | 0x07 | Calibration complete |
+| CAL_DONE | 0x07 | Calibration complete. 6-byte payload: `[x_hi, x_lo, y_hi, y_lo, peak_b, grid_delta]` (TX pixel coords as seen by the scanner) |
 | PING | 0x08 | Measure RTT |
 | PONG | 0x09 | Ping response |
 | RATE_CHANGE | 0x0A | Synchronize symbol rate between peers (2-byte BE payload) |
 
 Frame payload format: `[msg_type] [seq_num] [data...]`
 
-Subcommands: `calibrate`, `listen`, `connect`, `daemon-listen`, `daemon-connect`, `send`, `tx`, `tx-symbols`. Interactive cmds inside `connect`/`listen`: `send`, `send-hex`, `ping`, `cal`, `rate <ms>`, `stats`, `quit`.
+Subcommands: `calibrate`, `calibrate-pixel`, `listen`, `connect`, `daemon-listen`, `daemon-connect`, `send`, `tx`, `tx-symbols`. Interactive cmds inside `connect`/`listen`: `send`, `send-hex`, `ping`, `cal`, `bicall`, `rate <ms>`, `stats`, `quit`.
 
 Stdout contract (line-buffered via `fflush` after each line):
 - `MSG-HEX:<hex>` — binary-safe DATA payload (use this in orchestrators)
@@ -30,6 +30,9 @@ Stdout contract (line-buffered via `fflush` after each line):
 - `PROTO: ACK received for seq=N` / `PROTO: send failed`
 - `PROTO: ACK wait extended (peer carrier Xms ago, ext=N)` — carrier-aware extension firing
 - `RATE: ms=N rung=N reason=<probe-up|fallback|peer-initiated|probe-rollback|manual|split-brain-recovery>` — emitted on every rate change
+- `PIXEL: x y peak_b grid_delta block_idx` — emitted by the scanner side after a `calibrate-pixel`, `cal`, or `bicall` (its own view of the peer's TX)
+- `PEER-CAL: x y peak_b grid_delta` — emitted by the holder side after receiving CAL_DONE (the peer's view of US)
+- `BICAL: phase 1 done`, `BICAL: got reverse CAL_REQ`, `BICAL: bidirectional cal complete` — bicall progress markers
 
 ## Adaptive Symbol Rate
 
@@ -82,12 +85,22 @@ Controlled via `/run/prudynt/ae_freeze` — irlink writes `1` before starting, `
 
 ## ROI Calibration
 
-**On-camera (grid-based, legacy):** 20x12 grid (240 blocks) finds the transmitter's block:
+Three calibration paths, in order of preference for the autonomous-cam1 deployment:
+
+**1. On-camera pixel cal (`calibrate-pixel`, recommended).** Grid coarse → 6×6 stride-5 ROI sweep within the peak block. Auto-expands the search rectangle if the peak lands on its edge (handles IR LEDs straddling block boundaries). Writes `/opt/etc/calibration.json` (JFFS2-persistent). Used as the standalone CLI cal AND as the inner step of CAL_REQ over the link.
 ```bash
-irlink calibrate    # toggle peer LED during 4s window
+# Standalone (laptop SSH-drives both sides during a 4s+12s LED-on window):
+ssh da-camera2 "light ir850 on; light ir940 on; sleep 12; light ir850 off; light ir940 off" &
+sleep 2  # let baseline phase finish first
+ssh da-camera1 "/opt/bin/irlink calibrate-pixel"
+# stdout (cam1): PIXEL: 315 142 235 14 89  (x y peak_b grid_delta block_idx)
 ```
 
-**Host-side (pixel-level, recommended):** see `../host/CLAUDE.md` — delta +120-150 on-camera vs +10-15 with the grid.
+**2. Over-link cal (`cal` and `bicall` interactive cmds).** The CAL_REQ/CAL_ACK/CAL_DONE protocol triggers `do_calibrate_pixel` on the requestor side; CAL_DONE carries the result. `cal` does one direction; `bicall` does both via a role-swap (CAL_REQ payload bit 0 = `bidi`). Validated end-to-end at 160ms/sym ~3.5 min total. Both `/opt/etc/calibration.json` files end up fresh.
+
+**3. Grid-only legacy (`calibrate`).** Block-only, no pixel refinement. Kept for backwards compatibility; prefer `calibrate-pixel`.
+
+**Host-side RTSP cal:** `host/cal_procedure.py` — see `../host/CLAUDE.md`. Uses RTSP frame-diff; can underreport delta when AE compensates (the on-camera grid sees +67 delta where the laptop reports +24). Use the on-camera path when the laptop's cal looks suspiciously weak.
 
 ## Boot Automation
 
@@ -95,6 +108,7 @@ Both cameras run `/etc/rc.local` at boot (via `S94rc.local`):
 1. Mounts `/opt` JFFS2 partition if not mounted
 2. Stops stock prudynt, starts patched version
 3. Opens IR cut filter, kills daynightd
+4. **(cam1)** Reads `tx_pixel` from `/opt/etc/calibration.json` and starts `irlink daemon-listen --pixel X,Y --speed 160` in background (logs to `/var/log/irlink-boot.log`). Skips if no calibration.json exists. Backup of pre-edit script lives at `/etc/rc.local.bak`.
 
 ## Deploying
 
@@ -129,3 +143,7 @@ Toolchain: `thingino-firmware/output/stable/wyze_cam3_t31x_gc2053_atbm6031-3.10.
 - **Whole-frame mean is useless for ROI detection.** At 2-3 feet, the IR LEDs occupy ~1 grid block out of 240. Mean delta is ~1-3 units (noise level), but the specific block delta is 30-100+ units. Always calibrate and track the specific block/pixel.
 - **Cameras too close (<6 inches) gives poor signal.** The IR LEDs flood the entire sensor when very close, and the image is out of focus (min focus ~50cm). Best at 2-3 feet where the LEDs form a focused spot.
 - **GPIO mux state persists.** Running `tx_pwm` (legacy) switches GPIO 49 to PWM function mode. If the binary exits without resetting, the pin stays in PWM mode and GPIO commands have no effect. Reset with `gpio-diag PB17 func 1` or reboot.
+- **`calibrate-pixel` peak-on-edge auto-expansion.** The 6×6 stride-5 ROI sweep within the picked grid block can land its peak on the rectangle edge if the actual IR center sits near a block boundary. `find_peak_pixel_in_block` then expands the swept rectangle by one stride in each edge-adjacent direction and rescans only the new strips, capped at `MAX_EDGE_EXPANSIONS = 4`. Adds ~700 ms when triggered; 0 ms when peak is interior. Without this, a peak at xmax=315 in block 89 gets reported truthfully but offers no proof it isn't actually further right. With it, we scan x=320 column too and confirm.
+- **Bicall split-brain trip during long CAL_DONE wait.** When the responder's wait_for_msg(CAL_DONE) takes longer than `2 × ack_timeout_ms` (e.g. CAL_DONE was lost or scanner's pixel cal couldn't decode our TX), the responder hits split-brain recovery and force-drops to the slowest rate rung (200 ms) — but the peer is still at 160 ms. Phase 2 then deadlocks at CAL_ACK timeout because the rates desynced silently. Fix is to either (a) suppress split-brain during CAL_REQ flows, or (b) require split-brain to send a RATE_CHANGE before changing locally. **Open issue.**
+- **Bicall phase 2 timing margin is thin.** Holder's LED hold = 1.5 s OFF + 12 s ON = 13.5 s total. Scanner's `do_calibrate_pixel_to` takes ~12 s (1 s baseline + 4 s grid + ~6 s ROI sweep + edge expansion). If the scanner's scan finishes more than ~1.5 s before the holder's LED hold ends, the scanner's CAL_DONE TX starts during the holder's `tx_active=1` window and the holder misses the preamble (1.28 s @ 160 ms). Phase 1 always works because the responder's wait window starts when its LED hold ends, aligned with the scanner's TX start. Phase 2 is more fragile — if you lengthen the pixel sweep (e.g., add stride-1 sub-block refinement), bump the holder's hold to keep the margin.
+- **AE freeze stuck at 1 after `killall -9 irlink`.** The `-9` skips irlink's SIGTERM cleanup that writes `0` to `/run/prudynt/ae_freeze`. Subsequent operations (e.g. `cal_procedure.py`) silently fail because exposure is still locked to whatever it was when irlink was killed. `cam_setup.sh` now detects and resets this; manual fix is `echo 0 > /run/prudynt/ae_freeze`. Prefer `kill` (SIGTERM) over `kill -9` so cleanup fires.

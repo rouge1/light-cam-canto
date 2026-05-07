@@ -68,6 +68,7 @@ killall daynightd   # Prevent auto-switching back
 | Resync-framed RX (host) | pixel_rx --decoder resync | **4.91 bps @ 70ms/sym** | Single-frame ≤50-char, beats drift |
 | FEC-wrapped RX (host) | pixel_rx --decoder resync-fec | ~3.3 bps @ 80ms | RS(15,11), erasure-aware, decodes 82-char at Δ≈95 |
 | **Adaptive rate (on-camera)** | irlink probe-up / fallback / split-brain | 2–5 bps, self-tuning | **Working** — starts at cal-picked rate (≥160ms), ramps up/down with SNR |
+| **Autonomous cam1 + over-link cal** | rc.local autostart + `bicall` | full bidi cal in ~3.5 min | **Working** — cam1 boots, autostarts `daemon-listen` with saved coords; cam2 connects over light, runs `bicall`, both `/opt/etc/calibration.json` files refresh |
 
 ## Project Structure
 
@@ -96,14 +97,14 @@ pip install opencv-python numpy paramiko matplotlib pytest requests
 ### Camera SSH
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/cam_key
-ssh-copy-id -i ~/.ssh/cam_key root@192.168.50.110
+ssh-copy-id -i ~/.ssh/cam_key root@192.168.50.113
 ssh-copy-id -i ~/.ssh/cam_key root@192.168.50.143
 ```
 
 Add to `~/.ssh/config`:
 ```
 Host da-camera1
-    HostName 192.168.50.110
+    HostName 192.168.50.113
     User root
     IdentityFile ~/.ssh/cam_key
 Host da-camera2
@@ -166,6 +167,18 @@ python -m experiments.replay runs/capture.jsonl --decoder resync -v
 
 # 4. Multi-app orchestration (HELLO→META→CAL→TEXT→BYE)
 python -m host.session --symbol-ms 160 --text "HI"
+
+# 5. Aim cam2 at cam1 with live feedback, then trigger bicall over light
+python -m host.aim_assist                      # ★ GOOD AIM indicator + Enter to trigger bicall
+python -m host.aim_assist --no-cal             # aim only
+
+# 6. On-camera pixel cal (no laptop RTSP needed — cam1-autonomous path)
+ssh da-camera2 "light ir850 on; light ir940 on; sleep 12; light ir850 off; light ir940 off" &
+sleep 2
+ssh da-camera1 "/opt/bin/irlink calibrate-pixel"   # writes cam1's /opt/etc/calibration.json
+
+# 7. Bidirectional cal entirely over light (no SSH to cam1 once it's autonomous)
+echo bicall | ssh da-camera2 "/opt/bin/irlink connect --pixel <cam2sees> --speed 160"
 ```
 
 ### Calibration Viewer
@@ -191,7 +204,9 @@ The few that bite regardless of which subsystem you're in. Subsystem-specific pi
 - **Overlay filesystem is tiny** (~224KB `/etc` + 8MB `/opt`). Never `cp` large files to `/usr/bin/` — it will fill the overlay and corrupt the binary. Deploy to `/opt/bin/`.
 - **Wyze V3 USB port carries power AND data** — every USB cable change is a hard camera reboot. Wait ~60s for WiFi to come back before SSHing.
 - **AE freeze is required for half-duplex protocol.** Without it, the camera's own LED reflections cause massive AE swings (3-5s settle). `irlink` handles this via `/run/prudynt/ae_freeze`. See `irlink/CLAUDE.md`.
-- **Calibration coordinates shift when cameras move** — even a small bump invalidates pixel coordinates. Re-run `host.cal_procedure --no-interactive` after any physical change.
+- **Calibration coordinates shift when cameras move** — even a small bump invalidates pixel coordinates. Re-run `host.cal_procedure --no-interactive` after any physical change, or `aim_assist.py` + `bicall` once cam1 is deployed.
+- **DHCP IP rotation on reboot.** Both cameras get DHCP leases that may shift on reboot. `cam1` rotated `.110 → .113` mid-session and broke every hardcoded IP at once. When it happens, update in: `/etc/hosts`, `~/.ssh/config`, `host/cam_setup.sh:cam_ip()`, `host/cal_procedure.py:CAMERAS`, `host/config.py:TX_IP/RX_IP`, root `CLAUDE.md`, `thingino-firmware/CLAUDE.md`. Long-term fix is DHCP reservation on the router or use static USB-NCM (`usb-cam1`/`usb-cam2`).
+- **`killall -9 irlink` leaves AE freeze stuck at 1.** SIGKILL skips irlink's cleanup that resets `/run/prudynt/ae_freeze` to 0. Cameras then refuse to AE-adapt to LED on/off — `cal_procedure.py` quietly returns near-zero deltas. `cam_setup.sh` detects this; manual fix is `ssh <cam> "echo 0 > /run/prudynt/ae_freeze"`. Prefer plain `kill` so SIGTERM fires.
 
 ## Key References
 

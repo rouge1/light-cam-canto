@@ -10,6 +10,7 @@ Laptop-side Python drivers: RTSP receivers, SSH-based orchestrators, calibration
 - `pixel_rx.py` — RTSP pixel receiver (DPLL decode, 120ms/symbol default). `--decoder {baseline,resync,resync-fec}`. `--dump-samples` for offline replay.
 - `tx_resync.py` — TX driver for resync wire format: encode + ship hex via SSH to `irlink tx-symbols`
 - `session.py` — App-layer orchestrator: SSH-driven HELLO→META→CAL→TEXT→BYE flow
+- `aim_assist.py` — Live-feedback aim tool: SSH cam1 to hold LEDs, poll cam2's `brightness_grid`, show ★/◆/· delta indicator, trigger `bicall` on Enter
 - `send_message.py` — Legacy CLI
 
 Related: `../protocol/CLAUDE.md` for wire format; `../irlink/CLAUDE.md` for on-camera receiver; `../experiments/` for offline decoders and replay.
@@ -67,6 +68,29 @@ python -m host.cal_procedure --show             # show saved calibration
 
 Frame-differencing (LED-on vs LED-off RTSP frames) finds the exact TX pixel. Saves to `host/calibration.json`. Consumed by `pixel_rx.py` (auto-load) and passed to `irlink --pixel x,y` on-camera.
 
+For the cam1-autonomous deployment path (no PC reading cam1's RTSP), prefer `irlink calibrate-pixel` on-camera or `bicall` over the link — see `../irlink/CLAUDE.md`. cal_procedure stays useful for laptop-driven pixel discovery during dev.
+
+## Aim Assist (`aim_assist.py`)
+
+```bash
+python -m host.aim_assist                              # aim → bicall on Enter
+python -m host.aim_assist --no-cal                     # aim only
+python -m host.aim_assist --hold 180                   # longer LED-on window
+python -m host.aim_assist --cam2-pixel 271,91          # cam2's pixel for bicall
+```
+
+Workflow for the "operator carrying laptop+cam2 into position" case:
+
+1. Stops cam1's daemon (frees LED control).
+2. Measures cam2 baseline (8 grid samples × 250ms).
+3. SSH cam1 to hold IR LEDs ON for `--hold` seconds.
+4. Polls cam2's `/run/prudynt/brightness_grid` 4× per second; shows live max-block delta vs baseline with `★ GOOD AIM` / `◆ OK` / `· weak` indicator. Walk cam2 around until the marker hits ★.
+5. **Enter** → kill LEDs, restart cam1's `daemon-listen` from the saved coords, run `bicall` from cam2 → fresh `/opt/etc/calibration.json` on both sides. **q** → quit without cal.
+
+Currently uses SSH for the LED-hold step (dev mode — cam1 still on WiFi). For production-autonomous cam1, replace the SSH call with an `AIM_REQ` protocol message that triggers cam1's existing handle_cal_request-style LED hold. The script's structure already separates "trigger" from "feedback loop" — only the trigger needs to swap.
+
+Thresholds (line ~30 of `aim_assist.py`): `THRESHOLD_GOOD=80`, `THRESHOLD_OK=40`. Tune for your scene.
+
 ## Camera Setup Script (`cam_setup.sh`)
 
 Run before any calibration or communication:
@@ -100,3 +124,5 @@ Checks/fixes: patched prudynt, night/monochrome mode, IR cut filter, daynightd k
 - **Orchestrator must serialize back-to-back sends.** `CamLink.send_app(payload, wait=True)` blocks until our irlink prints `PROTO: ACK received for seq=` (success) or `PROTO: send failed` (after retries). Without this, the orchestrator's next `send_app()` queues a new DATA via stdin while our irlink is still mid-TX of the previous one. If the test then issues a *peer* send, the peer starts TXing before this side has finished its ACK round-trip — mutual collision. Pass `wait=False` only for genuine pipelined sends (none in v1).
 - **Dump-and-replay beats live debugging for RX changes.** `pixel_rx.py --dump-samples runs/foo.jsonl` writes every TX burst's raw `(t_ms, brightness)` samples to JSONL. `experiments/replay.py runs/foo.jsonl --decoder {baseline,resync,resync-fec}` runs any decoder offline at repo speed. `experiments/debug_capture.py` compares the DPLL-extracted symbol stream against the expected symbols for a known message. Use these before touching decoder code — the root cause is almost never where you'd guess from a live terminal.
 - **Camera RTC is not synced** — `ls -la` timestamps on the camera filesystem are unreliable for verifying a deploy. Compare `md5sum` instead.
+- **`cal_procedure.py` underreports delta vs `brightness_grid` when AE is active.** RTSP frame-diff between sequential OFF/ON captures lets the camera's auto-exposure drift between captures. When the LED comes on, AE compresses exposure to compensate — the IR LED's apparent brightness in the H.264-encoded frame is much lower than the raw YUV. Direct comparison: at one position cal_procedure reported delta=24 (peak-blurred 9) while a `head /run/prudynt/brightness` snapshot showed max-block jumping 153 → 220 (delta +67). **Workaround:** if cal_procedure delta looks suspiciously weak (<40) but the cameras are physically aimed at each other, switch to `irlink calibrate-pixel` on-camera or run `aim_assist.py` to verify there's actually no signal vs. just AE masking it. **Long-term fix:** cal_procedure should write `1` to `/run/prudynt/ae_freeze` on the RX camera before the OFF capture and `0` after the ON capture (~5 LOC, not yet implemented).
+- **Aim asymmetry is geometric, not an electrical issue.** If cam1 sees cam2 at delta 200 but cam2 sees cam1 at delta 20, it's almost certainly aiming angle, not LED power. IR LED radiation patterns are narrow (~30° half-power); a 20-30° off-aim drops received power by 5-10×. Use `aim_assist.py` to find the angle where both directions are strong before running cal — if you can only get one direction strong, the round-trip protocol can't form a reliable link.

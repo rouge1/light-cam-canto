@@ -60,7 +60,7 @@ ssh_cmd() {
 # Get camera IP from hostname
 cam_ip() {
     case "$1" in
-        da-camera1) echo "192.168.50.110" ;;
+        da-camera1) echo "192.168.50.113" ;;
         da-camera2) echo "192.168.50.143" ;;
         *) ssh_cmd "$1" "hostname -I" | awk '{print $1}' ;;
     esac

@@ -39,6 +39,10 @@ An experimental system that turns Wyze V3 security cameras into IR Li-Fi transce
 | **Resync-framed TX** | — | **Working** (`host/tx_resync.py` + `irlink tx-symbols <hex>`) |
 | **Reed-Solomon FEC** | ~3.3 bps @ 80ms | **Working** (`--fec` + `--decoder resync-fec` — RS(15,11) with erasure hints, decodes 82-char at Δ≈95 where non-FEC fails) |
 | **Adaptive symbol rate (on-camera)** | 2–5 bps self-tuning | **Working** (`MSG_RATE_CHANGE` 0x0A; probe-up after 5 ACKs, fallback-down after 3 retries, split-brain recovery at 2×ack_timeout; initial rate picked from calibration Δ, clamped ≥160ms for on-camera RX) |
+| **On-camera pixel cal (`irlink calibrate-pixel`)** | ~12 s, 1.4 px from laptop ground truth | **Working** (grid coarse → 6×6 stride-5 ROI sweep + edge-peak auto-expansion; writes `/opt/etc/calibration.json` JFFS2-persistent — no laptop RTSP needed) |
+| **Bidirectional cal over light (`bicall`)** | full bidi cal in ~3.5 min @ 160 ms/sym | **Working** (single trigger, role-swaps via `bidi` flag in CAL_REQ payload; both `/opt/etc/calibration.json` files refresh from one cmd) |
+| **Autonomous cam1 (rc.local autostart)** | — | **Working** (cam1 boots → reads saved `tx_pixel` → starts `irlink daemon-listen` automatically; verified by physical power-cycle test) |
+| **Aim-assist tool (`host/aim_assist.py`)** | live ★/◆/· feedback | **Working** (laptop polls cam2's `brightness_grid` 4× / s while cam1 holds LEDs; Enter triggers `bicall`) |
 
 ## Requirements
 
@@ -60,8 +64,8 @@ pip install opencv-python numpy paramiko matplotlib pytest
 # 1. Flash Thingino to both cameras via SD card
 
 # 2. Set up SSH keys
-ssh-copy-id root@192.168.50.110   # da-camera1
-ssh-copy-id root@192.168.50.141   # da-camera2
+ssh-copy-id root@192.168.50.113   # da-camera1 (DHCP, may rotate)
+ssh-copy-id root@192.168.50.143   # da-camera2
 
 # 3. Setup cameras (night mode, IR cut filter, patched prudynt)
 ./host/cam_setup.sh
@@ -100,6 +104,13 @@ python -m host.tx_resync --cam cam1 --speed 80 --fec \
 
 # 6. Run tests
 pytest tests/ -v   # 76 tests: protocol + app layer + resync framing + FEC + adaptive rate
+
+# 7. Autonomous cam1 deployment (no PC reading cam1's RTSP)
+#    cam1 autostarts irlink daemon-listen at boot from /opt/etc/calibration.json.
+#    Operator carries laptop+cam2 into position:
+python -m host.aim_assist                      # live aim feedback; Enter triggers bicall
+#    Both /opt/etc/calibration.json files refresh from one cmd over light. cam1
+#    never needs an SSH session in production.
 ```
 
 ## Project Structure
@@ -117,6 +128,7 @@ host/          — Calibration, pixel RX, SSH orchestration, camera setup
   cam_setup.sh      — Camera pre-flight: night mode, ircut, LEDs, prudynt
   session.py        — App-layer orchestrator: SSH-driven HELLO→META→CAL→TEXT→BYE flow
   tx_resync.py      — TX driver for resync framing: encode + ship hex to irlink tx-symbols over SSH
+  aim_assist.py     — Aim cam2 at cam1 with live ★ GOOD AIM feedback; Enter triggers `bicall`
 experiments/   — Offline analysis + alternate decoders
   replay.py         — Replay dumped captures against decoder variants (A/B testing)
   resync_decoder.py — Resync-aware DPLL decoder (tolerant to isolated bit errors)

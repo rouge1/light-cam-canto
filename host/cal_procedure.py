@@ -28,7 +28,7 @@ from datetime import datetime
 from host.config import pick_initial_rate_ms
 
 CAMERAS = {
-    "cam1": "192.168.50.110",
+    "cam1": "192.168.50.113",
     "cam2": "192.168.50.143",
 }
 CAM_PASSWORD = "password"

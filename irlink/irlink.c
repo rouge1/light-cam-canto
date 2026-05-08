@@ -65,6 +65,15 @@ static int fail_at_rate = 0;            /* consecutive retransmit-exhausted send
 static int probe_in_progress = 0;       /* true while testing a faster rate post-probe-up */
 static int pre_probe_rung = -1;         /* rung to restore on failed probe */
 static int64_t last_valid_frame_ms = 0; /* for split-brain recovery */
+
+/* Set to 1 while a CAL_REQ/CAL_ACK/CAL_DONE flow is in flight. Suppresses
+   the rx_thread split-brain recovery, which would otherwise trip mid-cal:
+   a long CAL_DONE wait or multi-attempt CAL_ACK retry can exceed the
+   2 × ack_timeout_ms window even though both peers are still alive at the
+   same rate. The split-brain recovery dropped this side to 200 ms while
+   the peer stayed at 160 ms — a silent rate desync that deadlocked
+   bicall phase 2. See irlink/CLAUDE.md "Bicall split-brain" pitfall. */
+static volatile int cal_flow_active = 0;
 static int64_t failed_probe_cooldown_ms[RATE_LADDER_LEN] = {0};
 
 #define PROBE_UP_AFTER          5       /* successful ACKs before probing faster */
@@ -84,6 +93,11 @@ static int64_t failed_probe_cooldown_ms[RATE_LADDER_LEN] = {0};
 #define MSG_PING        0x08
 #define MSG_PONG        0x09
 #define MSG_RATE_CHANGE 0x0A
+
+/* App-layer message-type byte (sits inside MSG_DATA payload). Mirrors
+   protocol/app.py. We define it here so do_cal_request_internal can ship
+   a CAL_VISUAL right after CAL_DONE as a single 15-byte DATA frame. */
+#define APP_CAL_VISUAL  0x0E
 
 /* ---- Sync word ---- */
 
@@ -207,6 +221,124 @@ static void set_ae_freeze(int freeze)
         close(fd);
         fprintf(stderr, "AE: freeze %s\n", freeze ? "ON" : "OFF");
     }
+}
+
+/* ================================================================
+ *  Status JSON snapshot
+ *
+ * Writes a small JSON file the laptop can poll via HTTP (through a CGI
+ * script in /var/www/x/) instead of SSHing into the camera. Atomic via
+ * write-then-rename so HTTP readers never see partial JSON. Updated at
+ * key protocol events (handshake, cal phase, rate change, error).
+ * ================================================================ */
+
+#define STATUS_PATH       "/run/irlink-status.json"
+#define STATUS_TMP_PATH   "/run/irlink-status.json.tmp"
+#define STATUS_EVENT_LEN  96
+
+static int64_t status_started_ms = 0;
+static char status_mode[24] = "init";        /* daemon-listen|connect|listen|... */
+static char status_state[32] = "starting";   /* idle|connected|cal_holding|cal_scanning|... */
+static char status_event[STATUS_EVENT_LEN] = "";  /* short last-event description */
+static int64_t status_event_ms = 0;
+static int status_pixel_x = -1, status_pixel_y = -1;
+static int status_cal_phase = 0;             /* 0=none, 1=phase 1, 2=phase 2 */
+static int status_cal_bidi = 0;
+static int status_cal_retries = 0;
+static int status_peak_x = -1, status_peak_y = -1;
+static int status_peak_brightness = 0, status_peak_delta = 0, status_peak_block = -1;
+static int status_tx_count = 0;
+static int status_rx_count = 0;
+static int status_decode_fail = 0;
+
+/* protect concurrent write_status() from rx_thread + main thread */
+static pthread_mutex_t status_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void write_irlink_status(void)
+{
+    pthread_mutex_lock(&status_mutex);
+    int ae_freeze_val = -1;
+    int fdr = open(AE_FREEZE_PATH, O_RDONLY);
+    if (fdr >= 0) {
+        char ch;
+        if (read(fdr, &ch, 1) == 1) ae_freeze_val = (ch == '1') ? 1 : 0;
+        close(fdr);
+    }
+    char buf[1024];
+    int n = snprintf(buf, sizeof(buf),
+        "{"
+        "\"ts_ms\":%lld,"
+        "\"started_ms\":%lld,"
+        "\"mode\":\"%s\","
+        "\"state\":\"%s\","
+        "\"pixel\":[%d,%d],"
+        "\"rate_ms\":%d,"
+        "\"rung\":%d,"
+        "\"ae_frozen\":%d,"
+        "\"cal\":{"
+            "\"active\":%d,"
+            "\"phase\":%d,"
+            "\"bidi\":%d,"
+            "\"retries\":%d,"
+            "\"peak\":[%d,%d],"
+            "\"peak_brightness\":%d,"
+            "\"peak_delta\":%d,"
+            "\"peak_block\":%d"
+        "},"
+        "\"counters\":{"
+            "\"tx\":%d,"
+            "\"rx\":%d,"
+            "\"decode_fail\":%d"
+        "},"
+        "\"last_event\":\"%s\","
+        "\"last_event_ms\":%lld"
+        "}\n",
+        (long long)now_ms(),
+        (long long)status_started_ms,
+        status_mode, status_state,
+        status_pixel_x, status_pixel_y,
+        symbol_ms, current_rung,
+        ae_freeze_val,
+        cal_flow_active, status_cal_phase, status_cal_bidi, status_cal_retries,
+        status_peak_x, status_peak_y,
+        status_peak_brightness, status_peak_delta, status_peak_block,
+        status_tx_count, status_rx_count, status_decode_fail,
+        status_event,
+        (long long)status_event_ms);
+    if (n > 0 && n < (int)sizeof(buf)) {
+        int fd = open(STATUS_TMP_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            ssize_t w = write(fd, buf, n);
+            close(fd);
+            if (w == n)
+                rename(STATUS_TMP_PATH, STATUS_PATH);
+        }
+    }
+    pthread_mutex_unlock(&status_mutex);
+}
+
+/* Update the (state, last_event) tuple and re-write the status file. The
+   event message is truncated to STATUS_EVENT_LEN-1 chars and JSON-escaped
+   minimally (only quote/backslash). */
+static void status_set(const char *state, const char *event)
+{
+    if (state) {
+        strncpy(status_state, state, sizeof(status_state) - 1);
+        status_state[sizeof(status_state) - 1] = '\0';
+    }
+    if (event) {
+        /* minimal JSON escaping: replace " and \ with _ to keep things simple */
+        size_t i = 0;
+        for (const char *p = event; *p && i < STATUS_EVENT_LEN - 1; p++) {
+            char c = *p;
+            if (c == '"' || c == '\\') c = '_';
+            if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+            status_event[i++] = c;
+        }
+        status_event[i] = '\0';
+        status_event_ms = now_ms();
+    }
+    write_irlink_status();
 }
 
 /* ================================================================
@@ -849,6 +981,9 @@ typedef struct {
     int baseline_val;  /* mean brightness at peak block, LED OFF */
     int active_val;    /* mean brightness at peak block, LED ON */
     int delta;         /* active - baseline */
+    /* 4x4 sub-area of grid deltas centered on peak block (peak at cell (1,1)).
+       Quantized 0..15 (4-bit). Used as the over-light CAL_VISUAL payload. */
+    uint8_t zoom_4x4[16];
 } grid_cal_t;
 
 /* Grid-based coarse calibration: AE freeze, baseline scan, prompt for LED on,
@@ -959,6 +1094,26 @@ static int do_grid_calibration(grid_cal_t *out)
     out->baseline_val = baseline[best];
     out->active_val   = led_on[best];
     out->delta        = best_delta;
+
+    /* 4x4 sub-area of grid deltas centered on peak block. Peak at cell (1,1).
+       Off-grid cells stay 0. Quantize each delta to 0..15 by /16. */
+    int peak_bx = best % 20;
+    int peak_by = best / 20;
+    int origin_bx = peak_bx - 1;
+    int origin_by = peak_by - 1;
+    for (int i = 0; i < 16; i++) out->zoom_4x4[i] = 0;
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            int gx = origin_bx + c;
+            int gy = origin_by + r;
+            if (gx >= 0 && gx < 20 && gy >= 0 && gy < 12) {
+                int d = deltas[gy * 20 + gx] / 16;
+                if (d < 0) d = 0;
+                if (d > 15) d = 15;
+                out->zoom_4x4[r * 4 + c] = (uint8_t)d;
+            }
+        }
+    }
     return 0;
 }
 
@@ -1157,6 +1312,7 @@ typedef struct {
     uint8_t peak_b;
     int grid_delta;
     int block_idx;
+    uint8_t zoom_4x4[16];   /* 4x4 grid-delta sub-area, 4-bit (0..15 per cell) */
 } pixel_cal_result_t;
 
 /* Two-phase calibration: grid coarse → pixel ROI sweep within peak block.
@@ -1178,6 +1334,18 @@ static int do_calibrate_pixel_to(pixel_cal_result_t *out)
     int rc = find_peak_pixel_in_block(cal.block_idx, &px, &py, &pb);
     set_ae_freeze(0);
 
+    /* Critical: find_peak_pixel_in_block writes roi_config many times during
+       its sweep. After scanning, roi_config is at the LAST scanned position,
+       NOT at the base pixel set at startup. If we leave it there, subsequent
+       protocol RX reads from the wrong pixel — e.g., phase-2 of bicall has
+       cam2 (post-scan) listening at a stale ROI for cam1's CAL_REQ, decoding
+       fails. Reset to the connect/listen pixel here so RX resumes correctly. */
+    if (pixel_x >= 0 && pixel_y >= 0) {
+        write_roi_config(pixel_x, pixel_y, pixel_roi_size);
+        fprintf(stderr, "PIXEL-CAL: restored RX ROI to (%d, %d) size %d\n",
+                pixel_x, pixel_y, pixel_roi_size);
+    }
+
     if (rc < 0) {
         fprintf(stderr, "PIXEL-CAL: ROI sweep failed\n");
         return 1;
@@ -1191,6 +1359,7 @@ static int do_calibrate_pixel_to(pixel_cal_result_t *out)
     out->peak_b = pb;
     out->grid_delta = cal.delta;
     out->block_idx = cal.block_idx;
+    memcpy(out->zoom_4x4, cal.zoom_4x4, 16);
     return 0;
 }
 
@@ -1252,7 +1421,7 @@ static void *rx_thread(void *arg)
         int split_brain_window_ms = 2 * ack_timeout_ms;
         if (split_brain_window_ms < SPLIT_BRAIN_TIMEOUT_MS)
             split_brain_window_ms = SPLIT_BRAIN_TIMEOUT_MS;
-        if (!tx_active && last_valid_frame_ms > 0
+        if (!tx_active && !cal_flow_active && last_valid_frame_ms > 0
             && current_rung < RATE_LADDER_LEN - 1
             && now_ms() - last_valid_frame_ms > split_brain_window_ms) {
             apply_rate(RATE_LADDER_MS[RATE_LADDER_LEN - 1],
@@ -1588,13 +1757,16 @@ static int do_connect(void)
             fprintf(stderr, "PROTO: got SYN_ACK! Sending ACK...\n");
             send_message(MSG_ACK, 0, NULL, 0);
             fprintf(stderr, "PROTO: connected!\n");
+            status_set("connected", "got SYN_ACK; sent ACK");
             return 0;
         }
         fprintf(stderr, "PROTO: SYN_ACK timeout, retry %d/%d\n",
                 attempt + 1, MAX_RETRIES);
+        status_set("connecting", "SYN_ACK timeout, retrying");
     }
 
     fprintf(stderr, "PROTO: connection failed after %d attempts\n", MAX_RETRIES);
+    status_set("error", "handshake failed (no SYN_ACK after retries)");
     return -1;
 }
 
@@ -1603,21 +1775,25 @@ static int do_connect(void)
 static int do_listen(void)
 {
     fprintf(stderr, "PROTO: listening for SYN...\n");
+    status_set("listening", "waiting for SYN");
 
     while (running) {
         rx_message_t msg;
         /* Wait indefinitely (60s chunks to check running flag) */
         if (wait_for_msg(MSG_SYN, &msg, 60000) == 0) {
             fprintf(stderr, "PROTO: got SYN! Sending SYN_ACK...\n");
+            status_set("connecting", "got SYN; sent SYN_ACK");
             send_message(MSG_SYN_ACK, 0, NULL, 0);
 
             fprintf(stderr, "PROTO: waiting for ACK...\n");
             rx_message_t ack;
             if (wait_for_msg(MSG_ACK, &ack, ack_timeout_ms) == 0) {
                 fprintf(stderr, "PROTO: connected!\n");
+                status_set("connected", "got ACK");
                 return 0;
             }
             fprintf(stderr, "PROTO: ACK timeout, back to listening\n");
+            status_set("listening", "ACK timeout, retrying");
         }
     }
     return -1;
@@ -1742,6 +1918,7 @@ static int do_send(const char *text)
     return do_send_bytes((const uint8_t *)text, strlen(text));
 }
 
+
 /* Decode an ASCII hex string into raw bytes. Allows spaces between bytes.
    Returns number of bytes written, or -1 on malformed input. */
 static int hex_decode(const char *hex, uint8_t *out, int max_out)
@@ -1778,8 +1955,18 @@ static void handle_cal_request(int bidi);      /* fwd decl for bicall */
 static int do_cal_request_internal(int bidi)
 {
     fprintf(stderr, "PROTO: requesting pixel calibration (bidi=%d)...\n", bidi);
+    cal_flow_active = 1;
+    status_cal_phase = (bidi == 1) ? 1 : 2;
+    status_cal_bidi = bidi;
+    status_cal_retries = 0;
+    status_set("cal_scanning", bidi ? "phase 1: sending CAL_REQ as scanner"
+                                     : "phase 2: sending CAL_REQ as scanner");
+    /* Reset to "now" so the split-brain timer doesn't pre-fire from stale
+       quiet time leading into the cal flow. */
+    last_valid_frame_ms = now_ms();
 
     for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        status_cal_retries = attempt;
         uint8_t req_payload[1] = { (uint8_t)bidi };
         send_message(MSG_CAL_REQ, 0, req_payload, 1);
 
@@ -1802,23 +1989,68 @@ static int do_cal_request_internal(int bidi)
                 fprintf(stderr, "PROTO: pixel cal OK, sending CAL_DONE "
                                 "(x=%d y=%d b=%d d=%d)\n",
                         r.pixel_x, r.pixel_y, r.peak_b, r.grid_delta);
+                status_peak_x = r.pixel_x;
+                status_peak_y = r.pixel_y;
+                status_peak_brightness = r.peak_b;
+                status_peak_delta = r.grid_delta;
+                status_peak_block = r.block_idx;
+                status_set("cal_sending_done", "scan complete; sending CAL_DONE");
                 /* Stable parseable line for orchestrators (this side's scan
                    result, i.e. peer's TX position in OUR view). */
                 printf("PIXEL: %d %d %d %d %d\n",
                        r.pixel_x, r.pixel_y, (int)r.peak_b, r.grid_delta, r.block_idx);
                 fflush(stdout);
                 send_message(MSG_CAL_DONE, 0, payload, 6);
+
+                /* CAL_VISUAL: 15-byte single DATA frame (1 type + 14 body),
+                   fits the 16-byte single-frame ceiling. Body =
+                   x(2)+y(2)+bright(1)+delta(1)+zoom_4x4(8). Only fire when
+                   bidi==0 — sending during bidi==1 (bicall phase 1)
+                   collides with the peer's immediate role-swap to scanner.
+                   No fragmentation — single ACK round-trip, ~30 sec. */
+                if (bidi == 0) {
+                    uint8_t visual[15];
+                    int delta_clamped = r.grid_delta > 255 ? 255
+                                      : (r.grid_delta < 0 ? 0 : r.grid_delta);
+                    visual[0] = APP_CAL_VISUAL;
+                    visual[1] = (uint8_t)((r.pixel_x >> 8) & 0xFF);
+                    visual[2] = (uint8_t)(r.pixel_x & 0xFF);
+                    visual[3] = (uint8_t)((r.pixel_y >> 8) & 0xFF);
+                    visual[4] = (uint8_t)(r.pixel_y & 0xFF);
+                    visual[5] = r.peak_b;
+                    visual[6] = (uint8_t)delta_clamped;
+                    /* Pack 16 4-bit cells into 8 bytes, high nibble first. */
+                    for (int i = 0; i < 8; i++) {
+                        uint8_t hi = r.zoom_4x4[i * 2] & 0x0F;
+                        uint8_t lo = r.zoom_4x4[i * 2 + 1] & 0x0F;
+                        visual[7 + i] = (uint8_t)((hi << 4) | lo);
+                    }
+                    fprintf(stderr,
+                            "PROTO: sending CAL_VISUAL (15B; 4x4 grid-delta zoom)\n");
+                    if (do_send_bytes(visual, 15) < 0) {
+                        fprintf(stderr,
+                                "PROTO: CAL_VISUAL send failed (peer may "
+                                "have closed); cal numbers still valid\n");
+                    }
+                } else {
+                    fprintf(stderr,
+                            "PROTO: skipping CAL_VISUAL (bidi=1, phase 1 of "
+                            "bicall — peer will swap roles immediately)\n");
+                }
+                cal_flow_active = 0;
                 return 0;
             }
 
             /* On failure, send empty CAL_DONE so peer doesn't hang. */
             fprintf(stderr, "PROTO: pixel cal failed, sending empty CAL_DONE\n");
             send_message(MSG_CAL_DONE, 0, NULL, 0);
+            cal_flow_active = 0;
             return -1;
         }
         fprintf(stderr, "PROTO: CAL_ACK timeout, retry %d/%d\n",
                 attempt + 1, MAX_RETRIES);
     }
+    cal_flow_active = 0;
     return -1;
 }
 
@@ -1835,18 +2067,29 @@ static int do_bicall(void)
         fprintf(stderr, "BICAL: phase 1 (forward scan) failed\n");
         return -1;
     }
-    fprintf(stderr, "BICAL: phase 1 done; waiting for peer's reverse CAL_REQ...\n");
+
+    /* AE was unfrozen at the end of do_calibrate_pixel_to. For phase 2 RX
+       we need it frozen — without it, AE adapts during the inter-phase
+       quiet window, then drops the contrast on incoming CAL_REQ symbols
+       (we observed this as cam2 RX delta=14 instead of 200+, decode
+       failures for the rest of phase 2). Keep AE frozen through the wait
+       and through handle_cal_request's LED-on phase + CAL_DONE wait. */
+    set_ae_freeze(1);
+    fprintf(stderr, "BICAL: phase 1 done; waiting for peer's reverse CAL_REQ "
+                    "(AE frozen for phase 2 RX)...\n");
     rx_message_t msg;
     int wait_ms = ack_timeout_ms * 2;
     if (wait_ms < 60000) wait_ms = 60000;
     if (wait_for_msg(MSG_CAL_REQ, &msg, wait_ms) != 0) {
         fprintf(stderr, "BICAL: timeout waiting for reverse CAL_REQ\n");
+        set_ae_freeze(0);
         return -1;
     }
     fprintf(stderr, "BICAL: got reverse CAL_REQ — now LED-holder, peer is scanner\n");
     /* Peer's reverse CAL_REQ should have bidi=0 (no further swap). */
     int peer_bidi = (msg.data_len >= 1 && msg.data[0] == 1) ? 1 : 0;
     handle_cal_request(peer_bidi);
+    set_ae_freeze(0);
     fprintf(stderr, "BICAL: bidirectional cal complete\n");
     return 0;
 }
@@ -1863,6 +2106,12 @@ static int do_bicall(void)
 static void handle_cal_request(int bidi)
 {
     fprintf(stderr, "PROTO: peer requested pixel calibration (bidi=%d)\n", bidi);
+    cal_flow_active = 1;
+    status_cal_phase = (bidi == 1) ? 1 : 2;
+    status_cal_bidi = bidi;
+    status_set("cal_holding", bidi ? "phase 1: holder, peer scanning us"
+                                    : "phase 2: holder, peer scanning us");
+    last_valid_frame_ms = now_ms();
     send_message(MSG_CAL_ACK, 0, NULL, 0);
 
     /* Phase 1: 1.5s LED OFF — peer's baseline phase needs a clean OFF window. */
@@ -1880,9 +2129,12 @@ static void handle_cal_request(int bidi)
     tx_active = 0;
     pthread_mutex_unlock(&tx_mutex);
 
-    /* Phase 3: wait for CAL_DONE with pixel coord payload. */
+    /* Phase 3: wait for CAL_DONE with pixel coord payload. Wait window
+       sized for: scanner takes ~12s for grid+ROI, +7s zoom (bidi==0 only),
+       +CAL_DONE TX (~30s at 160ms). 90s gives slack for slow links. */
+    status_set("cal_awaiting_done", "LED hold ended; waiting for peer CAL_DONE");
     rx_message_t msg;
-    if (wait_for_msg(MSG_CAL_DONE, &msg, 30000) == 0) {
+    if (wait_for_msg(MSG_CAL_DONE, &msg, 90000) == 0) {
         if (msg.data_len >= 6) {
             int x = (msg.data[0] << 8) | msg.data[1];
             int y = (msg.data[2] << 8) | msg.data[3];
@@ -1890,22 +2142,35 @@ static void handle_cal_request(int bidi)
             int delta = msg.data[5];
             fprintf(stderr, "PROTO: peer cal complete → x=%d y=%d b=%d d=%d\n",
                     x, y, peak_b, delta);
+            status_peak_x = x;
+            status_peak_y = y;
+            status_peak_brightness = peak_b;
+            status_peak_delta = delta;
+            char ev[STATUS_EVENT_LEN];
+            snprintf(ev, sizeof(ev), "peer cal complete x=%d y=%d d=%d", x, y, delta);
+            status_set("cal_done_recv", ev);
             /* Stable parseable line for orchestrators (peer's view of US). */
             printf("PEER-CAL: %d %d %d %d\n", x, y, peak_b, delta);
             fflush(stdout);
         } else {
             fprintf(stderr, "PROTO: peer cal returned empty CAL_DONE (failed)\n");
+            status_set("cal_failed", "empty CAL_DONE from peer");
         }
     } else {
         fprintf(stderr, "PROTO: CAL_DONE timeout\n");
+        status_set("cal_failed", "CAL_DONE timeout (90s)");
     }
 
-    /* Phase 4 (bidi only): swap roles. Peer expects us to send CAL_REQ next. */
+    /* Phase 4 (bidi only): swap roles. Peer expects us to send CAL_REQ next.
+       do_cal_request_internal manages cal_flow_active itself; clear here so
+       there's no overlap if it sets+clears, and re-set is fine — both calls
+       to set just write 1. */
     if (bidi) {
         fprintf(stderr, "PROTO: bidi swap — letting peer settle 2s, then scanning back\n");
         usleep(2000000);
         do_cal_request_internal(0);
     }
+    cal_flow_active = 0;
 }
 
 /* ================================================================
@@ -2089,6 +2354,13 @@ int main(int argc, char *argv[])
     setbuf(stderr, NULL);
     setbuf(stdout, NULL);
 
+    status_started_ms = now_ms();
+    if (argc >= 2) {
+        strncpy(status_mode, argv[1], sizeof(status_mode) - 1);
+        status_mode[sizeof(status_mode) - 1] = '\0';
+    }
+    status_set("starting", "irlink launched");
+
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <command> [options]\n", argv[0]);
         fprintf(stderr, "Commands:\n");
@@ -2114,6 +2386,8 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "irlink: --pixel must be x,y (e.g. --pixel 385,178)\n");
                 return 1;
             }
+            status_pixel_x = pixel_x;
+            status_pixel_y = pixel_y;
             fprintf(stderr, "irlink: pixel ROI at (%d, %d) size %d\n",
                     pixel_x, pixel_y, pixel_roi_size);
         } else if (strcmp(argv[i], "--roi-size") == 0 && i + 1 < argc) {

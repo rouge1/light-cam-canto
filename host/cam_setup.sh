@@ -8,7 +8,7 @@
 #
 # Usage:
 #   ./cam_setup.sh                  # setup both cameras
-#   ./cam_setup.sh da-camera1       # setup one camera
+#   ./cam_setup.sh dacam1       # setup one camera
 #   ./cam_setup.sh --check          # verify only, don't fix
 #   ./cam_setup.sh --reboot CAM     # reboot and re-check
 
@@ -43,7 +43,7 @@ if [ ${#args[@]} -gt 0 ]; then
 elif [ "$REBOOT_CAM" != "" ] && [ "$REBOOT_CAM" != "next" ]; then
     CAMERAS="$REBOOT_CAM"
 else
-    CAMERAS="da-camera1 da-camera2"
+    CAMERAS="dacam1 dacam2"
 fi
 
 pass() { echo -e "  ${GRN}✓${RST} $1"; }
@@ -54,14 +54,14 @@ info() { echo -e "  ${YEL}→${RST} $1"; }
 CAM_PASSWORD="password"
 
 ssh_cmd() {
-    ssh -o ConnectTimeout=5 -o BatchMode=yes "$1" "$2" 2>/dev/null
+    ssh -o ConnectTimeout=30 -o BatchMode=yes "$1" "$2" 2>/dev/null
 }
 
 # Get camera IP from hostname
 cam_ip() {
     case "$1" in
-        da-camera1) echo "192.168.50.113" ;;
-        da-camera2) echo "192.168.50.143" ;;
+        dacam1) echo "192.168.50.113" ;;
+        dacam2) echo "192.168.50.143" ;;
         *) ssh_cmd "$1" "hostname -I" | awk '{print $1}' ;;
     esac
 }
@@ -84,6 +84,20 @@ imp_cmd() {
     curl -s -b "$cookie_file" "http://${ip}/x/json-imp.cgi" \
         -H "Content-Type: application/json" \
         -d "{\"cmd\":\"${cmd}\",\"val\":${val}}" 2>/dev/null
+}
+
+# Write 0 or 1 to /run/prudynt/ae_freeze via /x/ae-freeze.cgi (Phase 3).
+# Returns 0 on success, non-zero on failure. Replaces SSH `echo N > file`.
+ae_freeze_set() {
+    local ip="$1" val="$2"
+    local cookie_file="/tmp/cam_cookie_${ip}.txt"
+    local out
+    out=$(curl -s -b "$cookie_file" -X POST -d "value=${val}" \
+        "http://${ip}/x/ae-freeze.cgi" 2>/dev/null)
+    case "$out" in
+        *'"ok":true'*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # Get fast heartbeat (SSE — color_mode, daynight_mode)
@@ -301,13 +315,17 @@ check_cam() {
     if [ "$ae_val" = "MISSING" ]; then
         fail "ae_freeze file missing"
         if [ $CHECK_ONLY -eq 0 ]; then
-            info "Creating ae_freeze file..."
-            ssh_cmd "$cam" "echo 0 > /run/prudynt/ae_freeze"
-            ae_val=$(ssh_cmd "$cam" "cat /run/prudynt/ae_freeze 2>/dev/null" || echo "MISSING")
-            if [ "$ae_val" != "MISSING" ]; then
-                pass "ae_freeze file created (set to $ae_val)"
+            info "Creating ae_freeze file (via web API)..."
+            if ae_freeze_set "$ip" 0; then
+                ae_val=$(ssh_cmd "$cam" "cat /run/prudynt/ae_freeze 2>/dev/null" || echo "MISSING")
+                if [ "$ae_val" != "MISSING" ]; then
+                    pass "ae_freeze file created (set to $ae_val)"
+                else
+                    fail "ae_freeze file still missing"
+                    errors=$((errors + 1))
+                fi
             else
-                fail "ae_freeze file still missing"
+                fail "ae_freeze HTTP write failed"
                 errors=$((errors + 1))
             fi
         else
@@ -318,9 +336,13 @@ check_cam() {
     else
         warn "AE freeze stuck at $ae_val (should be 0 when idle)"
         if [ $CHECK_ONLY -eq 0 ]; then
-            info "Resetting ae_freeze to 0..."
-            ssh_cmd "$cam" "echo 0 > /run/prudynt/ae_freeze"
-            pass "AE freeze reset to 0"
+            info "Resetting ae_freeze to 0 (via web API)..."
+            if ae_freeze_set "$ip" 0; then
+                pass "AE freeze reset to 0"
+            else
+                fail "ae_freeze HTTP write failed"
+                errors=$((errors + 1))
+            fi
         else
             errors=$((errors + 1))
         fi
@@ -407,3 +429,5 @@ else
     echo " Try: $0 --reboot <camera>"
 fi
 echo "==============================="
+
+exit $total_errors

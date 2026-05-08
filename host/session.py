@@ -26,14 +26,15 @@ from typing import Callable, Optional
 
 from protocol import app
 from protocol.app import (
-    APP_HELLO, APP_META, APP_META_ACK, APP_CAL_RESULT, APP_STATS,
-    APP_TEXT, APP_BYE, APP_CHUNK, APP_CHUNK_ACK, APP_NACK,
+    APP_HELLO, APP_META, APP_META_ACK, APP_CAL_RESULT, APP_CAL_VISUAL,
+    APP_STATS, APP_TEXT, APP_BYE, APP_CHUNK, APP_CHUNK_ACK, APP_NACK,
     AppMessage, pack_hello, pack_meta, pack_meta_ack, pack_cal_result,
-    pack_text, pack_bye, pack_chunk_ack,
+    pack_text, pack_bye, pack_chunk_ack, pack_chunk,
     fragment, reassemble, missing_chunks,
     STATUS_IDLE, STATUS_READY, STATUS_BUSY, STATUS_ERROR,
     MAX_SINGLE_FRAME, MAX_CHUNK_DATA,
 )
+from host.cam_status import CamStatusClient, format_status_line, resolve_ip
 
 CALIBRATION_FILE = os.path.join(os.path.dirname(__file__), "calibration.json")
 
@@ -68,6 +69,12 @@ class CamLink:
         # our irlink is still mid-TX, causing both sides to TX simultaneously.
         self._send_complete = threading.Event()
         self._send_ok = False
+        # Optional CGI status-poll thread (off by default; enabled via
+        # IRSession when SessionConfig.status_poll=True). Polls
+        # /x/cal-status.cgi out-of-band and logs irlink's internal state
+        # alongside our stdin/stdout-driven event log.
+        self._status_thr: Optional[threading.Thread] = None
+        self._status_stop = threading.Event()
 
     def start(self):
         x, y = self.pixel
@@ -207,6 +214,59 @@ class CamLink:
             if type_filter is None or msg.type == type_filter:
                 return msg
 
+    def receive_fragmented_app(self, expected_app_type: int,
+                               timeout: float = 600.0) -> AppMessage:
+        """Collect APP_CHUNK frames carrying a fragmented message and reassemble
+        into the original app message. Used for messages that exceed the 16-byte
+        single-frame ceiling — currently APP_CAL_VISUAL.
+
+        Reads chunks from the app queue until total chunks (as advertised in
+        the first chunk's `total` field) have arrived, then reassembles. Out-of-
+        order arrival is fine; mismatched msg_id chunks are skipped.
+        """
+        deadline = time.monotonic() + timeout
+        received: dict[int, bytes] = {}
+        seen_total: Optional[int] = None
+        seen_msg_id: Optional[int] = None
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"[{self.label}] timeout collecting fragmented "
+                    f"{_type_name(expected_app_type)} "
+                    f"(got {len(received)}/{seen_total} chunks)"
+                )
+            try:
+                msg = self.wait_for_app(APP_CHUNK,
+                                         timeout=min(remaining, 2.0))
+            except TimeoutError:
+                continue
+
+            if seen_msg_id is None:
+                seen_msg_id = msg.fields["msg_id"]
+            elif msg.fields["msg_id"] != seen_msg_id:
+                self.log(f"[{self.label}] skipping chunk with wrong msg_id "
+                         f"({msg.fields['msg_id']} != {seen_msg_id})")
+                continue
+
+            if seen_total is None:
+                seen_total = msg.fields["total"]
+
+            received[msg.fields["seq"]] = msg.fields["data"]
+
+            if seen_total is not None and len(received) == seen_total:
+                break
+
+        raw = [pack_chunk(seen_msg_id, s, seen_total, received[s])
+               for s in range(seen_total)]
+        app_type, body = reassemble(raw)
+        if app_type != expected_app_type:
+            raise ValueError(
+                f"expected {_type_name(expected_app_type)}, got {_type_name(app_type)}"
+            )
+        return app.unpack(bytes([app_type]) + body)
+
     def request_stats(self, timeout: float = 10.0) -> dict:
         while not self._stats_queue.empty():
             try:
@@ -216,8 +276,41 @@ class CamLink:
         self.send_cmd("stats")
         return self._stats_queue.get(timeout=timeout)
 
+    def start_status_poll(self, interval: float = 3.0):
+        """Spawn a daemon thread that GETs /x/cal-status.cgi every `interval`
+        seconds and logs the result. Suppresses duplicate ticks via
+        last_event_ms — only logs when irlink advances its state. No-op if
+        the host can't be resolved (logged once and skipped)."""
+        try:
+            ip = resolve_ip(self.host)
+        except RuntimeError as e:
+            self.log(f"[{self.label}-status] disabled — {e}")
+            return
+        client = CamStatusClient(ip)
+        last_event_ms = 0
+
+        def loop():
+            nonlocal last_event_ms
+            while not self._status_stop.is_set():
+                s = client.get()
+                if s is None:
+                    self.log(f"[{self.label}-status] (no status — endpoint failed)")
+                else:
+                    ev_ms = s.get("last_event_ms", 0)
+                    if ev_ms != last_event_ms:
+                        last_event_ms = ev_ms
+                        self.log(f"[{self.label}-status] {format_status_line(s)}")
+                self._status_stop.wait(interval)
+
+        self._status_thr = threading.Thread(target=loop, daemon=True)
+        self._status_thr.start()
+        self.log(f"[{self.label}-status] poller started (every {interval}s)")
+
     def stop(self):
         self._stop.set()
+        self._status_stop.set()
+        if self._status_thr is not None:
+            self._status_thr.join(timeout=3.0)
         if self.proc:
             try:
                 if self.proc.stdin and not self.proc.stdin.closed:
@@ -238,8 +331,8 @@ class CamLink:
 def _type_name(t: int) -> str:
     names = {
         APP_HELLO: "HELLO", APP_META: "META", APP_META_ACK: "META_ACK",
-        APP_CAL_RESULT: "CAL_RESULT", APP_STATS: "STATS",
-        APP_TEXT: "TEXT", APP_BYE: "BYE",
+        APP_CAL_RESULT: "CAL_RESULT", APP_CAL_VISUAL: "CAL_VISUAL",
+        APP_STATS: "STATS", APP_TEXT: "TEXT", APP_BYE: "BYE",
         APP_CHUNK: "CHUNK", APP_CHUNK_ACK: "CHUNK_ACK",
         APP_NACK: "NACK",
     }
@@ -267,13 +360,15 @@ def _load_calibration() -> dict:
 
 @dataclass
 class SessionConfig:
-    cam1_host: str = "da-camera1"
-    cam2_host: str = "da-camera2"
+    cam1_host: str = "dacam1"
+    cam2_host: str = "dacam2"
     cam1_name: str = "cam1-window"
     cam2_name: str = "cam2-laptop"
     symbol_ms: int = 120
     handshake_timeout: float = 180.0
     msg_timeout: float = 180.0
+    status_poll: bool = False
+    status_poll_interval: float = 3.0
 
 
 _DEFAULT_SYMBOL_MS = 160  # fallback when calibration lacks recommended_rate_ms
@@ -329,6 +424,9 @@ class IRSession:
         if not self.cam2.connected.wait(self.cfg.handshake_timeout):
             raise TimeoutError("cam2 never connected")
         self.log(f"[session] handshake complete at {_ts()}")
+        if self.cfg.status_poll:
+            self.cam1.start_status_poll(self.cfg.status_poll_interval)
+            self.cam2.start_status_poll(self.cfg.status_poll_interval)
 
     def hello_exchange(self) -> dict:
         """cam2→cam1 HELLO (name), then bilateral META (state) + META_ACK."""
@@ -499,8 +597,8 @@ def main():
                    help="override symbol rate (ms). Default: from calibration.json's "
                         "recommended_rate_ms, or 160ms if absent.")
     p.add_argument("--text", default="HELLO")
-    p.add_argument("--cam1-host", default="da-camera1")
-    p.add_argument("--cam2-host", default="da-camera2")
+    p.add_argument("--cam1-host", default="dacam1")
+    p.add_argument("--cam2-host", default="dacam2")
     p.add_argument("--cam1-name", default="cam1-window")
     p.add_argument("--cam2-name", default="cam2-laptop")
     p.add_argument("--handshake-only", action="store_true",
@@ -509,6 +607,12 @@ def main():
     p.add_argument("--skip-cal", action="store_true")
     p.add_argument("--skip-text", action="store_true")
     p.add_argument("--skip-stats", action="store_true")
+    p.add_argument("--status-poll", action="store_true",
+                   help="GET /x/cal-status.cgi on both cams every "
+                        "--status-poll-interval seconds and log irlink's "
+                        "internal state (out-of-band, alongside stdout events)")
+    p.add_argument("--status-poll-interval", type=float, default=3.0,
+                   help="status poll interval in seconds (default 3.0)")
     args = p.parse_args()
 
     if args.dry_run:
@@ -535,6 +639,8 @@ def main():
         cam1_host=args.cam1_host, cam2_host=args.cam2_host,
         cam1_name=args.cam1_name, cam2_name=args.cam2_name,
         symbol_ms=symbol_ms,
+        status_poll=args.status_poll,
+        status_poll_interval=args.status_poll_interval,
     )
     sess = IRSession(cfg, log_fn=log)
     try:

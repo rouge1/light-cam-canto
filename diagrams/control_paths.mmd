@@ -1,0 +1,139 @@
+%%{init: {'flowchart': {'curve': 'basis'}, 'theme': 'base'}}%%
+flowchart LR
+    subgraph LAPTOP["💻 Laptop · post Phase 5 — migration target reached"]
+        direction TB
+        subgraph SETUP["host/cam_setup.sh"]
+            S1["ISP setup<br/>night, mono, ircut"]
+            S2["GPIO + process · SSH<br/>ae_freeze write · HTTP"]
+        end
+        subgraph CAL["host/cal_procedure.py"]
+            C1["leds_on_hold<br/>ir850/ir940 ON+OFF"]
+            C2["RTSP frame-diff cal<br/>fallback paths"]
+        end
+        subgraph AIM["host/aim_assist.py"]
+            A1["read_grid 4 Hz<br/>brightness_grid<br/>HTTP-first · SSH fallback"]
+            A2["set_ae_freeze · HTTP<br/>turn/force_leds · HTTP<br/>kill_cam1_daemon · SSH"]
+            A3["preflight<br/>ae read · HTTP<br/>pgrep · HTTP<br/>grid-exists · SSH"]
+            A4["restart cam1 daemon<br/>verify via cal-status<br/>or proc-status (HTTP only)"]
+            A5["run_bicall + cam1<br/>status poller"]
+        end
+        subgraph SESS["host/session.py"]
+            X1["CamLink: irlink<br/>listen/connect<br/>stdin/stdout pipe"]
+            X2["in-band send-hex<br/>STATS / RATE / MSG-HEX"]
+            X3["--status-poll<br/>per-cam telemetry"]
+        end
+    end
+
+    subgraph CAM1["📷 cam1 (dacam1)"]
+        direction TB
+        H1["lighttpd /x/<br/>json-imp.cgi"]
+        H2["lighttpd /x/<br/>cal-status.cgi"]
+        H5["lighttpd /x/<br/>brightness-grid.cgi<br/>· Phase 1 ·"]
+        H7["lighttpd /x/<br/>ae-freeze.cgi<br/>GET · Phase 2<br/>POST · Phase 3"]
+        H9["lighttpd /x/<br/>proc-status.cgi<br/>· Phase 4 ·"]
+        SSHD1[sshd]
+        IRLINK1["irlink<br/>writes<br/>/run/irlink-status.json"]
+        PRUDYNT1["prudynt-patched<br/>/run/prudynt/<br/>brightness_grid<br/>+ ae_freeze"]
+        IRLINK1 -.atomic write.-> H2
+        PRUDYNT1 -.per-frame.-> H5
+        H7 -.atomic temp+rename.-> PRUDYNT1
+        H9 -.pgrep+pidof.-> IRLINK1
+        H1 -.IMP ctrl.-> PRUDYNT1
+    end
+
+    subgraph CAM2["📷 cam2 (dacam2)"]
+        direction TB
+        H3["lighttpd /x/<br/>json-imp.cgi"]
+        H4["lighttpd /x/<br/>cal-status.cgi"]
+        H6["lighttpd /x/<br/>brightness-grid.cgi<br/>· Phase 1 ·"]
+        H8["lighttpd /x/<br/>ae-freeze.cgi<br/>GET · Phase 2<br/>POST · Phase 3"]
+        H10["lighttpd /x/<br/>proc-status.cgi<br/>· Phase 4 ·"]
+        SSHD2[sshd]
+        IRLINK2["irlink<br/>writes<br/>/run/irlink-status.json"]
+        PRUDYNT2["prudynt-patched<br/>/run/prudynt/<br/>brightness_grid<br/>+ ae_freeze"]
+        IRLINK2 -.atomic write.-> H4
+        PRUDYNT2 -.per-frame.-> H6
+        H8 -.atomic temp+rename.-> PRUDYNT2
+        H10 -.pgrep+pidof.-> IRLINK2
+        H3 -.IMP ctrl.-> PRUDYNT2
+    end
+
+    %% --- cam_setup.sh ---
+    S1 ==web==> H3
+    S1 ==web==> H1
+    S2 ==SSH==> SSHD1
+    S2 ==SSH==> SSHD2
+    S2 ==web POST==> H7
+    S2 ==web POST==> H8
+
+    %% --- cal_procedure.py ---
+    C1 ==web==> H1
+    C1 ==web==> H3
+    C2 ==SSH==> SSHD1
+    C2 ==SSH==> SSHD2
+
+    %% --- aim_assist : Phases 1-5 migrated ---
+    A1 ==web 4Hz==> H6
+    A1 -.SSH fallback.-> SSHD2
+    A2 ==web POST==> H7
+    A2 ==web POST==> H8
+    A2 ==web LED==> H1
+    A2 ==web LED==> H3
+    A2 ==SSH kill==> SSHD1
+    A3 ==web==> H7
+    A3 ==web==> H8
+    A3 ==web==> H9
+    A3 ==web==> H10
+    A3 ==SSH grid-test==> SSHD2
+    A4 ==web==> H2
+    A4 ==web==> H9
+    A5 ==SSH stream==> SSHD2
+    A5 ==web 0.5Hz==> H2
+
+    %% --- session.py ---
+    X1 ==SSH pipe==> SSHD1
+    X1 ==SSH pipe==> SSHD2
+    X2 -.stdin/stdout.-> X1
+    X3 ==web 0.3Hz==> H2
+    X3 ==web 0.3Hz==> H4
+
+    classDef ssh stroke:#c0392b,stroke-width:3px,fill:#fbe9e7,color:#000
+    classDef web stroke:#2e7d32,stroke-width:2px,fill:#e8f5e9,color:#000
+    classDef phase1 stroke:#2e7d32,stroke-width:3px,fill:#c8e6c9,color:#000
+    classDef phase3 stroke:#0d4818,stroke-width:3px,fill:#81c784,color:#000
+    classDef phase4 stroke:#003910,stroke-width:3px,fill:#66bb6a,color:#000
+    classDef phase5 stroke:#1565c0,stroke-width:3px,fill:#bbdefb,color:#000
+    classDef mixed stroke:#f57c00,stroke-width:2px,fill:#ffe0b2,color:#000
+    classDef cam fill:#eceff1,stroke:#37474f,color:#000
+    classDef irlink fill:#fff8e1,stroke:#f9a825,color:#000
+    classDef prudynt fill:#fff3e0,stroke:#e65100,color:#000
+
+    class C2 ssh
+    class S1,C1,A1,A4,A5,X3 web
+    class S2,A2,A3 mixed
+    class H5,H6 phase1
+    class H7,H8 phase3
+    class H9,H10 phase4
+    class H1,H3 phase5
+    class H2,H4,SSHD1,SSHD2 cam
+    class IRLINK1,IRLINK2 irlink
+    class PRUDYNT1,PRUDYNT2 prudynt
+
+    linkStyle 0,1 stroke:#2e7d32,stroke-width:2px
+    linkStyle 2,3 stroke:#c0392b,stroke-width:3px
+    linkStyle 4,5 stroke:#2e7d32,stroke-width:3px
+    linkStyle 6,7 stroke:#2e7d32,stroke-width:2px
+    linkStyle 8,9 stroke:#c0392b,stroke-width:3px
+    linkStyle 10 stroke:#2e7d32,stroke-width:4px
+    linkStyle 11 stroke:#c0392b,stroke-width:1px,stroke-dasharray:4 4
+    linkStyle 12,13 stroke:#2e7d32,stroke-width:3px
+    linkStyle 14,15 stroke:#1565c0,stroke-width:3px
+    linkStyle 16 stroke:#c0392b,stroke-width:3px
+    linkStyle 17,18,19,20 stroke:#2e7d32,stroke-width:3px
+    linkStyle 21 stroke:#c0392b,stroke-width:2px
+    linkStyle 22,23 stroke:#2e7d32,stroke-width:2px
+    linkStyle 24 stroke:#c0392b,stroke-width:3px
+    linkStyle 25 stroke:#2e7d32,stroke-width:2px
+    linkStyle 26,27 stroke:#c0392b,stroke-width:3px
+    linkStyle 28 stroke:#37474f,stroke-width:1px,stroke-dasharray:3 3
+    linkStyle 29,30 stroke:#2e7d32,stroke-width:2px

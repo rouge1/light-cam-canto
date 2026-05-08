@@ -19,6 +19,8 @@ Related: `../protocol/CLAUDE.md` for frame/app-layer/FEC details; `../host/CLAUD
 | PONG | 0x09 | Ping response |
 | RATE_CHANGE | 0x0A | Synchronize symbol rate between peers (2-byte BE payload) |
 
+After CAL_DONE, the scanner side also ships an APP_CAL_VISUAL (`0x0E`) inside a regular MSG_DATA frame: 15 bytes total = `[0x0E, x_hi, x_lo, y_hi, y_lo, peak_b, delta_clamped, zoom_4x4 (8B)]`. The 4×4 zoom is a sub-area of the grid-delta map centered on the peak block (peak at cell (1,1)), 4-bit per cell. Used by the laptop-driven `cal_procedure --over-light` flow to render a visual confirmation for the cam1-sees-cam2 direction without RTSP into cam1. See `protocol/CLAUDE.md` for the wire format and `host/cal_procedure.py:render_cal_visual_zoom`.
+
 Frame payload format: `[msg_type] [seq_num] [data...]`
 
 Subcommands: `calibrate`, `calibrate-pixel`, `listen`, `connect`, `daemon-listen`, `daemon-connect`, `send`, `tx`, `tx-symbols`. Interactive cmds inside `connect`/`listen`: `send`, `send-hex`, `ping`, `cal`, `bicall`, `rate <ms>`, `stats`, `quit`.
@@ -90,9 +92,9 @@ Three calibration paths, in order of preference for the autonomous-cam1 deployme
 **1. On-camera pixel cal (`calibrate-pixel`, recommended).** Grid coarse → 6×6 stride-5 ROI sweep within the peak block. Auto-expands the search rectangle if the peak lands on its edge (handles IR LEDs straddling block boundaries). Writes `/opt/etc/calibration.json` (JFFS2-persistent). Used as the standalone CLI cal AND as the inner step of CAL_REQ over the link.
 ```bash
 # Standalone (laptop SSH-drives both sides during a 4s+12s LED-on window):
-ssh da-camera2 "light ir850 on; light ir940 on; sleep 12; light ir850 off; light ir940 off" &
+ssh dacam2 "light ir850 on; light ir940 on; sleep 12; light ir850 off; light ir940 off" &
 sleep 2  # let baseline phase finish first
-ssh da-camera1 "/opt/bin/irlink calibrate-pixel"
+ssh dacam1 "/opt/bin/irlink calibrate-pixel"
 # stdout (cam1): PIXEL: 315 142 235 14 89  (x y peak_b grid_delta block_idx)
 ```
 
@@ -117,6 +119,34 @@ cd irlink && make deploy                 # builds + SCPs to both cameras
 ```
 
 Toolchain: `thingino-firmware/output/stable/wyze_cam3_t31x_gc2053_atbm6031-3.10.14-musl/host/bin/mipsel-linux-gcc`.
+
+## CGI endpoints (`irlink/cgi/`)
+
+Small read-only shell-CGIs deployed to `/var/www/x/` on each camera. They give the laptop `host/cam_status.py` lightweight HTTP access to per-camera state, replacing the SSH-`cat` pattern that overloads sshd during high-rate polling (notably `aim_assist.read_grid` at 4 Hz).
+
+```bash
+# One-time deploy on each camera:
+scp -O irlink/cgi/cal-status.cgi       root@dacamN:/var/www/x/
+scp -O irlink/cgi/brightness-grid.cgi  root@dacamN:/var/www/x/
+scp -O irlink/cgi/ae-freeze.cgi        root@dacamN:/var/www/x/
+scp -O irlink/cgi/proc-status.cgi      root@dacamN:/var/www/x/
+scp -O irlink/cgi/gpio-state.cgi       root@dacamN:/var/www/x/
+ssh dacamN "chmod 755 /var/www/x/cal-status.cgi /var/www/x/brightness-grid.cgi /var/www/x/ae-freeze.cgi /var/www/x/proc-status.cgi /var/www/x/gpio-state.cgi"
+# IMPORTANT: must be 755, not just `chmod +x`. The default umask yields 077,
+# so `chmod +x` produces mode 700 — uhttpd then serves the CGI as 403 Forbidden.
+```
+
+| Endpoint | Reads | Consumed by |
+|----------|-------|-------------|
+| `/x/cal-status.cgi` | `/run/irlink-status.json` (irlink writes atomically per protocol event) | `cam_status.CamStatusClient.get()` |
+| `/x/brightness-grid.cgi` | `/run/prudynt/brightness_grid` (242 ints: ts + 240 blocks) | `cam_status.CamStatusClient.get_brightness_grid()` → `aim_assist.read_grid()` |
+| `/x/ae-freeze.cgi` GET | `/run/prudynt/ae_freeze` (single int 0 or 1) | `cam_status.CamStatusClient.get_ae_freeze()` → `aim_assist.preflight()` |
+| `/x/ae-freeze.cgi` POST `value=0\|1` | atomic write (temp+rename) of single char into `/run/prudynt/ae_freeze`; rejects anything else with HTTP 400 | `cam_status.CamStatusClient.set_ae_freeze()` → `aim_assist.set_ae_freeze()`, `cam_setup.sh:ae_freeze_set()` |
+| `/x/proc-status.cgi` | `pgrep irlink \| wc -l`, `pgrep daynightd \| wc -l`, `pidof prudynt-patched` → JSON `{irlink:N, daynightd:N, prudynt:N, ts_s:T}` | `cam_status.CamStatusClient.get_proc_status()` → `aim_assist.preflight()`, `aim_assist.restart_cam1_daemon()` |
+| `/x/json-imp.cgi` POST `{"cmd":<C>,"val":<V>}` | Stock Thingino IMP control (daynight, color, ircut, ir850, ir940) | `cam_status.CamStatusClient.imp_cmd()` → `aim_assist.turn_leds_on/force_leds_off`, `cal_procedure.leds_on_hold/_off`, `cam_setup.sh:imp_cmd` |
+| `/x/gpio-state.cgi` | `gpio read 47` (ir850) + `gpio read 49` (ir940) → JSON `{ir850, ir940}` | `cam_status.CamStatusClient.get_led_state()` → `webui` real-time IR LED reflection |
+
+All endpoints share the cookie auth from `/x/login.cgi`; the laptop client logs in once and replays the cookie.
 
 ## Pitfalls
 

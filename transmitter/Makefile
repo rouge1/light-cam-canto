@@ -8,8 +8,8 @@ tx_pwm: tx_pwm.c
 .PHONY: deploy clean
 
 deploy: tx_pwm
-	scp -O tx_pwm root@da-camera1:/opt/bin/tx_pwm
-	ssh root@da-camera1 "chmod +x /opt/bin/tx_pwm"
+	scp -O tx_pwm root@dacam1:/opt/bin/tx_pwm
+	ssh root@dacam1 "chmod +x /opt/bin/tx_pwm"
 
 clean:
 	rm -f tx_pwm

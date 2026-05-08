@@ -1,9 +1,9 @@
 """Camera and communication configuration."""
 
 # Camera network config (cam1 transmits, cam2 receives)
-TX_HOST = "da-camera1"
+TX_HOST = "dacam1"
 TX_IP = "192.168.50.113"
-RX_HOST = "da-camera2"
+RX_HOST = "dacam2"
 RX_IP = "192.168.50.143"
 RX_RTSP = f"rtsp://thingino:thingino@{RX_IP}/ch0"
 

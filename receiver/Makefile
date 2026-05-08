@@ -8,14 +8,14 @@ irlink_rx: irlink_rx.c
 .PHONY: deploy deploy-both clean
 
 deploy: irlink_rx
-	scp -O irlink_rx root@da-camera2:/opt/bin/irlink_rx
-	ssh root@da-camera2 "chmod +x /opt/bin/irlink_rx"
+	scp -O irlink_rx root@dacam2:/opt/bin/irlink_rx
+	ssh root@dacam2 "chmod +x /opt/bin/irlink_rx"
 
 deploy-both: irlink_rx
-	scp -O irlink_rx root@da-camera1:/opt/bin/irlink_rx
-	scp -O irlink_rx root@da-camera2:/opt/bin/irlink_rx
-	ssh root@da-camera1 "chmod +x /opt/bin/irlink_rx"
-	ssh root@da-camera2 "chmod +x /opt/bin/irlink_rx"
+	scp -O irlink_rx root@dacam1:/opt/bin/irlink_rx
+	scp -O irlink_rx root@dacam2:/opt/bin/irlink_rx
+	ssh root@dacam1 "chmod +x /opt/bin/irlink_rx"
+	ssh root@dacam2 "chmod +x /opt/bin/irlink_rx"
 
 clean:
 	rm -f irlink_rx

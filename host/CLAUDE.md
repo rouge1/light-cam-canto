@@ -5,15 +5,32 @@ Laptop-side Python drivers: RTSP receivers, SSH-based orchestrators, calibration
 - `config.py` — Camera IPs, GPIO pins, timing constants
 - `ssh.py` — SSH/SCP wrappers (uses `scp -O`)
 - `cam_setup.sh` — Camera pre-flight (prudynt, night mode, ircut, LEDs, AE freeze)
-- `cal_procedure.py` — Pixel-level calibration: diff LED-on/off RTSP frames to find TX
+- `cam_status.py` — **Single per-host HTTP client** (`CamStatusClient`) for every camera CGI. Cookie-cached, auto-relogin on 403, fail-soft `None` returns. All Phase 1-5 endpoints route through here. See "Camera HTTP Client" below.
+- `cal_procedure.py` — Pixel-level calibration: diff LED-on/off RTSP frames to find TX. LED on/off goes through web API (`imp_cmd`).
 - `calibration.json` — Saved calibration data (TX pixel coords per camera pair)
 - `pixel_rx.py` — RTSP pixel receiver (DPLL decode, 120ms/symbol default). `--decoder {baseline,resync,resync-fec}`. `--dump-samples` for offline replay.
 - `tx_resync.py` — TX driver for resync wire format: encode + ship hex via SSH to `irlink tx-symbols`
-- `session.py` — App-layer orchestrator: SSH-driven HELLO→META→CAL→TEXT→BYE flow
-- `aim_assist.py` — Live-feedback aim tool: SSH cam1 to hold LEDs, poll cam2's `brightness_grid`, show ★/◆/· delta indicator, trigger `bicall` on Enter
+- `session.py` — App-layer orchestrator: SSH-driven HELLO→META→CAL→TEXT→BYE flow. Optional `--status-poll` for per-cam CGI telemetry.
+- `aim_assist.py` — Live-feedback aim tool. `read_grid` is HTTP-first (4 Hz via `/x/brightness-grid.cgi`) with SSH fallback; preflight + LED toggle + ae-freeze + restart-daemon all migrated to HTTP. Phase 6 (kill_cam1_daemon, restart_cam1_daemon spawn) intentionally still SSH.
 - `send_message.py` — Legacy CLI
 
-Related: `../protocol/CLAUDE.md` for wire format; `../irlink/CLAUDE.md` for on-camera receiver; `../experiments/` for offline decoders and replay.
+Related: `../protocol/CLAUDE.md` for wire format; `../irlink/CLAUDE.md` for on-camera receiver and the CGI endpoint table; `../webui/` for the live-status webpage that proxies through `cam_status.CamStatusClient`; `../experiments/` for offline decoders and replay.
+
+## Camera HTTP Client (`cam_status.py`)
+
+Centralizes all `http://<cam>/x/*.cgi` access behind one `CamStatusClient` per cam. Cookie file at `/tmp/cam_cookie_<ip>.txt` is reused across calls (login once, replay many). All public methods return `None` on transport failure rather than raising — the contract every caller can rely on:
+
+| Method | Endpoint | Returns | Phase |
+|--------|----------|---------|-------|
+| `get()` | GET `/x/cal-status.cgi` | irlink status dict (state/mode/rate/peak/counters) | — |
+| `get_brightness_grid()` | GET `/x/brightness-grid.cgi` | `(ts_ms, [240 blocks])` | 1 |
+| `get_ae_freeze()` | GET `/x/ae-freeze.cgi` | `0` or `1` | 2 |
+| `set_ae_freeze(bool)` | POST `/x/ae-freeze.cgi` | `True`/`False` (fail-loud) | 3 |
+| `get_proc_status()` | GET `/x/proc-status.cgi` | `{irlink, daynightd, prudynt}` | 4 |
+| `imp_cmd(cmd, val)` | POST `/x/json-imp.cgi` | `True`/`False` (fail-loud) | 5 |
+| `get_led_state()` | GET `/x/gpio-state.cgi` | `{ir850, ir940}` | webui |
+
+Read paths in `aim_assist` keep an SSH fallback (`read_grid` does HTTP-first, SSH on `None`); write paths fail loud by design — silent SSH fallback for writes risks state divergence. Use `host.cam_status.resolve_ip(host)` to turn an SSH alias (`dacam1`) into a numeric IP for `CamStatusClient(ip)`.
 
 ## Host-Side Pixel Receiver (`pixel_rx.py`)
 
@@ -84,7 +101,7 @@ Workflow for the "operator carrying laptop+cam2 into position" case:
 1. Stops cam1's daemon (frees LED control).
 2. Measures cam2 baseline (8 grid samples × 250ms).
 3. SSH cam1 to hold IR LEDs ON for `--hold` seconds.
-4. Polls cam2's `/run/prudynt/brightness_grid` 4× per second; shows live max-block delta vs baseline with `★ GOOD AIM` / `◆ OK` / `· weak` indicator. Walk cam2 around until the marker hits ★.
+4. Polls cam2's `/run/prudynt/brightness_grid` 4× per second via `/x/brightness-grid.cgi` (HTTP-first, with SSH fallback if the CGI is missing); shows live max-block delta vs baseline with `★ GOOD AIM` / `◆ OK` / `· weak` indicator. Walk cam2 around until the marker hits ★.
 5. **Enter** → kill LEDs, restart cam1's `daemon-listen` from the saved coords, run `bicall` from cam2 → fresh `/opt/etc/calibration.json` on both sides. **q** → quit without cal.
 
 Currently uses SSH for the LED-hold step (dev mode — cam1 still on WiFi). For production-autonomous cam1, replace the SSH call with an `AIM_REQ` protocol message that triggers cam1's existing handle_cal_request-style LED hold. The script's structure already separates "trigger" from "feedback loop" — only the trigger needs to swap.
@@ -96,7 +113,7 @@ Thresholds (line ~30 of `aim_assist.py`): `THRESHOLD_GOOD=80`, `THRESHOLD_OK=40`
 Run before any calibration or communication:
 ```bash
 ./host/cam_setup.sh                # both cameras
-./host/cam_setup.sh da-camera1     # one camera only
+./host/cam_setup.sh dacam1     # one camera only
 ./host/cam_setup.sh --check        # verify only, don't fix
 ```
 

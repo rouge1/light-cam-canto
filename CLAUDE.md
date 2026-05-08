@@ -74,12 +74,18 @@ killall daynightd   # Prevent auto-switching back
 
 ```
 irlink/            — Combined half-duplex transceiver (C, MIPS). See irlink/CLAUDE.md
+  cgi/             — Shell CGIs deployed to /var/www/x/ on each cam: brightness-grid,
+                     ae-freeze, proc-status, gpio-state, cal-status. See irlink/CLAUDE.md
 protocol/          — Manchester/frame/app-layer (pure Python). See protocol/CLAUDE.md
 host/              — Host orchestration, RX, calibration, TX driver. See host/CLAUDE.md
+  cam_status.py    — Single CamStatusClient for all camera HTTP endpoints (cookie auth + retry)
+webui/             — 8-bit live-status webpage + http.server proxy (live cal sequence,
+                     real-time LED state, embedded calibration viewer). See "Live-Status
+                     Webpage" below.
 experiments/       — Offline decoders, replay.py, debug_capture.py
 photos/            — Calibration images, calibration.html viewer
 runs/              — JSONL captures from pixel_rx --dump-samples
-tests/             — pytest (protocol + app layer + resync framing)
+tests/             — pytest (protocol + app layer + resync framing + cam_status HTTP)
 transmitter/       — Legacy Phase 2 C TX binary
 receiver/          — Legacy standalone on-camera decoder + rx_stream.py
 thingino-firmware/ — Firmware build tree (not committed). See thingino-firmware/CLAUDE.md
@@ -103,11 +109,11 @@ ssh-copy-id -i ~/.ssh/cam_key root@192.168.50.143
 
 Add to `~/.ssh/config`:
 ```
-Host da-camera1
+Host dacam1
     HostName 192.168.50.113
     User root
     IdentityFile ~/.ssh/cam_key
-Host da-camera2
+Host dacam2
     HostName 192.168.50.143
     User root
     IdentityFile ~/.ssh/cam_key
@@ -123,8 +129,8 @@ Host usb-cam2
 
 ### Code Deployment
 ```bash
-scp -O my_program root@da-camera1:/opt/bin/       # Thingino lacks sftp-server → use -O
-ssh da-camera1 "chmod +x /opt/bin/my_program"
+scp -O my_program root@dacam1:/opt/bin/       # Thingino lacks sftp-server → use -O
+ssh dacam1 "chmod +x /opt/bin/my_program"
 ```
 
 ### Cross-Compilation (C for MIPS)
@@ -153,7 +159,7 @@ python -m host.cal_procedure --show             # verify calibration
 
 # 3b. Host-side pixel RX (~4.2 bps, best SNR)
 python -m host.pixel_rx --cam cam2 --symbol-ms 120
-# Trigger TX from cam1: ssh da-camera1 "/opt/bin/irlink tx HELLO --speed 120"
+# Trigger TX from cam1: ssh dacam1 "/opt/bin/irlink tx HELLO --speed 120"
 
 # 3c. Resync-framed long messages (~4.9 bps @ 70ms/sym)
 python -m host.pixel_rx --cam cam2 --symbol-ms 80 --decoder resync \
@@ -173,12 +179,12 @@ python -m host.aim_assist                      # ★ GOOD AIM indicator + Enter 
 python -m host.aim_assist --no-cal             # aim only
 
 # 6. On-camera pixel cal (no laptop RTSP needed — cam1-autonomous path)
-ssh da-camera2 "light ir850 on; light ir940 on; sleep 12; light ir850 off; light ir940 off" &
+ssh dacam2 "light ir850 on; light ir940 on; sleep 12; light ir850 off; light ir940 off" &
 sleep 2
-ssh da-camera1 "/opt/bin/irlink calibrate-pixel"   # writes cam1's /opt/etc/calibration.json
+ssh dacam1 "/opt/bin/irlink calibrate-pixel"   # writes cam1's /opt/etc/calibration.json
 
 # 7. Bidirectional cal entirely over light (no SSH to cam1 once it's autonomous)
-echo bicall | ssh da-camera2 "/opt/bin/irlink connect --pixel <cam2sees> --speed 160"
+echo bicall | ssh dacam2 "/opt/bin/irlink connect --pixel <cam2sees> --speed 160"
 ```
 
 ### Calibration Viewer
@@ -186,6 +192,27 @@ echo bicall | ssh da-camera2 "/opt/bin/irlink connect --pixel <cam2sees> --speed
 cd photos && python -m http.server 8888
 # Open http://localhost:8888/calibration.html
 ```
+
+### Live-Status Webpage (`webui/`)
+
+8-bit themed live dashboard showing the 5 SSH→web-migrated CGIs in action, with a one-click `RUN CAL SEQUENCE` button that drives `cal_procedure --no-interactive` end-to-end and renders the result. Two pixel-art Wyze V3 cameras at the top reflect real GPIO state (green-pulsing lens when idle, red-flickering 8-LED ring when IR is firing).
+
+```bash
+# Terminal 1 — calibration viewer (iframe target)
+cd photos && python -m http.server 8889
+
+# Terminal 2 — main live-status server (8765 default)
+conda activate light
+python -m webui.server                 # default 127.0.0.1:8765
+python -m webui.server --port 9000     # different port
+python -m webui.server --bind 0.0.0.0  # expose on LAN
+
+# open http://127.0.0.1:8765/
+```
+
+The server proxies `/api/{cam}/grid|ae|proc|leds|status` and `POST /api/{cam}/ae|led` through a per-host `CamStatusClient`, plus `/api/cal/start` + `/api/cal/status` for the cal worker. See `webui/server.py` for the routing table.
+
+**Stack push behavior:** as the sequence runs, each new step prepends to the top with a slide-in animation; previous steps stack below in completion order. Step 5 expands to show the live `cal_procedure` stdout. The cal viewer auto-refreshes when the run completes.
 
 ## Running Tests
 
@@ -207,6 +234,11 @@ The few that bite regardless of which subsystem you're in. Subsystem-specific pi
 - **Calibration coordinates shift when cameras move** — even a small bump invalidates pixel coordinates. Re-run `host.cal_procedure --no-interactive` after any physical change, or `aim_assist.py` + `bicall` once cam1 is deployed.
 - **DHCP IP rotation on reboot.** Both cameras get DHCP leases that may shift on reboot. `cam1` rotated `.110 → .113` mid-session and broke every hardcoded IP at once. When it happens, update in: `/etc/hosts`, `~/.ssh/config`, `host/cam_setup.sh:cam_ip()`, `host/cal_procedure.py:CAMERAS`, `host/config.py:TX_IP/RX_IP`, root `CLAUDE.md`, `thingino-firmware/CLAUDE.md`. Long-term fix is DHCP reservation on the router or use static USB-NCM (`usb-cam1`/`usb-cam2`).
 - **`killall -9 irlink` leaves AE freeze stuck at 1.** SIGKILL skips irlink's cleanup that resets `/run/prudynt/ae_freeze` to 0. Cameras then refuse to AE-adapt to LED on/off — `cal_procedure.py` quietly returns near-zero deltas. `cam_setup.sh` detects this; manual fix is `ssh <cam> "echo 0 > /run/prudynt/ae_freeze"`. Prefer plain `kill` so SIGTERM fires.
+- **`irlink daemon-listen` ignores SIGTERM.** `pkill -TERM irlink` and `killall irlink` cleanly stop irlink in `connect`/`listen` modes (rx thread halts + AE freeze resets), but in `daemon-listen` mode the main process lingers indefinitely after the rx thread stops. Use `kill -9 <pid>` + manual `echo 0 > /run/prudynt/ae_freeze` to fully tear down a daemon-listen instance. `aim_assist.kill_cam1_daemon()` already does this. Pre-existing irlink behavior — surfaced when Phase 4's HTTP `pgrep` made it observable that `kill_cam1_daemon` + `restart_cam1_daemon` could leave 2 instances briefly.
+- **CGI files on Thingino need `chmod 755`, not `chmod +x`.** When deploying to `/var/www/x/`, scp transfers the file under root's umask 077 → mode `600`; `chmod +x` then yields `700`, which uhttpd serves as `403 Forbidden`. Always `chmod 755 /var/www/x/<file>.cgi` after scp. A 403 from a freshly-deployed CGI is almost always this.
+- **busybox `pgrep -c` is not supported.** Thingino's busybox 1.37 pgrep doesn't accept `-c`; the call exits non-zero with a usage error, so `pgrep -c <name> || echo 0` always returns "0" silently. The pre-Phase-4 `aim_assist.preflight()` had this latent bug for irlink/daynightd counts. Use `pgrep <name> | wc -l` instead. For binaries with hyphens in the name (e.g. `prudynt-patched`), prefer `pidof` since pgrep matches argv[0] basename only.
+- **`/x/json-imp.cgi` returns `{"code":200,"result":"success",...}`, not `{"success":true}`.** The legacy convention in `cam_setup.sh` and `cal_procedure.py` is to grep for the bare substring `"success"` rather than the structured field. `CamStatusClient.imp_cmd()` follows the same convention. Don't assume a JSON `success: true` field — inspect the actual body shape before parsing strictly.
+- **`/x/json-heartbeat-slow.cgi` reports cached daynightd state, NOT actual GPIO.** Its `ir850_state` / `ir940_state` fields track an internal model that isn't synced when `imp_cmd ir850/ir940` writes happen directly. We added `irlink/cgi/gpio-state.cgi` (reads `gpio read 47`/`gpio read 49`) for the live UI's real-time LED reflection. Use that when the UI needs to know whether IR LEDs are actually firing right now.
 
 ## Key References
 

@@ -78,6 +78,7 @@ Typed protocol sitting on top of irlink's `MSG_DATA` frames. Reserves `payload[0
 | 0x07 | APP_BYE | optional reason | Clean teardown |
 | 0x08 | APP_CHUNK | `msg_id(1) seq(1) total(1) data(≤12)` | Fragment of a longer payload |
 | 0x09 | APP_CHUNK_ACK | `msg_id(1) bitmap(...)` | Selective ACK — bitmap of received chunk seqs |
+| 0x0E | APP_CAL_VISUAL | `x(2) y(2) bright(1) delta(1) off_zoom(32) on_zoom(32)` | Cal result + 8×8 OFF + 8×8 ON 4-bit zoom from cam1's ROI scans around the peak (over-light cal flow). 70B body, 71B total — fragments to 6 APP_CHUNK frames (~6 min @ 160ms/sym). Laptop computes DIFF locally and renders OFF/ON/DIFF triptych. |
 | 0xFE | APP_NACK | `rejected_type(1) reason(1)` | Receiver rejected the message |
 
 ### Drift-budget rule (16-byte single-frame ceiling)

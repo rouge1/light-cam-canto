@@ -29,7 +29,12 @@ APP_TEXT = 0x06
 APP_BYE = 0x07
 APP_CHUNK = 0x08
 APP_CHUNK_ACK = 0x09
+APP_CAL_VISUAL = 0x0E
 APP_NACK = 0xFE
+
+CAL_VISUAL_ZOOM_DIM = 4                   # 4x4 grid of cells (single panel)
+CAL_VISUAL_PANEL_BYTES = 8                # 4x4 4-bit packed (16 cells / 2)
+CAL_VISUAL_ZOOM_BYTES = CAL_VISUAL_PANEL_BYTES  # 8 bytes — single DATA frame, no fragmentation
 
 PROTOCOL_VERSION = 1
 
@@ -69,6 +74,67 @@ def pack_meta_ack(ver: int = PROTOCOL_VERSION) -> bytes:
 
 def pack_cal_result(x: int, y: int) -> bytes:
     return bytes([APP_CAL_RESULT]) + struct.pack(">HH", x & 0xFFFF, y & 0xFFFF)
+
+
+def pack_cal_visual(x: int, y: int, brightness: int, delta: int,
+                    zoom_4bit: bytes) -> bytes:
+    """Cal result + 4x4 grid-delta zoom from cam1's view (over-light cal).
+
+    Body: x(2 BE) y(2 BE) brightness(1) delta(1) zoom(8) = 14 bytes.
+    Total with type byte = 15 — fits the 16-byte single-frame ceiling, no
+    fragmentation needed. Single DATA frame, ~30 sec over IR @ 160 ms/sym.
+
+    zoom_4bit: 8 bytes encoding a 4x4 grid of 4-bit cells (two per byte;
+    high nibble first). Each cell is a per-block brightness delta (LEDs-on
+    minus LEDs-off) sampled from a 4x4 sub-area of the 20x12 brightness grid
+    centered on the peak block. Quantized via /16 to 0..15.
+
+    Single-frame chosen for reliability: any fragmented variant requires per-
+    chunk ACK and breaks the bicall protocol margins on overloaded cams.
+    The 4x4 visual is coarse but spatially honest — shows the peak block
+    surrounded by adjacent blocks at the same scale as the on-camera grid.
+    """
+    if len(zoom_4bit) != CAL_VISUAL_ZOOM_BYTES:
+        raise ValueError(
+            f"zoom_4bit must be {CAL_VISUAL_ZOOM_BYTES} bytes, got {len(zoom_4bit)}"
+        )
+    return bytes([APP_CAL_VISUAL]) + struct.pack(
+        ">HHBB", x & 0xFFFF, y & 0xFFFF, brightness & 0xFF, delta & 0xFF,
+    ) + zoom_4bit
+
+
+def unpack_cal_visual_panel(panel_bytes: bytes) -> list[list[int]]:
+    """Expand a 32-byte 4-bit-packed panel into an 8x8 grid of 0-15 cells."""
+    if len(panel_bytes) != CAL_VISUAL_PANEL_BYTES:
+        raise ValueError(f"expected {CAL_VISUAL_PANEL_BYTES} bytes")
+    dim = CAL_VISUAL_ZOOM_DIM
+    grid = [[0] * dim for _ in range(dim)]
+    for i, b in enumerate(panel_bytes):
+        row, col_pair = divmod(i, dim // 2)
+        grid[row][col_pair * 2] = (b >> 4) & 0x0F
+        grid[row][col_pair * 2 + 1] = b & 0x0F
+    return grid
+
+
+def pack_cal_visual_panel(grid: list[list[int]]) -> bytes:
+    """Inverse of unpack_cal_visual_panel — pack an 8x8 0-15 grid into 32 bytes."""
+    dim = CAL_VISUAL_ZOOM_DIM
+    if len(grid) != dim or any(len(row) != dim for row in grid):
+        raise ValueError(f"grid must be {dim}x{dim}")
+    out = bytearray(CAL_VISUAL_PANEL_BYTES)
+    for row in range(dim):
+        for col_pair in range(dim // 2):
+            hi = grid[row][col_pair * 2] & 0x0F
+            lo = grid[row][col_pair * 2 + 1] & 0x0F
+            out[row * (dim // 2) + col_pair] = (hi << 4) | lo
+    return bytes(out)
+
+
+# Back-compat aliases — older code referred to a single panel as "the zoom".
+# The triptych format ships TWO panels (OFF + ON). Helpers retained so the
+# pre-triptych call sites keep working until cleaned up.
+unpack_cal_visual_zoom = unpack_cal_visual_panel
+pack_cal_visual_zoom = pack_cal_visual_panel
 
 
 def pack_stats(tx: int, rx: int, crc_fail: int, retrans: int,
@@ -148,6 +214,18 @@ def unpack(payload: bytes) -> AppMessage:
             raise ValueError("APP_CAL_RESULT too short")
         x, y = struct.unpack(">HH", body[:4])
         return AppMessage(t, {"x": x, "y": y})
+
+    if t == APP_CAL_VISUAL:
+        if len(body) < 6 + CAL_VISUAL_ZOOM_BYTES:
+            raise ValueError(
+                f"APP_CAL_VISUAL too short ({len(body)} < {6 + CAL_VISUAL_ZOOM_BYTES})"
+            )
+        x, y, bright, delta = struct.unpack(">HHBB", body[:6])
+        zoom = bytes(body[6:6 + CAL_VISUAL_ZOOM_BYTES])
+        return AppMessage(t, {
+            "x": x, "y": y, "brightness": bright, "delta": delta,
+            "zoom_4bit": zoom,
+        })
 
     if t == APP_STATS:
         if len(body) < 12:

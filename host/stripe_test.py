@@ -3,7 +3,7 @@ Capture RTSP frame from cam2 and plot vertical column brightness to detect
 rolling shutter stripe patterns from a 500Hz LED toggle on cam1.
 
 Usage:
-    # First: ssh da-camera1 "rs_toggle_test 5"
+    # First: ssh dacam1 "rs_toggle_test 5"
     # Then:  python host/stripe_test.py
 
 Saves plot to photos/stripe_test.png

@@ -18,23 +18,33 @@ irlink_rs_rx: irlink_rs_rx.c
 .PHONY: deploy deploy-both deploy-rs clean
 
 deploy: irlink
-	scp -O irlink root@da-camera1:/opt/bin/irlink
-	scp -O irlink root@da-camera2:/opt/bin/irlink
+	@echo "Stopping irlink on both cams (avoids 'Text file busy')..."
+	-ssh -o ConnectTimeout=5 root@dacam1 "killall irlink 2>/dev/null; sleep 1" 2>/dev/null
+	-ssh -o ConnectTimeout=5 root@dacam2 "killall irlink 2>/dev/null; sleep 1" 2>/dev/null
+	scp -O irlink root@dacam1:/opt/bin/irlink
+	scp -O irlink root@dacam2:/opt/bin/irlink
+	scp -O cgi/cal-status.cgi root@dacam1:/var/www/x/cal-status.cgi
+	scp -O cgi/cal-status.cgi root@dacam2:/var/www/x/cal-status.cgi
+	@# Webserver runs as www-data — needs world-readable + executable.
+	-ssh -o ConnectTimeout=5 root@dacam1 "chmod 755 /var/www/x/cal-status.cgi"
+	-ssh -o ConnectTimeout=5 root@dacam2 "chmod 755 /var/www/x/cal-status.cgi"
 
 deploy-cam1: irlink
-	scp -O irlink root@da-camera1:/opt/bin/irlink
+	-ssh -o ConnectTimeout=5 root@dacam1 "killall irlink 2>/dev/null; sleep 1" 2>/dev/null
+	scp -O irlink root@dacam1:/opt/bin/irlink
 
 deploy-cam2: irlink
-	scp -O irlink root@da-camera2:/opt/bin/irlink
+	-ssh -o ConnectTimeout=5 root@dacam2 "killall irlink 2>/dev/null; sleep 1" 2>/dev/null
+	scp -O irlink root@dacam2:/opt/bin/irlink
 
 deploy-test: rs_toggle_test
-	scp -O rs_toggle_test root@da-camera1:/opt/bin/rs_toggle_test
+	scp -O rs_toggle_test root@dacam1:/opt/bin/rs_toggle_test
 
 deploy-rs: irlink_rs_tx irlink_rs_rx
-	scp -O irlink_rs_tx root@da-camera1:/opt/bin/irlink_rs_tx
-	scp -O irlink_rs_tx root@da-camera2:/opt/bin/irlink_rs_tx
-	scp -O irlink_rs_rx root@da-camera1:/opt/bin/irlink_rs_rx
-	scp -O irlink_rs_rx root@da-camera2:/opt/bin/irlink_rs_rx
+	scp -O irlink_rs_tx root@dacam1:/opt/bin/irlink_rs_tx
+	scp -O irlink_rs_tx root@dacam2:/opt/bin/irlink_rs_tx
+	scp -O irlink_rs_rx root@dacam1:/opt/bin/irlink_rs_rx
+	scp -O irlink_rs_rx root@dacam2:/opt/bin/irlink_rs_rx
 
 clean:
 	rm -f irlink rs_toggle_test irlink_rs_tx irlink_rs_rx

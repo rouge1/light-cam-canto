@@ -26,6 +26,12 @@ import argparse
 from datetime import datetime
 
 from host.config import pick_initial_rate_ms
+from protocol import app
+from protocol.app import (
+    APP_CAL_VISUAL, APP_CHUNK,
+    CAL_VISUAL_PANEL_BYTES,
+    pack_chunk, reassemble, unpack_cal_visual_panel,
+)
 
 CAMERAS = {
     "cam1": "192.168.50.113",
@@ -76,39 +82,56 @@ def ssh_cmd(ip, cmd):
 
 
 def leds_on_hold(ip, hold_seconds=30):
-    """Turn on LEDs and hold them on in a background SSH session.
+    """Turn on cam1's IR LEDs via Thingino's web API (no SSH).
 
-    Disables daynight, turns on LEDs, verifies, then sleeps to prevent
-    prudynt from re-enabling daynight and overriding the GPIO state.
-    Returns the Popen process — caller must kill it when done.
+    Uses /x/json-imp.cgi commands to disable daynight and switch on both
+    850nm + 940nm LEDs. No subprocess.Popen / sleep — caller invokes
+    leds_off() when done. Returns a sentinel object for caller (so the
+    existing led_proc.kill() pattern still works).
+
+    Why web API: SSH on overloaded cams times out unpredictably. A
+    timed-out off-SSH leaves LEDs stuck on, then the next direction's
+    capture sees ON+ON frames → delta=0/garbage. Web API is HTTP POST
+    via curl (subprocess) — much lighter, no sshd login.
     """
-    cmd = (
-        'echo \'{"daynight":{"enabled":false}}\' | prudyntctl json - >/dev/null 2>&1; '
-        'light ir850 on; light ir940 on; '
-        'ir850=$(light ir850 read); ir940=$(light ir940 read); '
-        'echo "LEDS_ON ir850=$ir850 ir940=$ir940"; '
-        f'sleep {hold_seconds}'
-    )
-    proc = subprocess.Popen(
-        ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
-         f"root@{ip}", cmd],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
-    # Read the verification line
-    line = proc.stdout.readline().strip()
-    if "ir850=1" in line and "ir940=1" in line:
-        print(f"  LEDs verified ON ({line})")
+    imp_cmd(ip, "daynight", '"night"')
+    on_result = imp_cmd(ip, "ir850", 1)
+    on_result2 = imp_cmd(ip, "ir940", 1)
+    if '"success"' in on_result and '"success"' in on_result2:
+        print(f"  LEDs verified ON via web API (ir850, ir940)")
     else:
-        print(f"  WARNING: LED verify unexpected: {line}")
-    return proc
+        print(f"  WARNING: LED on returned: 850={on_result} 940={on_result2}")
+
+    # Verify via heartbeat (state should reflect commanded values within ~1s)
+    time.sleep(1)
+    cookie_file = f"/tmp/cam_cookie_{ip}.txt"
+    hb = subprocess.run(
+        f"curl -s -b {cookie_file} 'http://{ip}/x/json-heartbeat-slow.cgi' "
+        f"-H 'Accept: application/json'",
+        shell=True, capture_output=True, text=True, timeout=5,
+    ).stdout
+    ir850 = "1" if '"ir850_state":1' in hb else "0"
+    ir940 = "1" if '"ir940_state":1' in hb else "0"
+    if ir850 == "1" and ir940 == "1":
+        print(f"  LEDs heartbeat-confirmed ON (ir850={ir850} ir940={ir940})")
+    else:
+        print(f"  WARNING: heartbeat shows ir850={ir850} ir940={ir940} (commands sent)")
+
+    # Return a dummy object with .kill()/.wait() so callers (which expect a
+    # subprocess.Popen) keep working unchanged.
+    class _Sentinel:
+        def kill(self): pass
+        def wait(self, *a, **kw): pass
+        def poll(self): return 0
+    return _Sentinel()
 
 
 def leds_off(ip):
-    """Turn off both IR LEDs in a single SSH session."""
-    ssh_cmd(ip, (
-        'echo \'{"daynight":{"enabled":false}}\' | prudyntctl json - 2>/dev/null; '
-        'light ir850 off; light ir940 off'
-    ))
+    """Turn off both IR LEDs via Thingino's web API (no SSH)."""
+    r1 = imp_cmd(ip, "ir850", 0)
+    r2 = imp_cmd(ip, "ir940", 0)
+    if not ('"success"' in r1 and '"success"' in r2):
+        print(f"  WARNING: LED off returned: 850={r1} 940={r2}")
 
 
 def grab_frames(cap, n=5):
@@ -287,6 +310,182 @@ def calibrate_pair(rx_name, tx_name, interactive=True):
     }
 
 
+def _panel_to_image(panel_bytes: bytes, label: str, scale: int = 32) -> np.ndarray:
+    """Render one 8×8 4-bit panel as a labeled grayscale image (256×256 default)."""
+    grid = np.array(unpack_cal_visual_panel(panel_bytes), dtype=np.uint8) * 17
+    upscaled = cv2.resize(grid, (8 * scale, 8 * scale),
+                          interpolation=cv2.INTER_NEAREST)
+    bgr = cv2.cvtColor(upscaled, cv2.COLOR_GRAY2BGR)
+    cv2.putText(bgr, label, (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (0, 255, 255), 2, cv2.LINE_AA)
+    return bgr
+
+
+def render_cal_visual_zoom(zoom_4bit: bytes, peak_x: int, peak_y: int,
+                            delta: int, brightness: int, output_path: str) -> None:
+    """Render the 8-byte 4×4 grid-delta zoom as a 256×256 PNG with colormap.
+
+    cam1 ships a 4×4 sub-area of its 20×12 brightness-grid deltas around the
+    peak block (peak at cell (1,1)). Each cell is a per-block delta clamped
+    to 0-15 (4-bit). The render upscales 64× nearest-neighbour and JET-
+    colormaps. A center crosshair marks the (peak_x, peak_y) source-pixel.
+    """
+    if len(zoom_4bit) != CAL_VISUAL_PANEL_BYTES:
+        raise ValueError(
+            f"zoom_4bit must be {CAL_VISUAL_PANEL_BYTES} bytes "
+            f"(4×4 4-bit), got {len(zoom_4bit)}"
+        )
+    grid = np.array(unpack_cal_visual_panel(zoom_4bit), dtype=np.uint8) * 17
+    upscaled = cv2.resize(grid, (256, 256), interpolation=cv2.INTER_NEAREST)
+    colored = cv2.applyColorMap(upscaled, cv2.COLORMAP_JET)
+    cv2.drawMarker(colored, (128, 128), (255, 255, 255),
+                   cv2.MARKER_CROSS, 24, 2)
+    cv2.putText(colored, f"({peak_x},{peak_y}) d={delta} b={brightness}",
+                (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
+                cv2.LINE_AA)
+    cv2.putText(colored, "OVER-LINK 4x4 (8B)",
+                (8, 248), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1,
+                cv2.LINE_AA)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    cv2.imwrite(output_path, colored)
+
+
+def cal_over_light(cam2_host: str = "dacam2", symbol_ms: int = 160,
+                   bicall_timeout: float = 600.0) -> dict | None:
+    """Run cam1-sees-cam2 calibration entirely over the IR link.
+
+    Spawns `irlink connect` on cam2, sends `bicall`, captures stdout for:
+      - PEER-CAL line (cam1's coords + delta, from CAL_DONE)
+      - APP_CHUNK frames carrying a fragmented APP_CAL_VISUAL
+      - BICAL: bidirectional cal complete marker
+
+    Reassembles the 4-chunk CAL_VISUAL, renders the 8×8 zoom to PNG, and
+    returns a calibration entry compatible with the existing schema (less
+    the box/diff images, which aren't available without RTSP-to-cam1).
+    """
+    cam2_pixel = get_tx_position("cam2", "cam1")
+    if cam2_pixel is None:
+        print("  ERROR: no cam2_sees_cam1 calibration. Run direction 1 first.")
+        return None
+
+    cmd = (f"/opt/bin/irlink connect --pixel {cam2_pixel[0]},{cam2_pixel[1]} "
+           f"--speed {symbol_ms}")
+    print(f"  driving cam2: {cmd}")
+    proc = subprocess.Popen(
+        ["ssh", "-o", "BatchMode=yes", cam2_host, cmd],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+
+    sent_bicall = False
+    chunks_by_seq: dict[int, bytes] = {}
+    expected_total: int | None = None
+    expected_msg_id: int | None = None
+    cal_visual: dict | None = None
+    bicall_complete = False
+    sent_quit = False
+    deadline = time.monotonic() + bicall_timeout
+
+    try:
+        for line in proc.stdout:
+            if time.monotonic() > deadline:
+                print("  TIMEOUT during bicall + CAL_VISUAL collection")
+                break
+            line = line.rstrip()
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+
+            if not sent_bicall and "PROTO: connected!" in line:
+                proc.stdin.write("bicall\n")
+                proc.stdin.flush()
+                sent_bicall = True
+
+            if line.startswith("MSG-HEX:"):
+                hex_part = line[len("MSG-HEX:"):].strip()
+                try:
+                    payload = bytes.fromhex(hex_part)
+                    msg = app.unpack(payload)
+                except Exception as e:
+                    print(f"  MSG-HEX parse error: {e}")
+                    continue
+                if msg.type == APP_CAL_VISUAL:
+                    # Unfragmented (would only happen if irlink supports
+                    # >16-byte single-frame DATA at this rate). Capture and stop.
+                    cal_visual = dict(msg.fields)
+                elif msg.type == APP_CHUNK:
+                    seq = msg.fields["seq"]
+                    msg_id = msg.fields["msg_id"]
+                    total = msg.fields["total"]
+                    if expected_msg_id is None:
+                        expected_msg_id = msg_id
+                        expected_total = total
+                    if msg_id == expected_msg_id:
+                        chunks_by_seq[seq] = msg.fields["data"]
+                        if expected_total and len(chunks_by_seq) == expected_total:
+                            try:
+                                raw = [pack_chunk(expected_msg_id, s,
+                                                   expected_total,
+                                                   chunks_by_seq[s])
+                                       for s in range(expected_total)]
+                                app_type, body = reassemble(raw)
+                                if app_type == APP_CAL_VISUAL:
+                                    full = app.unpack(bytes([app_type]) + body)
+                                    cal_visual = dict(full.fields)
+                                else:
+                                    print(f"  reassembled to 0x{app_type:02x}, "
+                                          f"not CAL_VISUAL")
+                            except Exception as e:
+                                print(f"  reassemble failed: {e}")
+
+            if "BICAL: bidirectional cal complete" in line:
+                bicall_complete = True
+
+            if (bicall_complete and cal_visual is not None and not sent_quit):
+                proc.stdin.write("quit\n")
+                proc.stdin.flush()
+                sent_quit = True
+
+        if not sent_quit:
+            try:
+                proc.stdin.write("quit\n")
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                pass
+        proc.wait(timeout=10)
+    except (KeyboardInterrupt, subprocess.TimeoutExpired):
+        proc.kill()
+
+    if cal_visual is None:
+        print("  ERROR: never received complete CAL_VISUAL")
+        return None
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zoom_path = os.path.join(PHOTOS_DIR,
+                             f"cal_cam1_sees_cam2_zoom_{ts}.png")
+    render_cal_visual_zoom(
+        cal_visual["zoom_4bit"],
+        cal_visual["x"], cal_visual["y"],
+        cal_visual["delta"], cal_visual["brightness"],
+        zoom_path,
+    )
+    print(f"  Saved over-link zoom: {zoom_path}")
+
+    return {
+        "rx_cam": "cam1",
+        "tx_cam": "cam2",
+        "tx_pixel": [cal_visual["x"], cal_visual["y"]],
+        "frame_size": [640, 360],
+        "off_value": None,
+        "on_value": cal_visual["brightness"],
+        "delta": cal_visual["delta"],
+        "peak_blurred": cal_visual["delta"],
+        "recommended_rate_ms": pick_initial_rate_ms(cal_visual["delta"]),
+        "timestamp": ts,
+        "source": "over_light",
+        "images": {"zoom": zoom_path},
+    }
+
+
 def load_calibration():
     """Load saved calibration from file."""
     if os.path.exists(CAL_FILE):
@@ -322,31 +521,73 @@ def write_html(cal_data):
         rx, tx = entry["rx_cam"], entry["tx_cam"]
         px, py = entry["tx_pixel"]
         delta = entry["delta"]
-        off_v, on_v = entry["off_value"], entry["on_value"]
+        off_v = entry.get("off_value")
+        on_v = entry.get("on_value")
         ts_human = _fmt_ts(entry.get("timestamp"))
-        box = os.path.basename(entry["images"]["box"])
-        diff = os.path.basename(entry["images"]["diff"])
-        zoom = os.path.basename(entry["images"]["zoom"])
+        images = entry.get("images", {})
+        zoom = os.path.basename(images["zoom"]) if images.get("zoom") else None
+        box = os.path.basename(images["box"]) if images.get("box") else None
+        diff = os.path.basename(images["diff"]) if images.get("diff") else None
+        is_over_link = entry.get("source") == "over_light"
 
         rows.append(
-            f'<tr><td>{rx.upper()} sees {tx.upper()}</td>'
+            f'<tr><td>{rx.upper()} sees {tx.upper()}'
+            f'{" <span style=\"color:#fa0;font-size:12px\">[over-link]</span>" if is_over_link else ""}</td>'
             f'<td style="color:#0ff">({px}, {py})</td>'
             f'<td style="color:#0f0">+{delta}</td>'
-            f'<td>{off_v}</td><td>{on_v}</td>'
+            f'<td>{"-" if off_v is None else off_v}</td>'
+            f'<td>{"-" if on_v is None else on_v}</td>'
             f'<td style="color:#aaa">{ts_human}</td></tr>'
         )
 
-        sections.append(f"""<div class="pair">
-<h2>{rx.upper()} sees {tx.upper()}</h2>
-<p class="summary">TX at <span>({px}, {py})</span> | Delta: <span>+{delta}</span> | <span style="color:#aaa;font-size:14px">{ts_human}</span></p>
-<h3>Analysis</h3>
-<div class="row">
-<figure><img src="{box}" width="320"><figcaption>Peak pixel marked</figcaption></figure>
-<figure><img src="{diff}" width="320"><figcaption>Diff heatmap</figcaption></figure>
-</div>
-<h3>Zoomed Peak (8x)</h3>
-<div class="row"><figure><img src="{zoom}" width="100%"><figcaption>OFF | ON | DIFF</figcaption></figure></div>
-</div>""")
+        # Section header
+        title_suffix = (
+            ' <span style="color:#fa0;font-size:14px">[over-link, low-res]</span>'
+            if is_over_link else ""
+        )
+        section_parts = [f'<div class="pair">',
+                         f'<h2>{rx.upper()} sees {tx.upper()}{title_suffix}</h2>',
+                         f'<p class="summary">TX at <span>({px}, {py})</span> | '
+                         f'Delta: <span>+{delta}</span> | '
+                         f'<span style="color:#aaa;font-size:14px">{ts_human}</span></p>']
+
+        if box or diff:
+            section_parts.append('<h3>Analysis</h3><div class="row">')
+            if box:
+                section_parts.append(
+                    f'<figure><img src="{box}" width="320">'
+                    f'<figcaption>Peak pixel marked</figcaption></figure>'
+                )
+            if diff:
+                section_parts.append(
+                    f'<figure><img src="{diff}" width="320">'
+                    f'<figcaption>Diff heatmap</figcaption></figure>'
+                )
+            section_parts.append('</div>')
+
+        if zoom:
+            zoom_caption = (
+                "OFF | ON | DIFF — 8×8 4-bit per panel, ~6 min over IR link"
+                if is_over_link
+                else "OFF | ON | DIFF"
+            )
+            section_parts.append(
+                f'<h3>{"Over-link Triptych (8×8)" if is_over_link else "Zoomed Peak (8x)"}</h3>'
+                f'<div class="row"><figure>'
+                f'<img src="{zoom}" width="100%">'
+                f'<figcaption>{zoom_caption}</figcaption></figure></div>'
+            )
+
+        if is_over_link:
+            section_parts.append(
+                '<p style="color:#aaa;font-size:13px">'
+                'Full-frame box/diff not available — cam1 has no laptop link, '
+                'only the IR channel. Visual confirmation is the 8×8 zoom above.'
+                '</p>'
+            )
+
+        section_parts.append('</div>')
+        sections.append('\n'.join(section_parts))
 
     if not rows:
         rows.append('<tr><td colspan="6" style="color:#aaa">No calibration data</td></tr>')
@@ -425,6 +666,15 @@ if __name__ == "__main__":
     parser.add_argument("--tx", help="Transmitter camera (cam1 or cam2)")
     parser.add_argument("--show", action="store_true", help="Show current calibration")
     parser.add_argument("--no-interactive", action="store_true", help="Skip interactive prompts")
+    parser.add_argument("--over-light", action="store_true",
+                        help="Run cam1-sees-cam2 over the IR link (no WiFi to cam1). "
+                             "Direction 1 (cam2-sees-cam1) still uses RTSP. cam1's "
+                             "visual is a low-res 8×8 zoom shipped over the link.")
+    parser.add_argument("--symbol-ms", type=int, default=160,
+                        help="Symbol rate for the over-light cal (default: 160ms)")
+    parser.add_argument("--skip-setup", action="store_true",
+                        help="Skip cam_setup.sh — use only when cam state is "
+                             "known good (saves ~60s on slow WiFi).")
     args = parser.parse_args()
 
     if args.show:
@@ -433,8 +683,90 @@ if __name__ == "__main__":
 
     cal = load_calibration()
 
-    if args.rx and args.tx:
-        # Calibrate one direction
+    if args.over_light:
+        cam1_ip = CAMERAS["cam1"]
+
+        # Run cam_setup first to verify state (ircut open, daynightd dead,
+        # AE freeze idle on both cams). Without this, repeated kills + scp
+        # cycles can leave ircut closed or AE stuck — direction 1 then gets
+        # delta=-17 and direction 2 hits SYN timeouts.
+        if args.skip_setup:
+            print("\n=== Skipping cam_setup.sh (--skip-setup) ===")
+        else:
+            print("\n=== cam_setup.sh — verifying camera state ===")
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            r = subprocess.run(["./host/cam_setup.sh"], cwd=repo_root, timeout=360)
+            if r.returncode != 0:
+                print("\n  ERROR: cam_setup.sh failed — fix and retry "
+                      "(or pass --skip-setup if state is known good)")
+                sys.exit(1)
+
+        # Direction 1 needs cam1's autostarted daemon-listen out of the way
+        # (it owns LED control and would race with `light ir850 off` SSH calls).
+        print("\n=== Stopping cam1 daemon-listen for direction 1 ===")
+        try:
+            subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=30", "-o", "BatchMode=yes",
+                 f"root@{cam1_ip}",
+                 "killall -9 irlink 2>/dev/null; sleep 1; "
+                 "echo 0 > /run/prudynt/ae_freeze 2>/dev/null"],
+                timeout=45,
+            )
+        except subprocess.TimeoutExpired:
+            print("  WARNING: cam1 daemon-stop SSH timed out — cam1 may "
+                  "still be running irlink. Direction 1 may fight with it.")
+
+        print("\n=== Direction 1: cam2 sees cam1 (RTSP frame-diff) ===")
+        result1 = calibrate_pair("cam2", "cam1",
+                                 interactive=not args.no_interactive)
+        if result1:
+            cal["cam2_sees_cam1"] = result1
+            save_calibration(cal)  # save direction-1 even if direction-2 fails
+
+        # Direction 2 needs cam1's daemon-listen RUNNING so cam2's `irlink
+        # connect` can reach it. The --pixel arg here is cam1's view of cam2's
+        # TX (where cam1 watches for incoming DATA frames) — pull from the
+        # last-known cam1_sees_cam2 entry, or fall back to cam1's local
+        # /opt/etc/calibration.json. Direction 2 then re-discovers cam2's
+        # exact TX pixel via on-camera grid scan, regardless of this hint.
+        print("\n=== Restarting cam1 daemon-listen for direction 2 ===")
+        prev_cam1_sees_cam2 = cal.get("cam1_sees_cam2", {}).get("tx_pixel")
+        if prev_cam1_sees_cam2:
+            coords = f"{prev_cam1_sees_cam2[0]},{prev_cam1_sees_cam2[1]}"
+        else:
+            # Read cam1's persisted coords. This is what rc.local autostart uses.
+            r = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                 f"root@{cam1_ip}",
+                 "grep '\"tx_pixel\"' /opt/etc/calibration.json "
+                 "| grep -oE '[0-9]+' | head -2 | tr '\\n' ',' | sed 's/,$//'"],
+                capture_output=True, text=True, timeout=10,
+            )
+            coords = r.stdout.strip() or "320,180"  # last-resort frame center
+        print(f"  using cam1 daemon-listen --pixel {coords}")
+        try:
+            subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=30", "-o", "BatchMode=yes",
+                 f"root@{cam1_ip}",
+                 f"nohup /opt/bin/irlink daemon-listen --pixel {coords} "
+                 f"--speed {args.symbol_ms} >/var/log/irlink-boot.log 2>&1 &"],
+                timeout=45,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"  WARNING: cam1 daemon-listen restart SSH timed out — "
+                  f"cam1 may be busy. Continuing; if direction 2 fails, "
+                  f"verify cam1 is reachable.")
+        time.sleep(4)  # let it bind
+
+        print("\n=== Direction 2: cam1 sees cam2 (over IR link) ===")
+        result2 = cal_over_light(symbol_ms=args.symbol_ms)
+        if result2:
+            cal["cam1_sees_cam2"] = result2
+            save_calibration(cal)
+        else:
+            print("\n  Direction 2 failed — direction 1 result still saved.")
+    elif args.rx and args.tx:
+        # Calibrate one direction (legacy single-direction mode)
         result = calibrate_pair(args.rx, args.tx, interactive=not args.no_interactive)
         if result:
             key = f"{args.rx}_sees_{args.tx}"

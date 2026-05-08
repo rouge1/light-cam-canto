@@ -2,11 +2,13 @@
 import pytest
 
 from protocol.app import (
-    APP_HELLO, APP_META, APP_META_ACK, APP_CAL_RESULT, APP_STATS,
-    APP_TEXT, APP_BYE, APP_CHUNK, APP_CHUNK_ACK, APP_NACK,
+    APP_HELLO, APP_META, APP_META_ACK, APP_CAL_RESULT, APP_CAL_VISUAL,
+    APP_STATS, APP_TEXT, APP_BYE, APP_CHUNK, APP_CHUNK_ACK, APP_NACK,
+    CAL_VISUAL_ZOOM_BYTES,
     PROTOCOL_VERSION, MAX_SINGLE_FRAME, MAX_CHUNK_DATA,
     STATUS_IDLE, STATUS_READY, STATUS_BUSY, STATUS_ERROR,
-    pack_hello, pack_meta, pack_meta_ack, pack_cal_result, pack_stats,
+    pack_hello, pack_meta, pack_meta_ack, pack_cal_result, pack_cal_visual,
+    pack_cal_visual_zoom, unpack_cal_visual_zoom, pack_stats,
     pack_text, pack_bye, pack_chunk, pack_chunk_ack, pack_nack,
     unpack, fragment, reassemble, missing_chunks,
 )
@@ -53,6 +55,40 @@ def test_cal_result_max_coords():
     m = unpack(b)
     assert m.fields["x"] == 640
     assert m.fields["y"] == 360
+
+
+def test_cal_visual_roundtrip():
+    zoom = bytes(range(CAL_VISUAL_ZOOM_BYTES))  # arbitrary 8 bytes
+    b = pack_cal_visual(385, 178, brightness=220, delta=240, zoom_4bit=zoom)
+    assert len(b) == 1 + 6 + CAL_VISUAL_ZOOM_BYTES
+    m = unpack(b)
+    assert m.type == APP_CAL_VISUAL
+    assert m.fields["x"] == 385
+    assert m.fields["y"] == 178
+    assert m.fields["brightness"] == 220
+    assert m.fields["delta"] == 240
+    assert m.fields["zoom_4bit"] == zoom
+
+
+def test_cal_visual_fits_single_frame():
+    """14-byte body + 1-byte type = 15 bytes total, ≤ MAX_SINGLE_FRAME (16)."""
+    zoom = b"\xAB" * CAL_VISUAL_ZOOM_BYTES
+    b = pack_cal_visual(305, 168, 251, 240, zoom)
+    assert len(b) <= MAX_SINGLE_FRAME, f"CAL_VISUAL is {len(b)}B, must fit 16B"
+
+
+def test_cal_visual_wrong_zoom_size_raises():
+    with pytest.raises(ValueError, match="8 bytes"):
+        pack_cal_visual(0, 0, 0, 0, b"\x00" * 16)
+
+
+def test_cal_visual_panel_pack_unpack():
+    # 4x4 grid of 0-15 cells, packed 4-bit
+    grid = [[(r * 4 + c) % 16 for c in range(4)] for r in range(4)]
+    packed = pack_cal_visual_zoom(grid)  # alias to pack_cal_visual_panel
+    assert len(packed) == 8
+    unpacked = unpack_cal_visual_zoom(packed)
+    assert unpacked == grid
 
 
 def test_stats_roundtrip():

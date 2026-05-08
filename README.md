@@ -43,6 +43,8 @@ An experimental system that turns Wyze V3 security cameras into IR Li-Fi transce
 | **Bidirectional cal over light (`bicall`)** | full bidi cal in ~3.5 min @ 160 ms/sym | **Working** (single trigger, role-swaps via `bidi` flag in CAL_REQ payload; both `/opt/etc/calibration.json` files refresh from one cmd) |
 | **Autonomous cam1 (rc.local autostart)** | — | **Working** (cam1 boots → reads saved `tx_pixel` → starts `irlink daemon-listen` automatically; verified by physical power-cycle test) |
 | **Aim-assist tool (`host/aim_assist.py`)** | live ★/◆/· feedback | **Working** (laptop polls cam2's `brightness_grid` 4× / s while cam1 holds LEDs; Enter triggers `bicall`) |
+| **SSH→Web migration (phases 1-5)** | ~3.2× faster reads · zero new dropbear children at 4 Hz | **Working** (5 small CGIs in `irlink/cgi/`; all read/toggle paths in `aim_assist` + `cam_setup.sh` proxied through `host/cam_status.py:CamStatusClient`. Phase 6 process-control writes deferred — see plan in /home/user/.claude/plans/) |
+| **Live-status webpage (`webui/`)** | 8-bit dashboard · one-click cal | **Working** (`webui/server.py` proxies `/api/*` to camera CGIs; pixel-art Wyze V3s reflect real GPIO LED state; cal sequence push-stack + embedded calibration viewer) |
 
 ## Requirements
 
@@ -55,8 +57,10 @@ An experimental system that turns Wyze V3 security cameras into IR Li-Fi transce
 ```bash
 conda create -n light python=3.12 -y
 conda activate light
-pip install opencv-python numpy paramiko matplotlib pytest
+pip install opencv-python numpy paramiko matplotlib pytest requests
 ```
+
+(The `webui/` live-status server has no extra deps — pure Python stdlib + the existing pip set.)
 
 ## Quick Start
 
@@ -64,8 +68,8 @@ pip install opencv-python numpy paramiko matplotlib pytest
 # 1. Flash Thingino to both cameras via SD card
 
 # 2. Set up SSH keys
-ssh-copy-id root@192.168.50.113   # da-camera1 (DHCP, may rotate)
-ssh-copy-id root@192.168.50.143   # da-camera2
+ssh-copy-id root@192.168.50.113   # dacam1 (DHCP, may rotate)
+ssh-copy-id root@192.168.50.143   # dacam2
 
 # 3. Setup cameras (night mode, IR cut filter, patched prudynt)
 ./host/cam_setup.sh
@@ -75,12 +79,12 @@ conda activate light
 python -m host.cal_procedure --no-interactive
 
 # 5a. On-camera pixel RX (use coords from calibration)
-ssh da-camera2 "irlink listen --pixel 385,178 --speed 120"  # RX
-ssh da-camera1 "irlink tx 'HELLO' --speed 120"              # TX
+ssh dacam2 "irlink listen --pixel 385,178 --speed 120"  # RX
+ssh dacam1 "irlink tx 'HELLO' --speed 120"              # TX
 
 # 5b. Host-side pixel RX (auto-loads calibration)
 python -m host.pixel_rx --cam cam2 --symbol-ms 120          # RX
-ssh da-camera1 "/opt/bin/irlink tx 'HELLO' --speed 120"     # TX
+ssh dacam1 "/opt/bin/irlink tx 'HELLO' --speed 120"     # TX
 
 # 5c. App-layer session orchestrator (laptop drives both cams over SSH)
 python -m host.session --dry-run                            # offline pack/unpack check
@@ -103,7 +107,7 @@ python -m host.tx_resync --cam cam1 --speed 80 --fec \
 #     non-FEC path fails with ~15 bit errors
 
 # 6. Run tests
-pytest tests/ -v   # 76 tests: protocol + app layer + resync framing + FEC + adaptive rate
+pytest tests/ -v   # 112 tests: protocol + app layer + resync framing + FEC + adaptive rate + cam_status HTTP
 
 # 7. Autonomous cam1 deployment (no PC reading cam1's RTSP)
 #    cam1 autostarts irlink daemon-listen at boot from /opt/etc/calibration.json.
@@ -111,6 +115,17 @@ pytest tests/ -v   # 76 tests: protocol + app layer + resync framing + FEC + ada
 python -m host.aim_assist                      # live aim feedback; Enter triggers bicall
 #    Both /opt/etc/calibration.json files refresh from one cmd over light. cam1
 #    never needs an SSH session in production.
+
+# 8. Live-status webpage — 8-bit dashboard with one-click RUN CAL SEQUENCE
+#    First-time: deploy CGIs to both cams (mode 755 — see CLAUDE.md gotchas)
+scp -O irlink/cgi/*.cgi root@dacam1:/var/www/x/
+scp -O irlink/cgi/*.cgi root@dacam2:/var/www/x/
+ssh dacam1 "chmod 755 /var/www/x/*.cgi"
+ssh dacam2 "chmod 755 /var/www/x/*.cgi"
+#    Then run two servers (separate terminals or backgrounded):
+cd photos && python -m http.server 8889 &      # iframe target (cal viewer)
+python -m webui.server                          # live status @ 127.0.0.1:8765
+#    Open http://127.0.0.1:8765/ — Wyze V3 pixel art reflects real GPIO state.
 ```
 
 ## Project Structure
@@ -119,25 +134,33 @@ python -m host.aim_assist                      # live aim feedback; Enter trigge
 irlink/        — Combined half-duplex transceiver: TX+RX, DPLL decode, pixel ROI (C, MIPS)
                  interactive cmds: send / send-hex / ping / cal / stats / quit
                  raw subcommands: tx / tx-symbols (host-driven symbol stream)
+  cgi/              — Shell CGIs deployed to /var/www/x/ on the cameras (mode 755):
+                      brightness-grid, ae-freeze (GET+POST), proc-status, gpio-state,
+                      cal-status. Replace SSH-cat polling for laptop reads.
 protocol/      — Manchester encoding, CRC-8, frame encode/decode (Python)
   app.py            — Typed app-layer messages on top of DATA: HELLO/META/CAL_RESULT/STATS/TEXT/BYE/CHUNK/NACK + fragment/reassemble
   frame.py          — Classic framing + encode_frame_symbols_with_resync for mid-frame resync markers
 host/          — Calibration, pixel RX, SSH orchestration, camera setup
-  cal_procedure.py  — Pixel-level calibration via RTSP frame differencing
+  cam_status.py     — Single CamStatusClient for all camera HTTP endpoints (cookie-cached)
+  cal_procedure.py  — Pixel-level calibration via RTSP frame differencing (LED toggle via web API)
   pixel_rx.py       — Host-side RTSP pixel receiver with DPLL clock recovery (--decoder baseline|resync)
-  cam_setup.sh      — Camera pre-flight: night mode, ircut, LEDs, prudynt
-  session.py        — App-layer orchestrator: SSH-driven HELLO→META→CAL→TEXT→BYE flow
+  cam_setup.sh      — Camera pre-flight: night mode, ircut, LEDs, prudynt (web-API driven)
+  session.py        — App-layer orchestrator: SSH-driven HELLO→META→CAL→TEXT→BYE flow; --status-poll for telemetry
   tx_resync.py      — TX driver for resync framing: encode + ship hex to irlink tx-symbols over SSH
-  aim_assist.py     — Aim cam2 at cam1 with live ★ GOOD AIM feedback; Enter triggers `bicall`
+  aim_assist.py     — Aim cam2 at cam1 with live ★ GOOD AIM feedback; reads via HTTP, falls back to SSH
+webui/         — 8-bit live-status webpage + http.server proxy
+  server.py         — Proxies /api/{cam}/* to host.cam_status.CamStatusClient (bypasses CORS)
+  index.html        — Single-file dashboard (Press Start 2P + VT323; pixel-art Wyze V3s, push-stack steps,
+                      embedded calibration viewer iframe, real-time IR LED reflection)
 experiments/   — Offline analysis + alternate decoders
   replay.py         — Replay dumped captures against decoder variants (A/B testing)
   resync_decoder.py — Resync-aware DPLL decoder (tolerant to isolated bit errors)
   debug_capture.py  — Compare extracted symbols against expected for a known message
 transmitter/   — TX: shell scripts (Phase 1), C GPIO binary (Phase 2)
 receiver/      — RX: standalone on-camera decoder + legacy host-side RTSP decoder
-photos/        — Calibration images, calibration.html viewer
+photos/        — Calibration images, calibration.html viewer (served by python -m http.server)
 runs/          — Captured samples from pixel_rx --dump-samples (JSONL per capture)
-tests/         — 76 pytest tests (protocol + app + resync framing + FEC + adaptive rate)
+tests/         — 112 pytest tests (protocol + app + resync framing + FEC + adaptive rate + cam_status HTTP)
 ```
 
 See [CLAUDE.md](CLAUDE.md) for detailed hardware docs, GPIO pinouts, firmware build instructions, and common pitfalls.

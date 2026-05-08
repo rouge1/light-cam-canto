@@ -3,46 +3,46 @@
     "rx_cam": "cam2",
     "tx_cam": "cam1",
     "tx_pixel": [
-      307,
-      169
+      243,
+      177
     ],
     "frame_size": [
       640,
       360
     ],
-    "off_value": 17,
-    "on_value": 255,
-    "delta": 238,
-    "peak_blurred": 167,
+    "off_value": 0,
+    "on_value": 253,
+    "delta": 253,
+    "peak_blurred": 179,
     "recommended_rate_ms": 70,
-    "timestamp": "20260508_162356",
+    "timestamp": "20260508_174703",
     "images": {
-      "box": "/data/python/light-cam-canto/photos/cal_cam2_sees_cam1_box_20260508_162356.png",
-      "diff": "/data/python/light-cam-canto/photos/cal_cam2_sees_cam1_diff_20260508_162356.png",
-      "zoom": "/data/python/light-cam-canto/photos/cal_cam2_sees_cam1_zoom_20260508_162356.png"
+      "box": "/data/python/light-cam-canto/photos/cal_cam2_sees_cam1_box_20260508_174703.png",
+      "diff": "/data/python/light-cam-canto/photos/cal_cam2_sees_cam1_diff_20260508_174703.png",
+      "zoom": "/data/python/light-cam-canto/photos/cal_cam2_sees_cam1_zoom_20260508_174703.png"
     }
   },
   "cam1_sees_cam2": {
     "rx_cam": "cam1",
     "tx_cam": "cam2",
     "tx_pixel": [
-      315,
-      139
+      326,
+      109
     ],
     "frame_size": [
       640,
       360
     ],
-    "off_value": 2,
-    "on_value": 255,
-    "delta": 253,
-    "peak_blurred": 151,
+    "off_value": 53,
+    "on_value": 252,
+    "delta": 199,
+    "peak_blurred": 129,
     "recommended_rate_ms": 70,
-    "timestamp": "20260508_162415",
+    "timestamp": "20260508_174722",
     "images": {
-      "box": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_box_20260508_162415.png",
-      "diff": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_diff_20260508_162415.png",
-      "zoom": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_zoom_20260508_162415.png"
+      "box": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_box_20260508_174722.png",
+      "diff": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_diff_20260508_174722.png",
+      "zoom": "/data/python/light-cam-canto/photos/cal_cam1_sees_cam2_zoom_20260508_174722.png"
     }
   }
 }

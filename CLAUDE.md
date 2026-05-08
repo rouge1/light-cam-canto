@@ -212,7 +212,11 @@ python -m webui.server --bind 0.0.0.0  # expose on LAN
 
 The server proxies `/api/{cam}/grid|ae|proc|leds|status` and `POST /api/{cam}/ae|led` through a per-host `CamStatusClient`, plus `/api/cal/start` + `/api/cal/status` for the cal worker. See `webui/server.py` for the routing table.
 
-**Stack push behavior:** as the sequence runs, each new step prepends to the top with a slide-in animation; previous steps stack below in completion order. Step 5 expands to show the live `cal_procedure` stdout. The cal viewer auto-refreshes when the run completes.
+**Stack push behavior:** as the sequence runs, each new step prepends to the top with a slide-in animation; previous steps stack below in completion order. Step 5 expands to show the live `cal_procedure` stdout.
+
+**Post-cal behavior (since 2026-05-08):** on `DONE · OK` the page auto-switches to the CAL RESULTS tab and force-reloads the iframe via `about:blank` → `?_t=<now>` (cache-bust isn't enough on its own — `calibration.html` is rewritten with new image filenames each run, but the browser tends to hold the old DOM until you fully tear down the iframe). Manual **▸ RELOAD CAL VIEWER** button uses the same `refreshCalViewer()` helper.
+
+**Beam channel is direction-aware:** the top beam (`CAM1 ▶▶▶ CAM2`) only animates when cam1's IR LEDs are physically firing; the bottom (`CAM1 ◀◀◀ CAM2`) only when cam2's are. Idle = neutral-gray dotted lines, no traveling photon — the UI signals are tied to real GPIO state via `/api/{cam}/leds`, not decorative. Both labels pulse the same cyan→white when their direction is live.
 
 ## Running Tests
 

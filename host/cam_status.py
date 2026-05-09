@@ -252,6 +252,52 @@ class CamStatusClient:
         code, response_body = res
         return code == 200 and '"success"' in response_body
 
+    def start_monocal(self, coords: tuple[int, int],
+                      speed_ms: int = 160) -> Optional[dict]:
+        """POST to /x/monocal-trigger.cgi to spawn `irlink monocal` on this cam.
+
+        coords is (x, y) — the pixel cam2 sees cam1's TX at, taken from the
+        host-side calibration.json. The CGI refuses with HTTP 409 if any
+        irlink is already running.
+
+        Returns the parsed response dict on HTTP 200 (`{ok, pid, coords,
+        speed_ms}`), or None on transport failure / 409 / 400. Caller can
+        treat None as "not started" and either resolve the conflict or
+        surface the failure to the operator."""
+        body = f"coords={coords[0]},{coords[1]}&speed={int(speed_ms)}"
+        res = self._post("/x/monocal-trigger.cgi", body)
+        if res is None:
+            return None
+        code, response_body = res
+        if code != 200:
+            return None
+        try:
+            d = json.loads(response_body)
+        except json.JSONDecodeError:
+            return None
+        return d if isinstance(d, dict) and d.get("ok") else None
+
+    def get_monocal_status(self) -> Optional[dict]:
+        """Return cam2's monocal status JSON (the `state`, `peer_pixel`, and
+        timing fields written by `irlink monocal` to /run/monocal-status.json).
+
+        Returns None on transport failure OR on the brief mid-rename window
+        (CGI returns 503 with `{"state":"transient"}`). The webui's intended
+        behavior is to keep polling — the next 1-2s tick will see a fresh
+        atomic file. Per the planning, no flock; tolerate transient."""
+        body = self._fetch("/x/monocal-status.cgi")
+        if body is None:
+            return None
+        try:
+            d = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(d, dict):
+            return None
+        # Both the "transient" and "never_run" sentinel states are valid
+        # responses — the caller distinguishes them. Don't filter here.
+        return d
+
     def get_proc_status(self) -> Optional[dict]:
         """Return process counts as `{irlink:N, daynightd:N, prudynt:N, ts_s:T}`
         or None on failure.

@@ -29,6 +29,8 @@ Centralizes all `http://<cam>/x/*.cgi` access behind one `CamStatusClient` per c
 | `get_proc_status()` | GET `/x/proc-status.cgi` | `{irlink, daynightd, prudynt}` | 4 |
 | `imp_cmd(cmd, val)` | POST `/x/json-imp.cgi` | `True`/`False` (fail-loud) | 5 |
 | `get_led_state()` | GET `/x/gpio-state.cgi` | `{ir850, ir940}` | webui |
+| `start_monocal((x,y), speed_ms=160)` | POST `/x/monocal-trigger.cgi` (cam2 only) | `{ok, pid, …}` or None | webui MONOCAL CAM1 button |
+| `get_monocal_status()` | GET `/x/monocal-status.cgi` (cam2 only) | `{state, peer_pixel, …}` (incl. `never_run`/`transient` sentinels) | webui M1..M5 polling |
 
 Read paths in `aim_assist` keep an SSH fallback (`read_grid` does HTTP-first, SSH on `None`); write paths fail loud by design — silent SSH fallback for writes risks state divergence. Use `host.cam_status.resolve_ip(host)` to turn an SSH alias (`dacam1`) into a numeric IP for `CamStatusClient(ip)`.
 

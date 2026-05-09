@@ -342,6 +342,116 @@ static void status_set(const char *state, const char *event)
 }
 
 /* ================================================================
+ *  Monocal status JSON (/run/monocal-status.json)
+ *  ----------------------------------------------------------------
+ *  Independent from /run/irlink-status.json. Written only by the
+ *  `monocal` subcommand (cam2 / requestor). Atomic via temp+rename.
+ *  Webui polls /x/monocal-status.cgi on cam2 to drive the M1..M5
+ *  step stack. Race tolerated — readers see HTTP 503 / empty body
+ *  during the brief rename window and retry.
+ * ================================================================ */
+
+#define MONOCAL_STATUS_PATH       "/run/monocal-status.json"
+#define MONOCAL_STATUS_TMP_PATH   "/run/monocal-status.json.tmp"
+
+static int64_t monocal_started_ms = 0;
+static int64_t monocal_updated_ms = 0;
+static int64_t monocal_ended_ms = 0;
+static char    monocal_state[40] = "idle";
+static int     monocal_ok = -1;   /* -1=null (running/init), 0=false, 1=true */
+static char    monocal_error[STATUS_EVENT_LEN] = "";
+static int64_t monocal_ack_recv_ms = 0;
+static int64_t monocal_hold_start_ms = 0;
+static int64_t monocal_hold_end_ms = 0;
+static int     monocal_have_peer_pixel = 0;
+static int     monocal_peer_x = 0, monocal_peer_y = 0;
+static int     monocal_peer_b = 0, monocal_peer_d = 0;
+
+static pthread_mutex_t monocal_status_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void write_monocal_status(void)
+{
+    pthread_mutex_lock(&monocal_status_mutex);
+    monocal_updated_ms = now_ms();
+
+    char peer_pixel[96];
+    if (monocal_have_peer_pixel) {
+        snprintf(peer_pixel, sizeof(peer_pixel),
+                 "{\"x\":%d,\"y\":%d,\"peak_b\":%d,\"grid_delta\":%d}",
+                 monocal_peer_x, monocal_peer_y, monocal_peer_b, monocal_peer_d);
+    } else {
+        snprintf(peer_pixel, sizeof(peer_pixel), "null");
+    }
+
+    char ok_str[8];
+    if (monocal_ok < 0)      snprintf(ok_str, sizeof(ok_str), "null");
+    else if (monocal_ok == 0) snprintf(ok_str, sizeof(ok_str), "false");
+    else                      snprintf(ok_str, sizeof(ok_str), "true");
+
+    char ended_str[32];
+    if (monocal_ended_ms == 0) snprintf(ended_str, sizeof(ended_str), "null");
+    else snprintf(ended_str, sizeof(ended_str), "%lld", (long long)monocal_ended_ms);
+
+    char buf[1024];
+    int n = snprintf(buf, sizeof(buf),
+        "{"
+        "\"schema\":1,"
+        "\"state\":\"%s\","
+        "\"started_ms\":%lld,"
+        "\"updated_ms\":%lld,"
+        "\"ended_ms\":%s,"
+        "\"ok\":%s,"
+        "\"error\":\"%s\","
+        "\"ack_received_ms\":%lld,"
+        "\"led_hold_started_ms\":%lld,"
+        "\"led_hold_ended_ms\":%lld,"
+        "\"peer_pixel\":%s,"
+        "\"speed_ms\":%d"
+        "}\n",
+        monocal_state,
+        (long long)monocal_started_ms,
+        (long long)monocal_updated_ms,
+        ended_str,
+        ok_str,
+        monocal_error,
+        (long long)monocal_ack_recv_ms,
+        (long long)monocal_hold_start_ms,
+        (long long)monocal_hold_end_ms,
+        peer_pixel,
+        symbol_ms);
+
+    if (n > 0 && n < (int)sizeof(buf)) {
+        int fd = open(MONOCAL_STATUS_TMP_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            ssize_t w = write(fd, buf, n);
+            close(fd);
+            if (w == n)
+                rename(MONOCAL_STATUS_TMP_PATH, MONOCAL_STATUS_PATH);
+        }
+    }
+    pthread_mutex_unlock(&monocal_status_mutex);
+}
+
+static void monocal_set_state(const char *state, const char *err)
+{
+    if (state) {
+        strncpy(monocal_state, state, sizeof(monocal_state) - 1);
+        monocal_state[sizeof(monocal_state) - 1] = '\0';
+    }
+    if (err) {
+        size_t i = 0;
+        for (const char *p = err; *p && i < STATUS_EVENT_LEN - 1; p++) {
+            char c = *p;
+            if (c == '"' || c == '\\') c = '_';
+            if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+            monocal_error[i++] = c;
+        }
+        monocal_error[i] = '\0';
+    }
+    write_monocal_status();
+}
+
+/* ================================================================
  *  GPIO TX
  * ================================================================ */
 
@@ -2173,6 +2283,199 @@ static void handle_cal_request(int bidi)
     cal_flow_active = 0;
 }
 
+/* ---- Monocal: cam2 holds LEDs, cam1 scans (peer_scans=1 path) ----
+   Mirrors do_cal_request_internal but with REQUESTOR=holder, not scanner.
+   CAL_REQ payload[0] bit 1 (peer_scans) tells the responder to invert its
+   role — instead of holding LEDs while we scan, the responder scans while
+   we hold LEDs. We then receive CAL_DONE with the responder's coords and
+   write /run/monocal-status.json for the laptop webui to poll.
+
+   Used by the `irlink monocal` subcommand on cam2; cam1 runs the
+   responder side via handle_monocal_request() dispatched from
+   daemon-listen / interactive_mode. */
+static int do_monocal_request(void)
+{
+    fprintf(stderr, "PROTO: monocal — sending CAL_REQ with peer_scans=1 (we hold, peer scans)\n");
+    cal_flow_active = 1;
+    monocal_started_ms = now_ms();
+    monocal_ok = -1;
+    monocal_error[0] = '\0';
+    monocal_have_peer_pixel = 0;
+    monocal_ack_recv_ms = 0;
+    monocal_hold_start_ms = 0;
+    monocal_hold_end_ms = 0;
+    monocal_ended_ms = 0;
+    monocal_set_state("monocal_req", NULL);
+
+    /* Reset split-brain timer (same hygiene as do_cal_request_internal). */
+    last_valid_frame_ms = now_ms();
+
+    int success = 0;
+    for (int attempt = 0; attempt < MAX_RETRIES && !success; attempt++) {
+        uint8_t req_payload[1] = { 0x02 };  /* bit 1 = peer_scans, bit 0 = bidi (clear) */
+        send_message(MSG_CAL_REQ, 0, req_payload, 1);
+        monocal_set_state("monocal_ack_wait", NULL);
+
+        rx_message_t reply;
+        if (wait_for_msg(MSG_CAL_ACK, &reply, ack_timeout_ms) != 0) {
+            fprintf(stderr, "PROTO: monocal CAL_ACK timeout, retry %d/%d\n",
+                    attempt + 1, MAX_RETRIES);
+            continue;
+        }
+        monocal_ack_recv_ms = now_ms();
+        fprintf(stderr, "PROTO: monocal CAL_ACK received; holding LEDs for peer scan\n");
+
+        /* Phase 1: 1.5s LED OFF — peer's baseline window. */
+        monocal_hold_start_ms = now_ms();
+        monocal_set_state("monocal_holding_off", NULL);
+        usleep(1500000);
+
+        /* Phase 2: 12s LED steady ON — peer's grid + ROI sweep. */
+        monocal_set_state("monocal_holding_on", NULL);
+        fprintf(stderr, "PROTO: monocal — holding LED ON 12s for peer scan...\n");
+        pthread_mutex_lock(&tx_mutex);
+        tx_active = 1;
+        gpio_set(1);
+        for (int i = 0; i < 120 && running; i++)
+            usleep(100000);  /* 120 * 100ms = 12s, polling running */
+        gpio_set(0);
+        tx_active = 0;
+        pthread_mutex_unlock(&tx_mutex);
+        monocal_hold_end_ms = now_ms();
+
+        /* Phase 3: wait for CAL_DONE (peer scan ~12s + CAL_DONE TX ~30s @ 160ms). */
+        monocal_set_state("monocal_awaiting_done", NULL);
+        rx_message_t done_msg;
+        if (wait_for_msg(MSG_CAL_DONE, &done_msg, 90000) != 0) {
+            fprintf(stderr, "PROTO: monocal CAL_DONE timeout (90s)\n");
+            monocal_ended_ms = now_ms();
+            monocal_ok = 0;
+            monocal_set_state("monocal_failed", "CAL_DONE timeout (90s)");
+            cal_flow_active = 0;
+            return -1;
+        }
+
+        if (done_msg.data_len >= 6) {
+            int x = (done_msg.data[0] << 8) | done_msg.data[1];
+            int y = (done_msg.data[2] << 8) | done_msg.data[3];
+            int peak_b = done_msg.data[4];
+            int delta = done_msg.data[5];
+            fprintf(stderr, "PROTO: monocal complete → peer x=%d y=%d b=%d d=%d\n",
+                    x, y, peak_b, delta);
+            monocal_peer_x = x;
+            monocal_peer_y = y;
+            monocal_peer_b = peak_b;
+            monocal_peer_d = delta;
+            monocal_have_peer_pixel = 1;
+            /* Reuse status_peak_* so /x/cal-status.cgi reflects monocal too. */
+            status_peak_x = x;
+            status_peak_y = y;
+            status_peak_brightness = peak_b;
+            status_peak_delta = delta;
+            /* Same parseable line as bicall's responder path uses. */
+            printf("PEER-CAL: %d %d %d %d\n", x, y, peak_b, delta);
+            fflush(stdout);
+            monocal_ended_ms = now_ms();
+            monocal_ok = 1;
+            monocal_set_state("monocal_done", NULL);
+            success = 1;
+        } else {
+            fprintf(stderr, "PROTO: monocal — peer returned empty CAL_DONE (scan failed)\n");
+            monocal_ended_ms = now_ms();
+            monocal_ok = 0;
+            monocal_set_state("monocal_failed", "peer scan failed (empty CAL_DONE)");
+            cal_flow_active = 0;
+            return -1;
+        }
+    }
+
+    cal_flow_active = 0;
+    if (!success) {
+        monocal_ended_ms = now_ms();
+        monocal_ok = 0;
+        monocal_set_state("monocal_failed", "CAL_ACK timeout after retries");
+        return -1;
+    }
+    return 0;
+}
+
+/* ---- Handle incoming monocal request (peer_scans=1) ----
+   Inverse of handle_cal_request: we are the SCANNER, peer is the HOLDER.
+   Timing alignment with peer's hold (1.5s OFF + 12s ON, total 13.5s starting
+   ~50ms after our CAL_ACK TX completes):
+
+     0..~12s   we run do_calibrate_pixel_to() — its internal AE freeze +
+               1s baseline + 4s grid scan + ~6s ROI sweep happens during
+               peer's LED hold window
+     ~12..15s  SYNC_BARRIER — wait until cal_ack_sent_at + PEER_HOLD_MS
+               + DRAIN_MARGIN_MS so our CAL_DONE preamble doesn't collide
+               with peer's tx_active=1 LED-on window. This is the explicit
+               fix for the bicall phase-2 "scanner finishes before holder
+               drops LEDs" pitfall.
+     15s+      send CAL_DONE with 6-byte coord payload */
+static void handle_monocal_request(void)
+{
+    fprintf(stderr, "PROTO: peer requested monocal (we scan, peer holds)\n");
+    cal_flow_active = 1;
+    status_cal_phase = 0;  /* not phase 1 or 2 of bicall */
+    status_cal_bidi = 0;
+    status_set("monocal_resp_ack", "monocal — sending CAL_ACK as scanner");
+    last_valid_frame_ms = now_ms();
+
+    send_message(MSG_CAL_ACK, 0, NULL, 0);
+    int64_t cal_ack_sent_at = now_ms();
+
+    /* Run the pixel scan during peer's LED hold window. do_calibrate_pixel_to
+       handles its own AE freeze and writes /opt/etc/calibration.json on
+       success. Takes ~12s. */
+    status_set("monocal_resp_scan", "scanning peer's LED hold");
+    pixel_cal_result_t r;
+    int rc = do_calibrate_pixel_to(&r);
+
+    /* SYNC_BARRIER: do not TX CAL_DONE until peer's LED hold has fully ended
+       plus a 1.5s drain margin. peer's hold = 1.5s OFF + 12s ON = 13500ms,
+       starting ~50ms after our CAL_ACK TX completes. We wait until
+       cal_ack_sent_at + 15000ms regardless of when our scan finished. */
+    const int64_t PEER_HOLD_MS = 13500;
+    const int64_t DRAIN_MARGIN_MS = 1500;
+    int64_t wait_until = cal_ack_sent_at + PEER_HOLD_MS + DRAIN_MARGIN_MS;
+    while (now_ms() < wait_until && running) {
+        int64_t remaining = wait_until - now_ms();
+        if (remaining > 200000) remaining = 200000;  /* defensive cap */
+        usleep((useconds_t)(remaining * 1000));
+    }
+
+    if (rc == 0) {
+        uint8_t payload[6];
+        payload[0] = (uint8_t)((r.pixel_x >> 8) & 0xFF);
+        payload[1] = (uint8_t)(r.pixel_x & 0xFF);
+        payload[2] = (uint8_t)((r.pixel_y >> 8) & 0xFF);
+        payload[3] = (uint8_t)(r.pixel_y & 0xFF);
+        payload[4] = r.peak_b;
+        payload[5] = (uint8_t)(r.grid_delta > 255 ? 255
+                               : (r.grid_delta < 0 ? 0 : r.grid_delta));
+        fprintf(stderr, "PROTO: monocal scan OK, sending CAL_DONE "
+                        "(x=%d y=%d b=%d d=%d)\n",
+                r.pixel_x, r.pixel_y, r.peak_b, r.grid_delta);
+        status_peak_x = r.pixel_x;
+        status_peak_y = r.pixel_y;
+        status_peak_brightness = r.peak_b;
+        status_peak_delta = r.grid_delta;
+        status_peak_block = r.block_idx;
+        status_set("monocal_resp_done", "scan complete; sending CAL_DONE");
+        printf("PIXEL: %d %d %d %d %d\n",
+               r.pixel_x, r.pixel_y, (int)r.peak_b, r.grid_delta, r.block_idx);
+        fflush(stdout);
+        send_message(MSG_CAL_DONE, 0, payload, 6);
+    } else {
+        fprintf(stderr, "PROTO: monocal scan failed, sending empty CAL_DONE\n");
+        status_set("monocal_resp_failed", "pixel scan failed");
+        send_message(MSG_CAL_DONE, 0, NULL, 0);
+    }
+
+    cal_flow_active = 0;
+}
+
 /* ================================================================
  *  Interactive mode: RX thread + protocol event loop
  * ================================================================ */
@@ -2270,12 +2573,18 @@ static int interactive_mode(int is_listener)
         pthread_mutex_lock(&rx_mutex);
         if (rx_msg.valid) {
             if (rx_msg.msg_type == MSG_CAL_REQ) {
-                /* Extract bidi flag before releasing the mutex — rx_thread
-                   might overwrite rx_msg.data once we let go. */
-                int bidi = (rx_msg.data_len >= 1 && rx_msg.data[0] == 1) ? 1 : 0;
+                /* Extract flags before releasing the mutex — rx_thread might
+                   overwrite rx_msg.data once we let go. payload[0] flags:
+                   bit 0 = bidi, bit 1 = peer_scans (mutually exclusive). */
+                int flags = (rx_msg.data_len >= 1) ? rx_msg.data[0] : 0;
+                int bidi       = !!(flags & 0x01);
+                int peer_scans = !!(flags & 0x02);
                 rx_msg.valid = 0;
                 pthread_mutex_unlock(&rx_mutex);
-                handle_cal_request(bidi);
+                if (peer_scans)
+                    handle_monocal_request();
+                else
+                    handle_cal_request(bidi);
             } else {
                 rx_msg.valid = 0;
                 pthread_mutex_unlock(&rx_mutex);
@@ -2327,8 +2636,14 @@ static int daemon_mode(int is_listener)
                daemon just needs to handle the heavier protocol cases. */
             switch (msg.msg_type) {
             case MSG_CAL_REQ: {
-                int bidi = (msg.data_len >= 1 && msg.data[0] == 1) ? 1 : 0;
-                handle_cal_request(bidi);
+                /* payload[0] flags: bit 0 = bidi, bit 1 = peer_scans. */
+                int flags = (msg.data_len >= 1) ? msg.data[0] : 0;
+                int bidi       = !!(flags & 0x01);
+                int peer_scans = !!(flags & 0x02);
+                if (peer_scans)
+                    handle_monocal_request();
+                else
+                    handle_cal_request(bidi);
                 break;
             }
             case MSG_SYN:
@@ -2368,6 +2683,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "  connect [--block N] [--speed MS]    — initiate connection\n");
         fprintf(stderr, "  daemon-listen [--block N] [--speed MS] — listen + auto-respond\n");
         fprintf(stderr, "  daemon-connect [--block N] [--speed MS] — connect + auto-respond\n");
+        fprintf(stderr, "  monocal --pixel X,Y [--speed MS] — peer scans, we hold LEDs (writes /run/monocal-status.json)\n");
         fprintf(stderr, "  send <text> [--block N] [--speed MS]  — connect, send, exit\n");
         fprintf(stderr, "  calibrate              — manual ROI calibration\n");
         fprintf(stderr, "\nOptions:\n");
@@ -2486,6 +2802,51 @@ int main(int argc, char *argv[])
         int ret = daemon_mode(0);
         set_ae_freeze(0);
         return ret;
+    }
+
+    if (strcmp(cmd, "monocal") == 0) {
+        /* One-shot non-interactive: connect, send CAL_REQ(peer_scans=1), hold
+           LEDs while peer scans, receive CAL_DONE, write monocal-status.json,
+           exit. Spawned by /x/monocal-trigger.cgi on cam2. */
+        if (pixel_x < 0 || pixel_y < 0) {
+            fprintf(stderr, "irlink monocal: --pixel X,Y is required\n");
+            return 1;
+        }
+
+        monocal_started_ms = now_ms();
+        monocal_set_state("starting", NULL);
+
+        set_ae_freeze(1);
+        usleep(1000000); /* 1s AE settle for RX of CAL_ACK + CAL_DONE */
+
+        pthread_t rx_tid;
+        if (pthread_create(&rx_tid, NULL, rx_thread, NULL) != 0) {
+            perror("pthread_create");
+            monocal_ended_ms = now_ms();
+            monocal_ok = 0;
+            monocal_set_state("monocal_failed", "rx_thread create failed");
+            set_ae_freeze(0);
+            return 1;
+        }
+
+        monocal_set_state("handshaking", NULL);
+        if (do_connect() != 0) {
+            fprintf(stderr, "irlink monocal: handshake failed\n");
+            monocal_ended_ms = now_ms();
+            monocal_ok = 0;
+            monocal_set_state("monocal_failed", "handshake failed");
+            running = 0;
+            pthread_join(rx_tid, NULL);
+            set_ae_freeze(0);
+            return 1;
+        }
+
+        int rc = do_monocal_request();
+
+        running = 0;
+        pthread_join(rx_tid, NULL);
+        set_ae_freeze(0);
+        return rc == 0 ? 0 : 1;
     }
 
     if (strcmp(cmd, "send") == 0) {

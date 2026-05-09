@@ -12,7 +12,7 @@ Related: `../protocol/CLAUDE.md` for frame/app-layer/FEC details; `../host/CLAUD
 | SYN_ACK | 0x02 | Acknowledge connection |
 | ACK | 0x03 | Acknowledge data (with seq number) |
 | DATA | 0x04 | Payload data |
-| CAL_REQ | 0x05 | Request calibration. 1-byte payload: `bidi` flag (1 = peer should swap roles + scan back after this cycle) |
+| CAL_REQ | 0x05 | Request calibration. 1-byte payload, bit-flagged: bit 0 = `bidi` (responder swaps roles + scans back), bit 1 = `peer_scans` (responder is the scanner — we hold LEDs). Mutually exclusive. |
 | CAL_ACK | 0x06 | Acknowledge calibration |
 | CAL_DONE | 0x07 | Calibration complete. 6-byte payload: `[x_hi, x_lo, y_hi, y_lo, peak_b, grid_delta]` (TX pixel coords as seen by the scanner) |
 | PING | 0x08 | Measure RTT |
@@ -23,7 +23,7 @@ After CAL_DONE, the scanner side also ships an APP_CAL_VISUAL (`0x0E`) inside a 
 
 Frame payload format: `[msg_type] [seq_num] [data...]`
 
-Subcommands: `calibrate`, `calibrate-pixel`, `listen`, `connect`, `daemon-listen`, `daemon-connect`, `send`, `tx`, `tx-symbols`. Interactive cmds inside `connect`/`listen`: `send`, `send-hex`, `ping`, `cal`, `bicall`, `rate <ms>`, `stats`, `quit`.
+Subcommands: `calibrate`, `calibrate-pixel`, `listen`, `connect`, `daemon-listen`, `daemon-connect`, `monocal`, `send`, `tx`, `tx-symbols`. Interactive cmds inside `connect`/`listen`: `send`, `send-hex`, `ping`, `cal`, `bicall`, `rate <ms>`, `stats`, `quit`.
 
 Stdout contract (line-buffered via `fflush` after each line):
 - `MSG-HEX:<hex>` — binary-safe DATA payload (use this in orchestrators)
@@ -35,6 +35,7 @@ Stdout contract (line-buffered via `fflush` after each line):
 - `PIXEL: x y peak_b grid_delta block_idx` — emitted by the scanner side after a `calibrate-pixel`, `cal`, or `bicall` (its own view of the peer's TX)
 - `PEER-CAL: x y peak_b grid_delta` — emitted by the holder side after receiving CAL_DONE (the peer's view of US)
 - `BICAL: phase 1 done`, `BICAL: got reverse CAL_REQ`, `BICAL: bidirectional cal complete` — bicall progress markers
+- `PROTO: monocal — …` and `PROTO: peer requested monocal …` — monocal progress markers (REQUESTOR + RESPONDER sides). monocal also writes a structured JSON to `/run/monocal-status.json` for webui polling — see Monocal section below.
 
 ## Adaptive Symbol Rate
 
@@ -43,6 +44,37 @@ irlink self-tunes symbol rate within a session: start at `--speed N`, probe fast
 Rate sync uses `MSG_RATE_CHANGE`: sender transmits `[rate_hi, rate_lo]` at OLD rate; peer auto-ACKs at OLD rate then switches. `ack_timeout_ms` recomputes on every rate change.
 
 Split-brain recovery: if `rx_thread` sees no valid frame for `2 * ack_timeout_ms` (and at least one frame was decoded previously), force slowest rung. Peer hits this too — both reconverge at 200ms. `last_valid_frame_ms > 0` guard prevents firing during startup.
+
+## Monocal — autonomous-cam1 calibration over light
+
+Mirror of `cal`/`bicall` with **inverted roles**: REQUESTOR holds LEDs, RESPONDER scans. Designed for the `[laptop]→[cam2]→light→[cam1]` deployment topology where cam1 is autonomous (no IP path from laptop) and only needs to refresh its own `/opt/etc/calibration.json`.
+
+**Trigger paths:**
+```bash
+# CGI-driven (preferred — used by webui MONOCAL CAM1 button):
+curl -X POST -d 'coords=243,177' http://dacam2/x/monocal-trigger.cgi
+# direct subcommand on cam2 (manual debug):
+ssh dacam2 "/opt/bin/irlink monocal --pixel 243,177 --speed 160"
+```
+
+**Protocol:** new `peer_scans` flag (CAL_REQ payload[0] bit 1). When set, the responder runs `do_calibrate_pixel_to()` instead of holding LEDs; the requestor holds LEDs (1.5s OFF + 12s ON, same pattern as `handle_cal_request`). One round trip:
+1. cam2 sends CAL_REQ(0x02) → cam1 sends CAL_ACK
+2. cam2 holds LEDs OFF 1.5s + ON 12s
+3. cam1 scans during the LED hold (writes its own `/opt/etc/calibration.json`)
+4. cam1 sends CAL_DONE with 6-byte coord payload
+5. cam2 receives, logs `PEER-CAL: x y b d`, writes `/run/monocal-status.json`, exits
+
+**SYNC_BARRIER (timing fix):** `handle_monocal_request` waits until `cal_ack_sent_at + PEER_HOLD_MS (13500ms) + DRAIN_MARGIN_MS (1500ms)` before TXing CAL_DONE. This is the explicit fix for the bicall phase-2 pitfall where the scanner finishes before the holder's LED-on window ends and TXes into the holder's `tx_active=1` window. Total cycle ~50s at 160ms/sym (vs bicall's ~3.5 min).
+
+**Status JSON (`/run/monocal-status.json`):** atomic write at every state transition. State machine on cam2:
+```
+spawning → starting → handshaking → monocal_req → monocal_ack_wait
+  → monocal_holding_off → monocal_holding_on → monocal_awaiting_done
+  → monocal_done | monocal_failed
+```
+Fields: `state`, `started_ms`, `updated_ms`, `ended_ms`, `ok`, `error`, `ack_received_ms`, `led_hold_started_ms`, `led_hold_ended_ms`, `peer_pixel: {x, y, peak_b, grid_delta}`, `speed_ms`. The webui polls cam2's `/x/monocal-status.cgi` for these and merges with cam1's `/x/cal-status.cgi` for a two-cam view.
+
+**Backwards compat:** old peers see CAL_REQ payload `0x02` and check `data[0] == 1` for bidi → bidi=0 → fall through to `handle_cal_request(0)` (regular cal — both sides try to hold LEDs, neither scans). Deploy the new binary to BOTH cams before using monocal.
 
 ## Usage
 
@@ -73,6 +105,11 @@ irlink connect --pixel 385,178 --speed 120
 
 # Adjust ROI size (default 15, range 3-31)
 irlink listen --pixel 385,178 --roi-size 21 --speed 120
+
+# Monocal — autonomous-cam1 cal: cam2 holds LEDs, cam1 scans, ~50s wall.
+# cam1 must be running daemon-listen (rc.local autostarts it). Writes
+# /run/monocal-status.json on cam2; updates cam1's /opt/etc/calibration.json.
+irlink monocal --pixel 243,177 --speed 160
 ```
 
 ## AE Freeze During Communication
@@ -98,7 +135,12 @@ ssh dacam1 "/opt/bin/irlink calibrate-pixel"
 # stdout (cam1): PIXEL: 315 142 235 14 89  (x y peak_b grid_delta block_idx)
 ```
 
-**2. Over-link cal (`cal` and `bicall` interactive cmds).** The CAL_REQ/CAL_ACK/CAL_DONE protocol triggers `do_calibrate_pixel` on the requestor side; CAL_DONE carries the result. `cal` does one direction; `bicall` does both via a role-swap (CAL_REQ payload bit 0 = `bidi`). Validated end-to-end at 160ms/sym ~3.5 min total. Both `/opt/etc/calibration.json` files end up fresh.
+**2. Over-link cal (`cal` / `bicall` interactive cmds, `monocal` subcommand).** The CAL_REQ/CAL_ACK/CAL_DONE protocol triggers `do_calibrate_pixel` on whichever side is the scanner; CAL_DONE carries the result.
+- `cal` — one-way, requestor scans, responder holds (~80s @ 160ms/sym)
+- `bicall` — both directions via role-swap (`bidi` flag), both `/opt/etc/calibration.json` files refresh from one trigger (~3.5 min)
+- `monocal` — one-way, **responder scans, requestor holds** (`peer_scans` flag) — for the autonomous-cam1 case where laptop only reaches cam2; only cam1's `/opt/etc/calibration.json` updates (~50s)
+
+See "Monocal" section above for the full state machine and CGI integration.
 
 **3. Grid-only legacy (`calibrate`).** Block-only, no pixel refinement. Kept for backwards compatibility; prefer `calibrate-pixel`.
 
@@ -131,7 +173,13 @@ scp -O irlink/cgi/brightness-grid.cgi  root@dacamN:/var/www/x/
 scp -O irlink/cgi/ae-freeze.cgi        root@dacamN:/var/www/x/
 scp -O irlink/cgi/proc-status.cgi      root@dacamN:/var/www/x/
 scp -O irlink/cgi/gpio-state.cgi       root@dacamN:/var/www/x/
+# Monocal CGIs go to cam2 ONLY (cam2 is requestor / laptop-tethered;
+# cam1 is responder, no trigger CGI needed):
+scp -O irlink/cgi/monocal-trigger.cgi  root@dacam2:/var/www/x/
+scp -O irlink/cgi/monocal-status.cgi   root@dacam2:/var/www/x/
 ssh dacamN "chmod 755 /var/www/x/cal-status.cgi /var/www/x/brightness-grid.cgi /var/www/x/ae-freeze.cgi /var/www/x/proc-status.cgi /var/www/x/gpio-state.cgi"
+ssh dacam2 "chmod 755 /var/www/x/monocal-trigger.cgi /var/www/x/monocal-status.cgi"
+# `make deploy` (Makefile target) ships all of the above in one command.
 # IMPORTANT: must be 755, not just `chmod +x`. The default umask yields 077,
 # so `chmod +x` produces mode 700 — uhttpd then serves the CGI as 403 Forbidden.
 ```
@@ -145,6 +193,8 @@ ssh dacamN "chmod 755 /var/www/x/cal-status.cgi /var/www/x/brightness-grid.cgi /
 | `/x/proc-status.cgi` | `pgrep irlink \| wc -l`, `pgrep daynightd \| wc -l`, `pidof prudynt-patched` → JSON `{irlink:N, daynightd:N, prudynt:N, ts_s:T}` | `cam_status.CamStatusClient.get_proc_status()` → `aim_assist.preflight()`, `aim_assist.restart_cam1_daemon()` |
 | `/x/json-imp.cgi` POST `{"cmd":<C>,"val":<V>}` | Stock Thingino IMP control (daynight, color, ircut, ir850, ir940) | `cam_status.CamStatusClient.imp_cmd()` → `aim_assist.turn_leds_on/force_leds_off`, `cal_procedure.leds_on_hold/_off`, `cam_setup.sh:imp_cmd` |
 | `/x/gpio-state.cgi` | `gpio read 47` (ir850) + `gpio read 49` (ir940) → JSON `{ir850, ir940}` | `cam_status.CamStatusClient.get_led_state()` → `webui` real-time IR LED reflection |
+| `/x/monocal-trigger.cgi` POST `coords=X,Y[&speed=N]` (cam2 only) | spawns `irlink monocal --pixel X,Y --speed N` via `setsid nohup`; refuses 409 if any `irlink` already running; pre-writes `/run/monocal-status.json` so the first poll sees `state=spawning` | `cam_status.CamStatusClient.start_monocal()` → `webui` MONOCAL CAM1 button |
+| `/x/monocal-status.cgi` (cam2 only) | `cat /run/monocal-status.json`; HTTP 503 + `{state: transient}` on mid-rename empty file; HTTP 200 + `{state: never_run}` if file missing | `cam_status.CamStatusClient.get_monocal_status()` → `webui` M1..M5 step polling |
 
 All endpoints share the cookie auth from `/x/login.cgi`; the laptop client logs in once and replays the cookie.
 
@@ -177,3 +227,6 @@ All endpoints share the cookie auth from `/x/login.cgi`; the laptop client logs 
 - **Bicall split-brain trip during long CAL_DONE wait.** When the responder's wait_for_msg(CAL_DONE) takes longer than `2 × ack_timeout_ms` (e.g. CAL_DONE was lost or scanner's pixel cal couldn't decode our TX), the responder hits split-brain recovery and force-drops to the slowest rate rung (200 ms) — but the peer is still at 160 ms. Phase 2 then deadlocks at CAL_ACK timeout because the rates desynced silently. Fix is to either (a) suppress split-brain during CAL_REQ flows, or (b) require split-brain to send a RATE_CHANGE before changing locally. **Open issue.**
 - **Bicall phase 2 timing margin is thin.** Holder's LED hold = 1.5 s OFF + 12 s ON = 13.5 s total. Scanner's `do_calibrate_pixel_to` takes ~12 s (1 s baseline + 4 s grid + ~6 s ROI sweep + edge expansion). If the scanner's scan finishes more than ~1.5 s before the holder's LED hold ends, the scanner's CAL_DONE TX starts during the holder's `tx_active=1` window and the holder misses the preamble (1.28 s @ 160 ms). Phase 1 always works because the responder's wait window starts when its LED hold ends, aligned with the scanner's TX start. Phase 2 is more fragile — if you lengthen the pixel sweep (e.g., add stride-1 sub-block refinement), bump the holder's hold to keep the margin.
 - **AE freeze stuck at 1 after `killall -9 irlink`.** The `-9` skips irlink's SIGTERM cleanup that writes `0` to `/run/prudynt/ae_freeze`. Subsequent operations (e.g. `cal_procedure.py`) silently fail because exposure is still locked to whatever it was when irlink was killed. `cam_setup.sh` now detects and resets this; manual fix is `echo 0 > /run/prudynt/ae_freeze`. Prefer `kill` (SIGTERM) over `kill -9` so cleanup fires.
+- **busybox `date +%s%3N` doesn't expand `%N`** — emits seconds only (Thingino busybox 1.37). The `monocal-trigger.cgi` pre-write originally had `started_ms:$(date +%s%3N)` and produced bogus `started_ms:1776061326` (seconds, not ms). Fix: `NOW_MS=$(date +%s)000` for one-second-granularity timestamps. The `irlink monocal` binary's first `write_monocal_status()` overwrites within ~hundreds of ms with real `clock_gettime` ms, so the bad CGI pre-write only shows for one webui poll tick.
+- **Monocal CAL_REQ flag dispatch must be bit-checked, not equality-checked.** Old code used `int bidi = (data[0] == 1) ? 1 : 0` — that catches bidi but interprets `0x02` (peer_scans) as bidi=0 → falls through to `handle_cal_request(0)` (regular cal — both sides hold LEDs, neither scans). Fix: `int flags = data[0]; int bidi = !!(flags & 0x01); int peer_scans = !!(flags & 0x02);`. Both `interactive_mode` and `daemon_mode` dispatch sites updated. **Cam1 must run the new binary** before any monocal trigger from cam2; old cam1 silently degrades to a no-op cycle.
+- **Monocal SYNC_BARRIER vs bicall race.** `handle_monocal_request` waits until `cal_ack_sent_at + 13500ms (peer hold) + 1500ms (drain margin)` before TXing CAL_DONE. This guarantees the responder's CAL_DONE preamble doesn't collide with the requestor's `tx_active=1` LED-on window — the explicit fix for the existing "Bicall phase 2 timing margin is thin" pitfall above. If you tune the requestor's hold duration in `do_monocal_request`, change `PEER_HOLD_MS` in `handle_monocal_request` to match.

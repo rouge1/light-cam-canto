@@ -95,8 +95,31 @@ cmd_status() {
 
 start_bg() {
   # start_bg <name> <pidfile> <logfile> <workdir> <cmd...>
+  #
+  # Spawns CMD detached, writes the actual python PID (not a launcher's) to
+  # pidfile. We can't rely on `nohup CMD &; echo $!` because coreutils-on-Linux
+  # nohup forks for tty/stderr handling, leaving $! at the nohup wrapper PID
+  # (one less than the real python). Bash's `( ... ) &` adds another fork on
+  # top. We saw stop fail to kill anything because of this.
+  #
+  # Robust pattern: have the soon-to-be-python process write its OWN $$ before
+  # exec'ing the real command. exec preserves PID across image replacement, so
+  # the PID written equals the python PID.
   local name="$1" pidfile="$2" logfile="$3" workdir="$4"; shift 4
-  ( cd "$workdir" && nohup "$@" >>"$logfile" 2>&1 < /dev/null & echo $! >"$pidfile" )
+  nohup bash -c '
+    cd "$1" || exit 1
+    pidfile="$2"
+    logfile="$3"
+    shift 3
+    # Final redirections inside the wrapper so they apply to the exec'\''d
+    # process directly. /dev/null on stdin guards against SIGTTIN/SIGTTOU.
+    exec >>"$logfile" 2>&1 </dev/null
+    # Write our PID (= python'\''s PID after exec) to the pidfile.
+    echo $$ >"$pidfile"
+    # Replace ourselves with the target command. PID is preserved.
+    exec "$@"
+  ' _ "$workdir" "$pidfile" "$logfile" "$@" </dev/null >/dev/null 2>&1 &
+  disown
 }
 
 cmd_start() {

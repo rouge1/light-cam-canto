@@ -41,10 +41,11 @@ An experimental system that turns Wyze V3 security cameras into IR Li-Fi transce
 | **Adaptive symbol rate (on-camera)** | 2–5 bps self-tuning | **Working** (`MSG_RATE_CHANGE` 0x0A; probe-up after 5 ACKs, fallback-down after 3 retries, split-brain recovery at 2×ack_timeout; initial rate picked from calibration Δ, clamped ≥160ms for on-camera RX) |
 | **On-camera pixel cal (`irlink calibrate-pixel`)** | ~12 s, 1.4 px from laptop ground truth | **Working** (grid coarse → 6×6 stride-5 ROI sweep + edge-peak auto-expansion; writes `/opt/etc/calibration.json` JFFS2-persistent — no laptop RTSP needed) |
 | **Bidirectional cal over light (`bicall`)** | full bidi cal in ~3.5 min @ 160 ms/sym | **Working** (single trigger, role-swaps via `bidi` flag in CAL_REQ payload; both `/opt/etc/calibration.json` files refresh from one cmd) |
+| **Monocal — one-way over-light cal (`irlink monocal`)** | ~50 s @ 160 ms/sym, single-cam refresh | **Working** (CAL_REQ `peer_scans` flag inverts roles — cam2 holds LEDs, cam1 scans; only cam1's `/opt/etc/calibration.json` updates; CGI-driven via cam2's `/x/monocal-trigger.cgi`, zero SSH from laptop. SYNC_BARRIER fixes the bicall phase-2 timing race. For autonomous-cam1 deployment) |
 | **Autonomous cam1 (rc.local autostart)** | — | **Working** (cam1 boots → reads saved `tx_pixel` → starts `irlink daemon-listen` automatically; verified by physical power-cycle test) |
 | **Aim-assist tool (`host/aim_assist.py`)** | live ★/◆/· feedback | **Working** (laptop polls cam2's `brightness_grid` 4× / s while cam1 holds LEDs; Enter triggers `bicall`) |
 | **SSH→Web migration (phases 1-5)** | ~3.2× faster reads · zero new dropbear children at 4 Hz | **Working** (5 small CGIs in `irlink/cgi/`; all read/toggle paths in `aim_assist` + `cam_setup.sh` proxied through `host/cam_status.py:CamStatusClient`. Phase 6 process-control writes deferred — see plan in /home/user/.claude/plans/) |
-| **Live-status webpage (`webui/`)** | 8-bit dashboard · one-click cal | **Working** (`webui/server.py` proxies `/api/*` to camera CGIs; pixel-art Wyze V3s reflect real GPIO LED state; cal sequence push-stack + embedded calibration viewer) |
+| **Live-status webpage (`webui/`)** | 8-bit dashboard · two-button cal | **Working** (`webui/server.py` proxies `/api/*` to camera CGIs; pixel-art Wyze V3s reflect real GPIO LED state; **▶ RUN CAL SEQUENCE** drives `cal_procedure` end-to-end · **▶ MONOCAL CAM1** drives over-light cal · embedded calibration viewer iframe) |
 
 ## Requirements
 
@@ -116,13 +117,18 @@ python -m host.aim_assist                      # live aim feedback; Enter trigge
 #    Both /opt/etc/calibration.json files refresh from one cmd over light. cam1
 #    never needs an SSH session in production.
 
-# 8. Live-status webpage — 8-bit dashboard with one-click RUN CAL SEQUENCE
-#    First-time: deploy CGIs to both cams (mode 755 — see CLAUDE.md gotchas)
-scp -O irlink/cgi/*.cgi root@dacam1:/var/www/x/
-scp -O irlink/cgi/*.cgi root@dacam2:/var/www/x/
-ssh dacam1 "chmod 755 /var/www/x/*.cgi"
-ssh dacam2 "chmod 755 /var/www/x/*.cgi"
-#    Then run two servers (separate terminals or backgrounded):
+# 7b. Monocal — once cam1 is deployed and only reachable via light, only cam1's
+#     calibration needs refreshing (cam2's is laptop-cal'd via cal_procedure).
+#     Zero SSH from laptop — entirely CGI-driven over HTTP.
+curl -X POST -d '' http://127.0.0.1:8765/api/cal/monocal           # via webui API
+# or click ▶ MONOCAL CAM1 in the webpage; ~50s wall, M1..M5 step stack tracks state.
+
+# 8. Live-status webpage — 8-bit dashboard with two big action buttons
+#    (RUN CAL SEQUENCE = laptop-driven · MONOCAL CAM1 = over-light)
+#    First-time: `make deploy` ships irlink + ALL CGIs to both cams (mode 755
+#    enforced; monocal CGIs go to cam2 only):
+cd irlink && make deploy
+#    Then run two servers (separate terminals or use ./webui.sh start):
 cd photos && python -m http.server 8889 &      # iframe target (cal viewer)
 python -m webui.server                          # live status @ 127.0.0.1:8765
 #    Open http://127.0.0.1:8765/ — Wyze V3 pixel art reflects real GPIO state.

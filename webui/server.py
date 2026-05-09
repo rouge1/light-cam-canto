@@ -41,6 +41,29 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 WEBUI_DIR = os.path.dirname(os.path.abspath(__file__))
 
+CALIBRATION_JSON_PATH = os.path.join(REPO_ROOT, "host", "calibration.json")
+
+
+def _read_cam2_sees_cam1_pixel() -> tuple[int, int] | None:
+    """Pull cam2's pixel for cam1's TX out of host/calibration.json.
+
+    Monocal needs this as cam2's --pixel arg so cam2's RX can decode cam1's
+    CAL_ACK + CAL_DONE over light. Returns None if the file is missing or
+    the field isn't there (operator must run cal_procedure first)."""
+    try:
+        with open(CALIBRATION_JSON_PATH) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    section = data.get("cam2_sees_cam1") or {}
+    pixel = section.get("tx_pixel")
+    if not (isinstance(pixel, list) and len(pixel) == 2):
+        return None
+    try:
+        return int(pixel[0]), int(pixel[1])
+    except (TypeError, ValueError):
+        return None
+
 CAM_HOSTS = {"cam1": "dacam1", "cam2": "dacam2"}
 CLIENTS: dict[str, CamStatusClient] = {}
 
@@ -192,6 +215,19 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/cal/status":
             self._send_json(200, _cal_snapshot())
             return
+        # /api/cal/monocal-status — merge cam2 monocal status + cam1 cal status.
+        # cam1's view drops to {} once cam1 is offline-to-IP after deploy;
+        # cam2's monocal-status carries the authoritative result either way.
+        if path == "/api/cal/monocal-status":
+            cam2 = self._client_for("cam2")
+            cam1 = self._client_for("cam1")
+            cam2_status = cam2.get_monocal_status() if cam2 else None
+            cam1_status = cam1.get() if cam1 else None
+            self._send_json(200, {
+                "cam2": cam2_status or {"state": "transient"},
+                "cam1": cam1_status or {},
+            })
+            return
         # /api/{cam}/{op}
         parts = path.strip("/").split("/")
         if len(parts) != 3:
@@ -254,6 +290,43 @@ class Handler(SimpleHTTPRequestHandler):
             t = threading.Thread(target=_cal_run, daemon=True)
             t.start()
             self._send_json(200, {"ok": True})
+            return
+        # /api/cal/monocal — trigger over-light cal of cam1 (cam2 holds, cam1 scans).
+        # All work happens on cam2 via /x/monocal-trigger.cgi; the laptop just
+        # reads cam2's pixel from calibration.json and POSTs the CGI.
+        if path == "/api/cal/monocal":
+            cam2 = self._client_for("cam2")
+            if cam2 is None:
+                self._send_json(503, {"ok": False, "error": "cam2 not initialised"})
+                return
+            body = self._read_body()
+            params = dict(urllib.parse.parse_qsl(body))
+            coords_str = params.get("coords")
+            if coords_str:
+                try:
+                    cx, cy = (int(p) for p in coords_str.split(",", 1))
+                except (ValueError, TypeError):
+                    self._send_json(400, {"ok": False,
+                                          "error": "coords must be X,Y"})
+                    return
+                coords = (cx, cy)
+            else:
+                coords = _read_cam2_sees_cam1_pixel()
+                if coords is None:
+                    self._send_json(400, {"ok": False,
+                        "error": "no coords; run cal_procedure first or pass coords=X,Y"})
+                    return
+            try:
+                speed_ms = int(params.get("speed_ms", "160"))
+            except (ValueError, TypeError):
+                speed_ms = 160
+            result = cam2.start_monocal(coords, speed_ms=speed_ms)
+            if result is None:
+                self._send_json(409, {"ok": False,
+                    "error": "monocal trigger refused (irlink already running on cam2?)"})
+                return
+            self._send_json(200, {"ok": True, "coords": list(coords),
+                                  "speed_ms": speed_ms, "trigger": result})
             return
         parts = path.strip("/").split("/")
         if len(parts) != 3:

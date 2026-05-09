@@ -69,6 +69,7 @@ killall daynightd   # Prevent auto-switching back
 | FEC-wrapped RX (host) | pixel_rx --decoder resync-fec | ~3.3 bps @ 80ms | RS(15,11), erasure-aware, decodes 82-char at Δ≈95 |
 | **Adaptive rate (on-camera)** | irlink probe-up / fallback / split-brain | 2–5 bps, self-tuning | **Working** — starts at cal-picked rate (≥160ms), ramps up/down with SNR |
 | **Autonomous cam1 + over-link cal** | rc.local autostart + `bicall` | full bidi cal in ~3.5 min | **Working** — cam1 boots, autostarts `daemon-listen` with saved coords; cam2 connects over light, runs `bicall`, both `/opt/etc/calibration.json` files refresh |
+| **Monocal (one-way over-light cal, autonomous-cam1)** | `irlink monocal` + cam2-only CGIs + webui MONOCAL CAM1 button | ~50s wall, single-cam refresh | **Working** — cam2 holds LEDs, cam1 scans, only cam1's `/opt/etc/calibration.json` updates. CGI-driven (zero SSH from laptop). For the [pc]→[cam2]→light→[cam1] deployment topology — see `irlink/CLAUDE.md` Monocal section. |
 
 ## Project Structure
 
@@ -185,6 +186,14 @@ ssh dacam1 "/opt/bin/irlink calibrate-pixel"   # writes cam1's /opt/etc/calibrat
 
 # 7. Bidirectional cal entirely over light (no SSH to cam1 once it's autonomous)
 echo bicall | ssh dacam2 "/opt/bin/irlink connect --pixel <cam2sees> --speed 160"
+
+# 8. Monocal — one-way cal over light, CGI-driven (zero SSH from laptop).
+#    Use this once cam1 is deployed: only cam1's /opt/etc/calibration.json
+#    refreshes (cam2's is laptop-cal'd via cal_procedure). ~50s wall.
+curl -X POST -d '' http://127.0.0.1:8765/api/cal/monocal           # webui flow
+# or via webui: open http://127.0.0.1:8765/ → click MONOCAL CAM1
+# or via cam2 CGI directly:
+curl -X POST -d 'coords=243,177' http://dacam2/x/monocal-trigger.cgi
 ```
 
 ### Calibration Viewer
@@ -195,7 +204,11 @@ cd photos && python -m http.server 8888
 
 ### Live-Status Webpage (`webui/`)
 
-8-bit themed live dashboard showing the 5 SSH→web-migrated CGIs in action, with a one-click `RUN CAL SEQUENCE` button that drives `cal_procedure --no-interactive` end-to-end and renders the result. Two pixel-art Wyze V3 cameras at the top reflect real GPIO state (green-pulsing lens when idle, red-flickering 8-LED ring when IR is firing).
+8-bit themed live dashboard showing the 5 SSH→web-migrated CGIs in action, with two big action buttons:
+- **▶ RUN CAL SEQUENCE** (green) — drives `cal_procedure --no-interactive` end-to-end through phases 1-5, laptop-driven, both cams reachable. ~90s.
+- **▶ MONOCAL CAM1** (cyan) — drives `irlink monocal` over light via cam2's `/x/monocal-trigger.cgi`. cam2 holds LEDs, cam1 scans, only cam1's `/opt/etc/calibration.json` refreshes. M1..M5 step stack tracks the state machine via `/api/cal/monocal-status` (which merges cam2's `monocal-status.cgi` with cam1's `cal-status.cgi`). ~50s. For the autonomous-cam1 deployment topology where laptop only reaches cam2.
+
+Two pixel-art Wyze V3 cameras at the top reflect real GPIO state (green-pulsing lens when idle, red-flickering 8-LED ring when IR is firing).
 
 ```bash
 # Terminal 1 — calibration viewer (iframe target)
@@ -243,6 +256,8 @@ The few that bite regardless of which subsystem you're in. Subsystem-specific pi
 - **busybox `pgrep -c` is not supported.** Thingino's busybox 1.37 pgrep doesn't accept `-c`; the call exits non-zero with a usage error, so `pgrep -c <name> || echo 0` always returns "0" silently. The pre-Phase-4 `aim_assist.preflight()` had this latent bug for irlink/daynightd counts. Use `pgrep <name> | wc -l` instead. For binaries with hyphens in the name (e.g. `prudynt-patched`), prefer `pidof` since pgrep matches argv[0] basename only.
 - **`/x/json-imp.cgi` returns `{"code":200,"result":"success",...}`, not `{"success":true}`.** The legacy convention in `cam_setup.sh` and `cal_procedure.py` is to grep for the bare substring `"success"` rather than the structured field. `CamStatusClient.imp_cmd()` follows the same convention. Don't assume a JSON `success: true` field — inspect the actual body shape before parsing strictly.
 - **`/x/json-heartbeat-slow.cgi` reports cached daynightd state, NOT actual GPIO.** Its `ir850_state` / `ir940_state` fields track an internal model that isn't synced when `imp_cmd ir850/ir940` writes happen directly. We added `irlink/cgi/gpio-state.cgi` (reads `gpio read 47`/`gpio read 49`) for the live UI's real-time LED reflection. Use that when the UI needs to know whether IR LEDs are actually firing right now.
+- **busybox `date +%s%3N` doesn't expand `%N`.** Thingino busybox 1.37 emits seconds only — the `%3N` literally appears in output or gets dropped depending on path. The original `monocal-trigger.cgi` JSON pre-write produced bogus `started_ms:1776061326` (seconds). Use `$(date +%s)000` for ms-granularity timestamps; the consumer (irlink C binary) overwrites with real `clock_gettime` ms within hundreds of ms.
+- **Monocal needs new `irlink` on BOTH cams.** The new `peer_scans` flag is bit 1 of CAL_REQ payload[0]. Old responders that check `data[0] == 1` interpret `0x02` as bidi=0 → fall through to regular `cal` (both sides hold LEDs, neither scans, then 90s CAL_DONE timeout). Always `make deploy` before flipping to a monocal-driven workflow. See irlink/CLAUDE.md → Monocal section.
 
 ## Key References
 

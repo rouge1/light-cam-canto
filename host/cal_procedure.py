@@ -71,16 +71,6 @@ def imp_cmd(ip, cmd, val):
     return result.stdout
 
 
-def ssh_cmd(ip, cmd):
-    """Run a command on the camera via SSH."""
-    result = subprocess.run(
-        ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
-         f"root@{ip}", cmd],
-        capture_output=True, text=True, timeout=10,
-    )
-    return result.stdout.strip()
-
-
 def leds_on_hold(ip, hold_seconds=30):
     """Turn on cam1's IR LEDs via Thingino's web API (no SSH).
 

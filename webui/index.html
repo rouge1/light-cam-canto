@@ -678,11 +678,35 @@ main {
 /* === Sequence panel content === */
 .seq-head {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: 1fr 1fr auto;
   gap: 14px;
   align-items: stretch;
   margin-bottom: 18px;
 }
+/* Monocal button = cyan-tinted variant to signal "over the light channel" — same
+   shape and pulse as RUN CAL SEQUENCE, different hue. Matches the cyan/white
+   beam-label pulse so the visual association is consistent. */
+.big-cal-btn.monocal {
+  background: linear-gradient(180deg, rgba(108,242,255,0.14) 0%, rgba(108,242,255,0.04) 100%);
+  border: 4px solid #6cf2ff;
+  color: #6cf2ff;
+  box-shadow: 0 4px 0 #003a45;
+}
+.big-cal-btn.monocal:hover {
+  box-shadow: 0 6px 0 #003a45, 0 0 24px rgba(108,242,255,0.4);
+  background: linear-gradient(180deg, rgba(108,242,255,0.26) 0%, rgba(108,242,255,0.06) 100%);
+}
+.big-cal-btn.monocal:active { box-shadow: 0 2px 0 #003a45; }
+.big-cal-btn.monocal.running {
+  box-shadow: 0 4px 0 #003a45, 0 0 24px rgba(108,242,255,0.3);
+  animation: monocal-running-pulse 1.6s ease-in-out infinite;
+}
+@keyframes monocal-running-pulse {
+  0%, 100% { box-shadow: 0 4px 0 #003a45, 0 0 24px rgba(108,242,255,0.3); }
+  50%      { box-shadow: 0 4px 0 #003a45, 0 0 36px rgba(108,242,255,0.6); }
+}
+.big-cal-btn.monocal.done-ok  { border-color: #6cf2ff; color: #6cf2ff; }
+.big-cal-btn.monocal.done-err { border-color: var(--red); color: var(--red); box-shadow: 0 4px 0 #2a0000; }
 .big-cal-btn {
   display: flex;
   flex-direction: row;
@@ -1050,7 +1074,14 @@ footer span { color: var(--amber); }
         <span class="big-cal-icon">▶</span>
         <span class="big-cal-text">
           <span class="big-cal-label">RUN CAL SEQUENCE</span>
-          <span class="big-cal-sub">and step thru phases 1-5</span>
+          <span class="big-cal-sub">laptop drives both cams · step thru phases 1-5</span>
+        </span>
+      </button>
+      <button class="big-cal-btn monocal" id="monocal-btn">
+        <span class="big-cal-icon">▶</span>
+        <span class="big-cal-text">
+          <span class="big-cal-label">MONOCAL CAM1</span>
+          <span class="big-cal-sub">cam1 learns its view of cam2 · over the light channel</span>
         </span>
       </button>
       <div class="cal-state-pill" id="cal-state-pill">
@@ -1117,6 +1148,61 @@ footer span { color: var(--amber); }
             </div>
           </div>
         </div>
+      </div>
+
+    </div>
+
+    <!-- MONOCAL STEP STACK (hidden until MONOCAL CAM1 is clicked) -->
+    <div class="step-stack" id="monocal-stack" style="display:none;">
+
+      <div class="step pending hidden" id="mstep-1" data-step="m1">
+        <div class="step-num">M1</div>
+        <div class="step-info">
+          <div class="step-title">SEND CAL_REQ TO CAM1</div>
+          <div class="step-sub">cam2 sends a calibration request over light · peer_scans=1 flag tells cam1 to be the scanner this time · waits for CAL_ACK</div>
+        </div>
+        <div class="step-state">PENDING</div>
+        <div class="step-result">—</div>
+      </div>
+
+      <div class="step pending hidden" id="mstep-2" data-step="m2">
+        <div class="step-num">M2</div>
+        <div class="step-info">
+          <div class="step-title">CAM2 HOLD LEDS</div>
+          <div class="step-sub">1.5s OFF (cam1 captures baseline) · then 12s ON steady (cam1 grid scan + ROI sweep) · this is what cam1 actually scans</div>
+        </div>
+        <div class="step-state">PENDING</div>
+        <div class="step-result">—</div>
+      </div>
+
+      <div class="step pending hidden" id="mstep-3" data-step="m3">
+        <div class="step-num">M3</div>
+        <div class="step-info">
+          <div class="step-title">CAM1 SCAN + WRITE CALIBRATION</div>
+          <div class="step-sub">cam1 finds the peak pixel where it sees cam2 · writes /opt/etc/calibration.json · waits for cam2's hold to fully end before TXing back</div>
+        </div>
+        <div class="step-state">PENDING</div>
+        <div class="step-result">—</div>
+      </div>
+
+      <div class="step pending hidden" id="mstep-4" data-step="m4">
+        <div class="step-num">M4</div>
+        <div class="step-info">
+          <div class="step-title">RECEIVE CAL_DONE OVER LIGHT</div>
+          <div class="step-sub">cam1 ships its 6-byte coord payload back · ~30s at 160ms/sym · cam2 decodes and logs PEER-CAL</div>
+        </div>
+        <div class="step-state">PENDING</div>
+        <div class="step-result">—</div>
+      </div>
+
+      <div class="step pending hidden" id="mstep-5" data-step="m5">
+        <div class="step-num">M5</div>
+        <div class="step-info">
+          <div class="step-title">RESULT</div>
+          <div class="step-sub">cam1's view of cam2 — pixel coords, peak brightness, and grid delta from the scan</div>
+        </div>
+        <div class="step-state">PENDING</div>
+        <div class="step-result">—</div>
       </div>
 
     </div>
@@ -1392,9 +1478,10 @@ function extractCalSummary(lines) {
 }
 
 async function runSequence() {
-  if (sequenceRunning) return;
+  if (sequenceRunning || (typeof monocalRunning !== 'undefined' && monocalRunning)) return;
   sequenceRunning = true;
   resetSteps();
+  if (typeof showMonocalMode === 'function') showMonocalMode(false);
   setOverall('running', 'RUNNING');
   runBtn.classList.remove('done-ok', 'done-err');
   runBtn.classList.add('running');
@@ -1442,6 +1529,193 @@ function activateTab(name) {
 }
 
 runBtn.addEventListener('click', runSequence);
+
+// ============================================================
+// MONOCAL — cam1 learns its view of cam2 over light.
+// Driven entirely by /api/cal/monocal-status (cam2's monocal-status.json
+// merged with cam1's irlink-status.json). State machine on cam2:
+//   spawning → starting → handshaking → monocal_req → monocal_ack_wait
+//   → monocal_holding_off → monocal_holding_on → monocal_awaiting_done
+//   → monocal_done | monocal_failed
+// We map those onto M1..M5 in the step stack.
+// ============================================================
+const monocalBtn = document.getElementById('monocal-btn');
+const monocalStack = document.getElementById('monocal-stack');
+const calStack = document.getElementById('step-stack');
+
+function showMStep(n) {
+  const me = document.getElementById('mstep-' + n);
+  monocalStack.prepend(me);
+  me.classList.remove('hidden');
+  me.classList.add('appearing');
+  setTimeout(() => me.classList.remove('appearing'), 400);
+}
+
+function setMStepState(n, state, label, result) {
+  const row = document.getElementById('mstep-' + n);
+  row.classList.remove('pending', 'running', 'done-ok', 'done-err');
+  row.classList.add(state);
+  row.querySelector('.step-state').textContent = label;
+  if (result !== undefined) row.querySelector('.step-result').textContent = result;
+}
+
+function resetMSteps() {
+  for (let i = 1; i <= 5; i++) {
+    const row = document.getElementById('mstep-' + i);
+    row.className = 'step pending hidden';
+    row.querySelector('.step-state').textContent = 'PENDING';
+    row.querySelector('.step-result').textContent = '—';
+  }
+}
+
+function showMonocalMode(on) {
+  /* Toggle which step stack is visible. We don't destroy the cal stack —
+     the user might run cal_procedure first, then monocal — so just hide it. */
+  monocalStack.style.display = on ? '' : 'none';
+  calStack.style.display     = on ? 'none' : '';
+}
+
+/* Map cam2's monocal state name → which M-step is active and the label/result.
+   We track which steps have been "completed" so we don't bounce backwards on
+   transient state reads. The state machine always moves forward, so once a
+   step is done-ok we leave it. */
+function applyMonocalState(merged, t0_ms) {
+  const cam2 = merged.cam2 || {};
+  const cam1 = merged.cam1 || {};
+  const state = cam2.state || 'transient';
+  const elapsed = ((performance.now() - t0_ms) / 1000).toFixed(1);
+
+  // M1 — handshake + CAL_REQ + CAL_ACK
+  if (['spawning','starting','handshaking','monocal_req','monocal_ack_wait'].includes(state)) {
+    showMStep(1);
+    let sub = 'spawning irlink…';
+    if (state === 'handshaking')       sub = 'SYN/SYN_ACK/ACK over light…';
+    if (state === 'monocal_req')       sub = 'sending CAL_REQ (peer_scans=1)…';
+    if (state === 'monocal_ack_wait')  sub = 'waiting for CAL_ACK from cam1…';
+    setMStepState(1, 'running', `${elapsed}s`, sub);
+    return;
+  }
+
+  // First time we see anything past M1, mark M1 done-ok and the ACK timestamp.
+  if (cam2.ack_received_ms && cam2.ack_received_ms > 0) {
+    const took = cam2.ack_received_ms - cam2.started_ms;
+    if (took > 0) setMStepState(1, 'done-ok', `${(took/1000).toFixed(1)}s`,
+      'CAL_ACK received from cam1');
+  }
+
+  // M2 — LED hold on cam2
+  if (state === 'monocal_holding_off') {
+    showMStep(2);
+    setMStepState(2, 'running', `${elapsed}s`, 'LEDs OFF (1.5s baseline window)…');
+    return;
+  }
+  if (state === 'monocal_holding_on') {
+    showMStep(2);
+    setMStepState(2, 'running', `${elapsed}s`, 'LEDs ON 12s steady · cam1 scanning…');
+    return;
+  }
+
+  // Past M2 — close it out with the actual hold duration.
+  if (cam2.led_hold_ended_ms && cam2.led_hold_ended_ms > 0
+      && cam2.led_hold_started_ms > 0) {
+    const took = (cam2.led_hold_ended_ms - cam2.led_hold_started_ms) / 1000;
+    setMStepState(2, 'done-ok', `${took.toFixed(1)}s`, 'hold complete · LEDs off');
+  }
+
+  // M3 — cam1 scanning. Reflect cam1's irlink-status.cgi state if reachable
+  // (during ground-truth phase). After deploy, cam1 is not IP-reachable; we
+  // infer M3 from cam2's "awaiting_done" state.
+  if (state === 'monocal_awaiting_done') {
+    showMStep(3);
+    const cam1State = cam1.state || '';
+    if (cam1State.startsWith('monocal_resp_scan')) {
+      setMStepState(3, 'running', `${elapsed}s`, 'cam1 scanning peer LEDs…');
+    } else if (cam1State.startsWith('monocal_resp_done')) {
+      setMStepState(3, 'done-ok', `${elapsed}s`, 'cam1 scan complete · CAL_DONE in flight');
+      showMStep(4);
+      setMStepState(4, 'running', `${elapsed}s`, 'awaiting CAL_DONE over light (~30s)…');
+    } else {
+      setMStepState(3, 'running', `${elapsed}s`,
+        cam1State ? `cam1: ${cam1State}` : 'awaiting cam1 scan + CAL_DONE…');
+    }
+    return;
+  }
+
+  // M5 — terminal states
+  if (state === 'monocal_done') {
+    setMStepState(3, 'done-ok', '—', 'cam1 scan complete');
+    setMStepState(4, 'done-ok', '—', 'CAL_DONE received');
+    showMStep(5);
+    const p = cam2.peer_pixel;
+    if (p) {
+      setMStepState(5, 'done-ok', 'OK',
+        `cam1 sees cam2 at (${p.x}, ${p.y}) · b=${p.peak_b}/255 · Δ=${p.grid_delta}`);
+    } else {
+      setMStepState(5, 'done-ok', 'OK', 'monocal complete');
+    }
+    return;
+  }
+
+  if (state === 'monocal_failed' || state === 'monocal_resp_failed') {
+    showMStep(5);
+    const err = cam2.error || 'monocal failed';
+    setMStepState(5, 'done-err', 'FAIL', err);
+    return;
+  }
+}
+
+let monocalRunning = false;
+
+async function runMonocal() {
+  if (monocalRunning || sequenceRunning) return;
+  monocalRunning = true;
+
+  resetMSteps();
+  showMonocalMode(true);
+  setOverall('running', 'MONOCAL');
+  monocalBtn.classList.remove('done-ok', 'done-err');
+  monocalBtn.classList.add('running');
+  monocalBtn.querySelector('.big-cal-icon').textContent = '⟳';
+  monocalBtn.querySelector('.big-cal-label').textContent = 'MONOCAL RUNNING…';
+
+  showMStep(1);
+  setMStepState(1, 'running', 'POST…', 'triggering /x/monocal-trigger.cgi…');
+
+  const r = await fetchJSON('/api/cal/monocal', {method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:''});
+  if (!r || !r.ok) {
+    setMStepState(1, 'done-err', 'FAIL', (r && r.error) || 'trigger refused');
+    monocalBtn.classList.remove('running');
+    monocalBtn.classList.add('done-err');
+    monocalBtn.querySelector('.big-cal-icon').textContent = '▶';
+    monocalBtn.querySelector('.big-cal-label').textContent = 'MONOCAL CAM1';
+    setOverall('done-err', 'DONE · FAILED');
+    monocalRunning = false;
+    return;
+  }
+
+  // Hand off to the polling loop.
+  const t0 = performance.now();
+  while (true) {
+    await sleep(800);
+    const merged = await fetchJSON('/api/cal/monocal-status');
+    if (!merged) continue;
+    applyMonocalState(merged, t0);
+    const state = (merged.cam2 && merged.cam2.state) || '';
+    if (state === 'monocal_done' || state === 'monocal_failed') {
+      const ok = state === 'monocal_done';
+      monocalBtn.classList.remove('running');
+      monocalBtn.classList.add(ok ? 'done-ok' : 'done-err');
+      monocalBtn.querySelector('.big-cal-icon').textContent = '▶';
+      monocalBtn.querySelector('.big-cal-label').textContent = 'MONOCAL CAM1';
+      setOverall(ok ? 'done-ok' : 'done-err', ok ? 'DONE · OK' : 'DONE · FAILED');
+      monocalRunning = false;
+      break;
+    }
+  }
+}
+
+monocalBtn.addEventListener('click', runMonocal);
 
 // On load: attach to in-flight cal if reload happened mid-run
 (async () => {

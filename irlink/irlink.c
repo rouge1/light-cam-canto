@@ -200,7 +200,13 @@ static volatile int running = 1;
 static volatile int tx_active = 0;  /* suppress RX during TX */
 static int tracked_block = -1;
 static int pixel_x = -1, pixel_y = -1;  /* pixel-level ROI center (-1 = disabled) */
-static int pixel_roi_size = 15;          /* ROI square size */
+/* Default 7×7 (49 cells). The IR LED spot at typical cam-cam distance is
+   ~5×5 pixels, so a 7×7 average has ~50% lit cells and reads Δ≈110 when
+   the peer holds LEDs solid (vs Δ≈37 with the old 15×15 default — the
+   larger window dilutes the spot across mostly-dark cells and pushes
+   Manchester decode below the noise margin). Override per-invocation
+   with --roi-size if your geometry differs. Range 3-31. */
+static int pixel_roi_size = 7;
 static pthread_mutex_t tx_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* RX callback: called when a complete message is decoded */
@@ -490,7 +496,9 @@ static void write_irlink_status(void)
         "\"counters\":{"
             "\"tx\":%d,"
             "\"rx\":%d,"
-            "\"decode_fail\":%d"
+            "\"decode_fail\":%d,"
+            "\"retransmit\":%d,"
+            "\"dpll_loss\":%d"
         "},"
         /* Diagnostic snapshot of rx_thread state. Lets the laptop see via
            HTTP whether cam1's pixel ROI is seeing the peer's IR (carrier
@@ -523,8 +531,12 @@ static void write_irlink_status(void)
            declared as separate aggregates but never incremented anywhere —
            the real counters live in rx_count / tx_count / crc_fail_count
            (rx_thread + send_message). Read those directly so the webapi
-           stops reporting `decode_fail:0` when decodes are actually failing. */
-        tx_count, rx_count, crc_fail_count,
+           stops reporting `decode_fail:0` when decodes are actually failing.
+           retransmit_count + dpll_loss_count added so the JSON exposes the
+           same counter set as SSH `STATS:` — operators monitoring via
+           webapi can now diagnose flaky-link (retransmit ticks) vs
+           DPLL-struggle (dpll_loss ticks) without needing SSH. */
+        tx_count, rx_count, crc_fail_count, retransmit_count, dpll_loss_count,
         status_rx_active ? "ACTIVE" : "IDLE",
         (int)status_rx_brightness, (int)status_rx_baseline,
         (int)status_rx_brightness - (int)status_rx_baseline,
@@ -3282,12 +3294,20 @@ static int do_cal_request_internal(int bidi)
                         visual[7 + i] = (uint8_t)((hi << 4) | lo);
                     }
                     fprintf(stderr,
-                            "PROTO: sending CAL_VISUAL (15B; 4x4 grid-delta zoom)\n");
-                    if (do_send_bytes(visual, 15) < 0) {
-                        fprintf(stderr,
-                                "PROTO: CAL_VISUAL send failed (peer may "
-                                "have closed); cal numbers still valid\n");
-                    }
+                            "PROTO: sending CAL_VISUAL (15B; 4x4 grid-delta "
+                            "zoom; fire-and-forget)\n");
+                    /* Fire-and-forget. Peer's rx_thread auto-ACKs DATA when
+                       alive, but we don't wait — the cal coords already
+                       landed via CAL_DONE, so the visual is informational
+                       only. Going through do_send_bytes() would retry 3×
+                       and wedge this daemon in cal_sending_done for ~230s
+                       if the peer quits immediately after BICAL completion
+                       (e.g. scripted `printf 'bicall\nquit'`), colliding
+                       with any subsequent connection attempt from the
+                       same peer. seq=1 mirrors what do_send_bytes would
+                       have used on its first DATA — keeps peer logs sane
+                       if the visual does land. */
+                    send_message(MSG_DATA, 1, visual, 15);
                 } else {
                     fprintf(stderr,
                             "PROTO: skipping CAL_VISUAL (bidi=1, phase 1 of "

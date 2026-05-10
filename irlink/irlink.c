@@ -29,6 +29,7 @@
 #include <signal.h>
 #include <pthread.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <sys/stat.h>
 
 /* ---- Configuration ---- */
@@ -65,6 +66,25 @@ static int fail_at_rate = 0;            /* consecutive retransmit-exhausted send
 static int probe_in_progress = 0;       /* true while testing a faster rate post-probe-up */
 static int pre_probe_rung = -1;         /* rung to restore on failed probe */
 static int64_t last_valid_frame_ms = 0; /* for split-brain recovery */
+/* Separate debounce for split-brain itself, so that triggering split-brain
+   doesn't artificially "reset" last_valid_frame_ms — that conflates "we
+   recently decoded a real frame" (used by the grid-watchdog's idle gate)
+   with "split-brain shouldn't immediately refire." Without this split,
+   firing split-brain bumps last_valid_frame_ms forward, which delays the
+   watchdog's idle re-arm by another full IDLE_THRESHOLD_MS. */
+static int64_t last_split_brain_fire_ms = 0;
+/* Last time we saw a "substantial" failed decode — i.e. a candidate frame
+   long enough to plausibly be a real Manchester transmission, not just a
+   2-sample ambient brightness drift blip. Split-brain recovery requires
+   this to be RECENT before dropping rate. Without this guard, daemon-listen
+   sitting idle for hours would accumulate per-second 2-sample drift events
+   that fail to decode, eventually trip split-brain, and silently drop the
+   rate to 200ms — leaving the daemon mismatched against the next 160ms
+   peer that connects. Threshold of 30 samples ≈ 1.6s of carrier at 18fps,
+   long enough to be a real frame attempt, short enough to catch genuine
+   rate-mismatch (where peer's full 16s frame produces 100+ samples). */
+static int64_t last_substantial_decode_fail_ms = 0;
+#define SUBSTANTIAL_DECODE_SAMPLES 30
 
 /* Set to 1 while a CAL_REQ/CAL_ACK/CAL_DONE flow is in flight. Suppresses
    the rx_thread split-brain recovery, which would otherwise trip mid-cal:
@@ -75,6 +95,17 @@ static int64_t last_valid_frame_ms = 0; /* for split-brain recovery */
    bicall phase 2. See irlink/CLAUDE.md "Bicall split-brain" pitfall. */
 static volatile int cal_flow_active = 0;
 static int64_t failed_probe_cooldown_ms[RATE_LADDER_LEN] = {0};
+
+/* Lock: stay at the slowest rung during startup + the first cal flow, so that
+   a half-decoded handshake or one missed RATE_CHANGE can't trip split-brain
+   before either side has cal-derived confidence in the pixel. Set in
+   daemon_mode at startup, cleared by the first successful cal (handle_cal_request,
+   handle_monocal_request, or handle_watchdog_trigger). While set, maybe_probe_up
+   short-circuits — peer-driven RATE_CHANGE still applies (explicit peer commands
+   are always honored). The helper is defined later (after log_event). */
+static volatile int rate_locked_at_floor = 0;
+static void unlock_rate_after_cal(const char *reason);
+static void lock_rate_at_floor(const char *mode);
 
 #define PROBE_UP_AFTER          5       /* successful ACKs before probing faster */
 #define FALLBACK_AFTER          3       /* retransmit-exhausted sends before stepping slower */
@@ -103,6 +134,65 @@ static int64_t failed_probe_cooldown_ms[RATE_LADDER_LEN] = {0};
 
 static const uint8_t SYNC_WORD[] = {1,1,0,0,1,0,1,1};
 #define SYNC_LEN 8
+
+/* ---- Resync framing (mirrors protocol/frame.py) ----
+ * Long protocol frames at 200ms/sym (CAL_REQ/CAL_ACK/CAL_DONE) overrun the
+ * DPLL's drift budget — extracted symbol stream slips, Manchester pairs go
+ * invalid, decode fails. Resync framing fixes this by injecting raw 1010...
+ * blocks every chunk_syms data symbols. The DPLL re-locks on each block's
+ * edges as cleanly as on the initial preamble.
+ *
+ * Wire layout (after preamble+sync, all in symbol space):
+ *     [CHUNK chunk_syms data] [RESYNC resync_syms 1010...] [CHUNK ...] ...
+ *     [CHUNK final ≤ chunk_syms]   ← no trailing resync
+ *
+ * Receiver finds SYNC at the symbol level (Manchester-encoded SYNC pattern),
+ * strips resync blocks at chunk_syms intervals, then Manchester-decodes.
+ *
+ * Defaults match protocol/frame.py. chunk_syms=48 = 24 bits = 3 bytes per
+ * chunk, alignment-safe for byte-boundary CRC. */
+#define DEFAULT_CHUNK_SYMS   48
+#define DEFAULT_RESYNC_SYMS  16
+
+/* SYNC_WORD `11001011` Manchester-encoded (1→01, 0→10): 16 symbols. */
+static const uint8_t SYNC_MANCHESTER[16] = {
+    0,1, 0,1, 1,0, 1,0, 0,1, 1,0, 0,1, 0,1
+};
+
+/* ---- CAL_DONE payload compression (6 bytes → 2 bytes) ----
+ *
+ * 4-px quantization. payload[0]=x/4, payload[1]=y/4. Re-centered on RX as
+ * x=p0*4+2, y=p1*4+2. Max round-trip error ±2 px per axis — well inside the
+ * 15-px ROI tolerance, so the cal pixel is effectively unchanged in practice.
+ *
+ * Cuts CAL_DONE wire time from ~50s (248 syms with resync) to ~30s (152 syms),
+ * which significantly reduces DPLL drift exposure on the longest frame in the
+ * protocol. peak_brightness and grid_delta are dropped — they were
+ * informational only (already published via /run/irlink-status.json on the
+ * scanner side, fetchable out-of-band via /x/cal-status.cgi).
+ *
+ * Both peers must run the new binary; no version bit. The decoder accepts
+ * data_len >= 2 as the success path; data_len == 0 still means scan failed. */
+#define CAL_DONE_PAYLOAD_LEN  2
+#define CAL_DONE_QUANT_PX     4
+
+static void pack_cal_done(int x, int y, uint8_t payload[CAL_DONE_PAYLOAD_LEN])
+{
+    int qx = x / CAL_DONE_QUANT_PX;
+    int qy = y / CAL_DONE_QUANT_PX;
+    if (qx < 0) qx = 0;
+    if (qx > 255) qx = 255;
+    if (qy < 0) qy = 0;
+    if (qy > 255) qy = 255;
+    payload[0] = (uint8_t)qx;
+    payload[1] = (uint8_t)qy;
+}
+
+static void unpack_cal_done(const uint8_t *payload, int *x, int *y)
+{
+    *x = (int)payload[0] * CAL_DONE_QUANT_PX + CAL_DONE_QUANT_PX / 2;
+    *y = (int)payload[1] * CAL_DONE_QUANT_PX + CAL_DONE_QUANT_PX / 2;
+}
 
 /* ---- Globals ---- */
 
@@ -211,16 +301,113 @@ static void apply_rate(int new_ms, int new_rung, const char *reason)
     fflush(stdout);
 }
 
-/* ---- AE freeze control (via prudynt BrightnessMonitor) ---- */
+/* ---- Append-only event log (post-mortem diagnostic ring) ----
+ *
+ * Tagged one-line records appended to /tmp/irlink-events.log (tmpfs, doesn't
+ * survive reboots — that's intentional, the overlay is tiny). Self-truncates
+ * to zero when over EVENT_LOG_MAX so the file caps at ~64 KB without rotation
+ * machinery. Scrape post-mortem with `ssh dacamN cat /tmp/irlink-events.log`.
+ */
 
-static void set_ae_freeze(int freeze)
+#define EVENT_LOG_PATH "/tmp/irlink-events.log"
+#define EVENT_LOG_MAX  (64 * 1024)
+static pthread_mutex_t evlog_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void log_event(const char *tag, const char *fmt, ...)
+{
+    pthread_mutex_lock(&evlog_mutex);
+    int flags = O_WRONLY | O_CREAT | O_APPEND;
+    struct stat st;
+    if (stat(EVENT_LOG_PATH, &st) == 0 && st.st_size > EVENT_LOG_MAX)
+        flags |= O_TRUNC;
+    int fd = open(EVENT_LOG_PATH, flags, 0644);
+    if (fd >= 0) {
+        char line[256];
+        int n = snprintf(line, sizeof(line), "%lld %s ",
+                         (long long)now_ms(), tag);
+        if (n > 0 && n < (int)sizeof(line)) {
+            va_list ap;
+            va_start(ap, fmt);
+            int m = vsnprintf(line + n, sizeof(line) - n, fmt, ap);
+            va_end(ap);
+            if (m > 0) n += m;
+            if (n >= (int)sizeof(line) - 1) n = (int)sizeof(line) - 2;
+            line[n++] = '\n';
+            (void)write(fd, line, n);
+        }
+        close(fd);
+    }
+    pthread_mutex_unlock(&evlog_mutex);
+}
+
+/* Lock helpers for the rate floor — defined here because they call log_event.
+   The forward declarations live up by the rate-state vars. */
+
+/* Force the slowest rung and lock probe-up until first successful cal. Called
+   from main() at the entry of every communication mode (listen/connect/
+   daemon-listen/daemon-connect/monocal) so both peers start at the same rate
+   regardless of --speed. Without the lock, cam1's daemon-listen at 200 vs
+   cam2's monocal at 160 would silently fail SYN decode. */
+static void lock_rate_at_floor(const char *mode)
+{
+    int floor_ms = RATE_LADDER_MS[RATE_LADDER_LEN - 1];
+    if (symbol_ms != floor_ms) {
+        fprintf(stderr,
+            "RATE: %s startup — clamping %dms → %dms (floor) until first cal\n",
+            mode, symbol_ms, floor_ms);
+    }
+    apply_rate(floor_ms, RATE_LADDER_LEN - 1, "startup-floor");
+    rate_locked_at_floor = 1;
+    log_event("RATE", "locked-at-floor ms=%d mode=%s", floor_ms, mode);
+}
+
+static void unlock_rate_after_cal(const char *reason)
+{
+    if (rate_locked_at_floor) {
+        rate_locked_at_floor = 0;
+        fprintf(stderr, "RATE: probe-up unlocked (reason=%s)\n", reason);
+        log_event("RATE", "unlocked-after-cal reason=%s", reason);
+    }
+}
+
+/* ---- AE freeze control (via prudynt BrightnessMonitor) ----
+ *
+ * `ae_freeze_intent` tracks the most recent value irlink wrote, so the
+ * heartbeat thread can detect drift caused by external writers (cam_setup.sh,
+ * aim_assist preflight, manual SSH echo, the webui CAL worker) and restore.
+ * -1 means "no opinion yet" (pre-mode-init); the heartbeat doesn't enforce
+ * in that state. cal_flow_active gates enforcement so do_calibrate_pixel_to
+ * can legitimately drop AE mid-flow without the heartbeat fighting it.
+ */
+
+static volatile int ae_freeze_intent = -1;
+
+static int read_ae_freeze_file(void)
+{
+    int fd = open(AE_FREEZE_PATH, O_RDONLY);
+    if (fd < 0) return -1;
+    char ch;
+    int n = read(fd, &ch, 1);
+    close(fd);
+    if (n != 1) return -1;
+    return (ch == '1') ? 1 : 0;
+}
+
+static void write_ae_freeze_file(int freeze)
 {
     int fd = open(AE_FREEZE_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
         write(fd, freeze ? "1" : "0", 1);
         close(fd);
-        fprintf(stderr, "AE: freeze %s\n", freeze ? "ON" : "OFF");
     }
+}
+
+static void set_ae_freeze(int freeze)
+{
+    ae_freeze_intent = freeze ? 1 : 0;
+    write_ae_freeze_file(freeze);
+    fprintf(stderr, "AE: freeze %s\n", freeze ? "ON" : "OFF");
+    log_event("AE", "freeze=%d", freeze);
 }
 
 /* ================================================================
@@ -250,6 +437,12 @@ static int status_peak_brightness = 0, status_peak_delta = 0, status_peak_block 
 static int status_tx_count = 0;
 static int status_rx_count = 0;
 static int status_decode_fail = 0;
+/* Mirrors of rx_thread locals — written by rx_thread, read by
+   write_irlink_status. Lets the laptop see "is cam1's ROI seeing peer
+   IR right now?" via /api/cam1/status without SSHing for stderr. */
+static volatile uint8_t status_rx_brightness = 0;
+static volatile uint8_t status_rx_baseline = 0;
+static volatile int     status_rx_active = 0;   /* 0=IDLE, 1=ACTIVE */
 
 /* protect concurrent write_status() from rx_thread + main thread */
 static pthread_mutex_t status_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -290,6 +483,21 @@ static void write_irlink_status(void)
             "\"rx\":%d,"
             "\"decode_fail\":%d"
         "},"
+        /* Diagnostic snapshot of rx_thread state. Lets the laptop see via
+           HTTP whether cam1's pixel ROI is seeing the peer's IR (carrier
+           recent → ROI is on-target) and whether decodes are succeeding
+           (valid_frame recent → Manchester/DPLL OK). When carrier ticks
+           but valid_frame stays at 0, the SYN is reaching cam1 but the
+           decode is failing — points at rate/AE/sample-density issues
+           rather than aim/ROI issues. */
+        "\"rx\":{"
+            "\"state\":\"%s\","
+            "\"brightness\":%d,"
+            "\"baseline\":%d,"
+            "\"diff\":%d,"
+            "\"last_carrier_ms\":%lld,"
+            "\"last_valid_frame_ms\":%lld"
+        "},"
         "\"last_event\":\"%s\","
         "\"last_event_ms\":%lld"
         "}\n",
@@ -303,6 +511,11 @@ static void write_irlink_status(void)
         status_peak_x, status_peak_y,
         status_peak_brightness, status_peak_delta, status_peak_block,
         status_tx_count, status_rx_count, status_decode_fail,
+        status_rx_active ? "ACTIVE" : "IDLE",
+        (int)status_rx_brightness, (int)status_rx_baseline,
+        (int)status_rx_brightness - (int)status_rx_baseline,
+        (long long)last_carrier_ms,
+        (long long)last_valid_frame_ms,
         status_event,
         (long long)status_event_ms);
     if (n > 0 && n < (int)sizeof(buf)) {
@@ -315,6 +528,38 @@ static void write_irlink_status(void)
         }
     }
     pthread_mutex_unlock(&status_mutex);
+}
+
+/* Periodic re-write of /run/irlink-status.json so ts_ms ticks even when no
+   protocol event fires. Diagnostic-only — without this, a daemon stuck in
+   any steady state (e.g. "listening", or worse, a wedged "monocal_resp_done")
+   looks identical to a daemon that's actively servicing requests. With this
+   running, frozen ts_ms across two polls is a clear hang signal. */
+static void *heartbeat_thread(void *unused)
+{
+    (void)unused;
+    while (running) {
+        usleep(1000 * 1000);  /* 1 Hz */
+        /* AE-drift defense: if some external writer flipped /run/prudynt/ae_freeze
+           away from what we last set, restore it. Skipped while a cal flow is
+           live, since do_calibrate_pixel_to legitimately drops AE mid-flow.
+           This catches the failure mode where (e.g.) a webui CAL worker shells
+           `echo 0 > /run/prudynt/ae_freeze` and our daemon-listen rx_thread
+           then can't decode incoming SYNs — without this, we'd have no way to
+           recover except a manual restart. */
+        if (ae_freeze_intent >= 0 && !cal_flow_active) {
+            int actual = read_ae_freeze_file();
+            if (actual >= 0 && actual != ae_freeze_intent) {
+                log_event("AE", "drift file=%d intent=%d, restoring",
+                          actual, ae_freeze_intent);
+                fprintf(stderr, "AE: drift detected (file=%d, want=%d), restoring\n",
+                        actual, ae_freeze_intent);
+                write_ae_freeze_file(ae_freeze_intent);
+            }
+        }
+        write_irlink_status();
+    }
+    return NULL;
 }
 
 /* Update the (state, last_event) tuple and re-write the status file. The
@@ -339,6 +584,9 @@ static void status_set(const char *state, const char *event)
         status_event_ms = now_ms();
     }
     write_irlink_status();
+    log_event("STATE", "%s | %s",
+              state ? state : status_state,
+              event ? event : "");
 }
 
 /* ================================================================
@@ -580,6 +828,91 @@ static int build_frame_symbols(uint8_t msg_type, uint8_t seq,
     return encode_manchester(bits, nb, symbols);
 }
 
+/* Resync-framed encoder: same frame contents as build_frame_symbols, but
+ * splits the data portion into chunks separated by raw 1010... resync blocks.
+ * Header (preamble+sync) Manchester-encoded as one piece (no resync inside);
+ * data (length+payload+crc+postamble) Manchester-encoded then chunked.
+ * Output is ~33% longer than classic for the same payload — overhead bought
+ * by reliable decode of long frames at the slowest rate rung. */
+static int build_frame_symbols_resync(uint8_t msg_type, uint8_t seq,
+                                       const uint8_t *data, int data_len,
+                                       uint8_t *symbols)
+{
+    /* Header: preamble + sync, Manchester-encoded together. */
+    uint8_t header_bits[16];
+    uint8_t preamble[] = {1,0,1,0,1,0,1,0};
+    memcpy(header_bits, preamble, 8);
+    memcpy(header_bits + 8, SYNC_WORD, 8);
+    uint8_t header_syms[32];
+    int n_header = encode_manchester(header_bits, 16, header_syms);
+
+    /* Data bits: length + payload + CRC + postamble. */
+    uint8_t data_bits[MAX_SYMBOLS];
+    int nb = 0;
+    uint8_t frame_len = 2 + data_len;
+    byte_to_bits(frame_len, data_bits + nb); nb += 8;
+
+    uint8_t payload[MAX_PAYLOAD];
+    payload[0] = msg_type;
+    payload[1] = seq;
+    if (data_len > 0)
+        memcpy(payload + 2, data, data_len);
+    for (int i = 0; i < frame_len; i++) {
+        byte_to_bits(payload[i], data_bits + nb);
+        nb += 8;
+    }
+
+    uint8_t crc_data[MAX_PAYLOAD + 1];
+    crc_data[0] = frame_len;
+    memcpy(crc_data + 1, payload, frame_len);
+    uint8_t crc = crc8(crc_data, frame_len + 1);
+    byte_to_bits(crc, data_bits + nb); nb += 8;
+
+    uint8_t postamble[] = {1,0,1,0};
+    memcpy(data_bits + nb, postamble, 4); nb += 4;
+
+    /* Manchester-encode data. */
+    uint8_t data_syms[MAX_SYMBOLS];
+    int n_data = encode_manchester(data_bits, nb, data_syms);
+
+    /* Header + chunked data with resync blocks between chunks. */
+    int out = 0;
+    memcpy(symbols + out, header_syms, n_header); out += n_header;
+    int i = 0;
+    while (i < n_data) {
+        int chunk = (n_data - i > DEFAULT_CHUNK_SYMS) ? DEFAULT_CHUNK_SYMS
+                                                       : (n_data - i);
+        memcpy(symbols + out, data_syms + i, chunk);
+        out += chunk;
+        i += chunk;
+        if (i < n_data) {
+            for (int k = 0; k < DEFAULT_RESYNC_SYMS; k++)
+                symbols[out++] = (k & 1) ? 0 : 1;  /* alternating 1010... */
+        }
+    }
+    return out;
+}
+
+/* Per-msg-type gate: which messages use resync framing. CAL_REQ/CAL_ACK/CAL_DONE
+ * are the ones that empirically blow the DPLL drift budget at 200ms/sym
+ * (CAL_REQ at 120 syms saw mid-frame Manchester pair invalidation; SYN/SYN_ACK
+ * at 104 syms work classic). RATE_CHANGE has 2 bytes payload = 120 syms = same
+ * danger zone, include for safety. SYN/ACK/PING/PONG stay classic — they're
+ * short enough to dodge drift and changing them would be a flag day. */
+static int frame_uses_resync(uint8_t msg_type)
+{
+    switch (msg_type) {
+    case MSG_CAL_REQ:
+    case MSG_CAL_ACK:
+    case MSG_CAL_DONE:
+    case MSG_RATE_CHANGE:
+    case MSG_DATA:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 /* ---- Transmit symbols (thread-safe) ---- */
 
 static void transmit_symbols(const uint8_t *symbols, int n_sym)
@@ -616,7 +949,12 @@ static void send_message(uint8_t msg_type, uint8_t seq,
                           const uint8_t *data, int data_len)
 {
     uint8_t symbols[MAX_SYMBOLS];
-    int n = build_frame_symbols(msg_type, seq, data, data_len, symbols);
+    int n;
+    if (frame_uses_resync(msg_type)) {
+        n = build_frame_symbols_resync(msg_type, seq, data, data_len, symbols);
+    } else {
+        n = build_frame_symbols(msg_type, seq, data, data_len, symbols);
+    }
 
     const char *type_names[] = {
         [MSG_SYN] = "SYN", [MSG_SYN_ACK] = "SYN_ACK", [MSG_ACK] = "ACK",
@@ -627,6 +965,7 @@ static void send_message(uint8_t msg_type, uint8_t seq,
     };
     const char *name = (msg_type <= MSG_RATE_CHANGE) ? type_names[msg_type] : "???";
     fprintf(stderr, "TX: %s seq=%d (%d symbols)\n", name, seq, n);
+    log_event("TX", "%s seq=%d len=%d sym=%d", name, seq, data_len, n);
 
     tx_count++;
     transmit_symbols(symbols, n);
@@ -821,6 +1160,9 @@ static int parse_frame(const uint8_t *bits, int n_bits, rx_message_t *msg)
     return length;
 }
 
+static int try_parse_resync(const uint8_t *symbols, int n_sym,
+                             rx_message_t *msg);  /* fwd decl */
+
 /* ---- DPLL decode: track clock from raw sample edges ---- */
 
 static int decode_samples_dpll(sample_t *samp, int n, rx_message_t *msg)
@@ -962,10 +1304,79 @@ static int decode_samples_dpll(sample_t *samp, int n, rx_message_t *msg)
                         symbols[i] = symbols[i] ? 0 : 1;
                 }
             }
+
+            /* Resync-framing fallback: same DPLL extraction succeeded; the
+             * raw symbol stream may contain mid-frame resync blocks that
+             * the strict trim+manchester path can't recover from. */
+            if (try_parse_resync(symbols, n_sym, msg)) return 0;
         }
     }
 
     return -1;
+}
+
+/* Try parse with resync framing — search for SYNC at the symbol level (allows
+ * up to 1 bit error in the 16-sym pattern for noise tolerance), strip resync
+ * blocks at chunk_syms intervals, Manchester-decode the result, prepend the
+ * known SYNC bits, and call parse_frame.
+ *
+ * Returns 1 on success (msg populated), 0 on no decode. Tries both polarities.
+ * Caller is responsible for the symbol stream `symbols` having at least the
+ * preamble+sync+chunk window present (~50+ symbols). */
+static int try_parse_resync(const uint8_t *symbols, int n_sym, rx_message_t *msg)
+{
+    if (n_sym < 32) return 0;  /* too short for even header+1-byte data */
+
+    for (int inv = 0; inv < 2; inv++) {
+        for (int sync_pos = 0; sync_pos + 16 <= n_sym; sync_pos++) {
+            /* Hamming distance of SYNC pattern at this position. Allow ≤1
+             * mismatch — extracted symbols can be 1 bit off from threshold
+             * jitter at low SNR. Tighter than that adds false positives. */
+            int errs = 0;
+            for (int j = 0; j < 16 && errs <= 1; j++) {
+                uint8_t s = symbols[sync_pos + j];
+                if (inv) s = !s;
+                if (s != SYNC_MANCHESTER[j]) errs++;
+            }
+            if (errs > 1) continue;
+
+            /* Strip resync blocks: keep DEFAULT_CHUNK_SYMS, skip
+             * DEFAULT_RESYNC_SYMS, repeat. */
+            uint8_t stripped[MAX_SYMBOLS];
+            int out = 0;
+            int pos = sync_pos + 16;
+            while (pos < n_sym && out < MAX_SYMBOLS) {
+                int take = DEFAULT_CHUNK_SYMS;
+                if (pos + take > n_sym) take = n_sym - pos;
+                if (out + take > MAX_SYMBOLS) take = MAX_SYMBOLS - out;
+                for (int k = 0; k < take; k++) {
+                    uint8_t s = symbols[pos + k];
+                    stripped[out++] = inv ? !s : s;
+                }
+                pos += DEFAULT_CHUNK_SYMS;
+                if (pos < n_sym) pos += DEFAULT_RESYNC_SYMS;
+            }
+
+            /* Try Manchester decode at multiple even-length truncations.
+             * The strip may leave a stray sym at the tail. */
+            for (int trim_e = 0; trim_e <= 4 && trim_e < out; trim_e++) {
+                int sc = out - trim_e;
+                if (sc < 16 || sc % 2 != 0) continue;
+                uint8_t bits[MAX_SYMBOLS / 2 + 8];
+                /* Prepend SYNC bits so parse_frame's sync search succeeds. */
+                memcpy(bits, SYNC_WORD, SYNC_LEN);
+                int nb = manchester_decode(stripped, sc, bits + SYNC_LEN);
+                if (nb < 0) continue;
+                if (parse_frame(bits, SYNC_LEN + nb, msg) > 0) {
+                    fprintf(stderr,
+                        "RX: resync decoded (sync_pos=%d errs=%d trim_e=%d%s)\n",
+                        sync_pos, errs, trim_e, inv ? " inv" : "");
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
 }
 
 /* ---- Decode collected samples (fixed-grid, original method) ---- */
@@ -1081,6 +1492,12 @@ static int decode_samples(sample_t *samp, int n, rx_message_t *msg)
         }
     }
 
+    /* Last resort: resync framing. Symbols are currently inverted from the
+     * loop above; try_parse_resync handles both polarities itself, so flip
+     * back to the original first. */
+    for (int i = 0; i < n_sym; i++) symbols[i] = symbols[i] ? 0 : 1;
+    if (try_parse_resync(symbols, n_sym, msg)) return 0;
+
     return -1;
 }
 
@@ -1166,14 +1583,54 @@ static int do_grid_calibration(grid_cal_t *out)
     fprintf(stderr, "CALIBRATE: got %d LED-ON frames\n", n_led);
 
     /* Step 3: Find block with biggest positive delta (LED ON - LED OFF) */
-    int best = -1, best_delta = 0;
     int deltas[GRID_BLOCKS];
-
-    for (int b = 0; b < GRID_BLOCKS; b++) {
+    for (int b = 0; b < GRID_BLOCKS; b++)
         deltas[b] = led_on[b] - baseline[b];
+
+    /* OSD masking — channel 1 carries a per-second timestamp + name +
+       uptime in the top 30 px and a "thingino" watermark in the bottom
+       30 px. Their per-frame character changes inject false delta into
+       block rows 0 (by=0) and 11 (by=11). Without masking, argmax can
+       pick an OSD-edge block (e.g. block 21 at y=30-59) over the true
+       TX block. Mirrors cal_procedure.py:206-209 so on-camera and
+       laptop scans converge on the same TX pixel. */
+    for (int bx = 0; bx < 20; bx++) {
+        deltas[0 * 20 + bx]  = 0;   /* by=0,  y∈[0,29]    — OSD strip  */
+        deltas[11 * 20 + bx] = 0;   /* by=11, y∈[330,359] — watermark  */
+    }
+
+    int best = -1, best_delta = 0;
+    for (int b = 0; b < GRID_BLOCKS; b++) {
         if (deltas[b] > best_delta) {
             best_delta = deltas[b];
             best = b;
+        }
+    }
+
+    /* Dump full delta grid to /run/grid-deltas.json (atomic temp+rename).
+       Served by /x/grid-deltas.cgi so the laptop can fetch the post-mask
+       deltas + best block + runner-up over HTTP — no SSH needed. Lets
+       the next round of monocal-misbehavior debugging see exactly which
+       block won and what the runner-up was without redeploying. */
+    {
+        const char *tmp = "/run/grid-deltas.json.tmp";
+        const char *path = "/run/grid-deltas.json";
+        int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            char buf[64];
+            int n;
+            n = snprintf(buf, sizeof(buf),
+                         "{\"ts_ms\":%lld,\"best_block\":%d,\"best_delta\":%d,\"deltas\":[",
+                         (long long)now_ms(), best, best_delta);
+            (void)write(fd, buf, n);
+            for (int i = 0; i < GRID_BLOCKS; i++) {
+                n = snprintf(buf, sizeof(buf),
+                             (i == 0) ? "%d" : ",%d", deltas[i]);
+                (void)write(fd, buf, n);
+            }
+            (void)write(fd, "]}\n", 3);
+            close(fd);
+            (void)rename(tmp, path);
         }
     }
 
@@ -1389,6 +1846,31 @@ static int find_peak_pixel_in_block(int block_idx,
     return 0;
 }
 
+/* Return saved peak_brightness from /opt/etc/calibration.json, or -1 if the
+ * file is missing / unreadable / unparseable. Used by handle_watchdog_trigger
+ * to refuse to overwrite a strong cal with a much weaker one — e.g. previous
+ * watchdog runs that latched onto a desk/floor reflection (peak_b=158) and
+ * blew away a direct-LED cal (peak_b=235). */
+static int read_saved_peak_brightness(void)
+{
+    int fd = open("/opt/etc/calibration.json", O_RDONLY);
+    if (fd < 0) return -1;
+    char buf[1024];
+    int n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+    const char *p = strstr(buf, "\"peak_brightness\"");
+    if (!p) return -1;
+    p = strchr(p, ':');
+    if (!p) return -1;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    int v = atoi(p);
+    if (v < 0 || v > 255) return -1;
+    return v;
+}
+
 static void write_calibration_json(int tx_x, int tx_y, int off_val, int on_val,
                                     int grid_delta, int peak_b)
 {
@@ -1486,6 +1968,566 @@ static int do_calibrate_pixel(void)
 }
 
 /* ================================================================
+ *  Search — cold-start grid scan ("where is my peer?")
+ *
+ *  No prior pixel knowledge required. Scans the whole 20x12 grid for any
+ *  block whose brightness has been elevated above its rolling baseline by
+ *  >=SEARCH_DELTA for >=SEARCH_HOLD_MS continuously. Once acquired, refines
+ *  to a precise pixel via the existing find_peak_pixel_in_block (peer must
+ *  hold LEDs ON for the full search-hold + ROI-sweep window, ~10-15s).
+ *
+ *  This is the on-camera, light-coordinated equivalent of cal_procedure.py's
+ *  laptop-driven frame-diff. Designed for the autonomous-cam1 deployment
+ *  topology where the laptop only reaches one cam (or neither) over IP, so
+ *  bootstrap calibration must travel by light alone. Counterpart "hold LEDs
+ *  on" mode + bidirectional sequencing land in a follow-up patch — for now,
+ *  this is the validating primitive.
+ *
+ *  Output on success: PIXEL line (same format as do_calibrate_pixel) +
+ *  SEARCH line with timing diagnostics. Does NOT write calibration.json
+ *  yet — caller / orchestrator decides whether to commit. (Will be flipped
+ *  to write-on-success once we wire it into a daemon-listen fallback.)
+ * ================================================================ */
+
+/* Tuned against measured cam2-sees-cam1 delta at the current bench geometry:
+ *   - AE active (during scan):   strongest block rises +13 when peer is on
+ *   - AE frozen (during refine): strongest block rises only +9 (no ISP
+ *     compression boosting contrast against dimmed non-LED blocks)
+ * SEARCH_DELTA is sized to catch +13 with margin while staying above the
+ * per-frame AE-compensation jitter of empty blocks (~±2). Refinement after
+ * acquisition runs with AE frozen because find_peak_pixel_in_block needs
+ * stable exposure to compare ROI candidates fairly. */
+#define SEARCH_DELTA       7      /* min block-brightness rise vs baseline */
+#define SEARCH_HOLD_MS     3000   /* must stay elevated this long to acquire */
+#define SEARCH_BASELINE_MS 1500   /* baseline-capture window before scanning */
+#define SEARCH_SCAN_HZ     20     /* grid-poll cadence during search */
+
+static int do_search(int max_wait_ms,
+                     int *out_block, int *out_px, int *out_py,
+                     int *out_baseline, int *out_active, int *out_delta)
+{
+    uint8_t baseline[GRID_BLOCKS];
+    int64_t bright_since[GRID_BLOCKS];
+    int64_t baseline_taken_ms;
+    int64_t start_ms = now_ms();
+
+    /* AE stays ACTIVE during the scan — counter-intuitive but correct.
+       When AE is active and the peer's LED comes on, the ISP compresses the
+       global exposure: the LED block rises while non-LED blocks dim, giving
+       us a CONTRAST delta we can detect (~+13). With AE frozen the global
+       exposure is locked, so only the raw LED contribution shows up in the
+       block (~+9) — too close to per-block noise. AE gets frozen later, just
+       before pixel refinement, where stable exposure is non-negotiable. */
+
+    /* Phase 1: capture baseline. Average a few frames to wash out per-frame
+       noise. We assume peer is OFF during this window — caller's
+       responsibility (cam2 explicitly delays its beacon by SEARCH_BASELINE_MS
+       in the bidirectional flow). */
+    fprintf(stderr, "SEARCH: capturing baseline (%dms)...\n",
+            SEARCH_BASELINE_MS);
+    status_set("search_baseline", "capturing grid baseline (peer LEDs OFF expected)");
+    log_event("SEARCH", "baseline-start");
+
+    {
+        int sum[GRID_BLOCKS] = {0};
+        int n_samples = 0;
+        int64_t baseline_until = now_ms() + SEARCH_BASELINE_MS;
+        while (now_ms() < baseline_until && running) {
+            uint8_t blocks[GRID_BLOCKS];
+            int64_t ts;
+            if (read_grid(&ts, blocks, GRID_BLOCKS) > 0) {
+                for (int i = 0; i < GRID_BLOCKS; i++) sum[i] += blocks[i];
+                n_samples++;
+            }
+            usleep(60 * 1000);
+        }
+        if (n_samples == 0) {
+            fprintf(stderr, "SEARCH: failed to read grid during baseline\n");
+            return -1;
+        }
+        for (int i = 0; i < GRID_BLOCKS; i++)
+            baseline[i] = (uint8_t)(sum[i] / n_samples);
+        baseline_taken_ms = now_ms();
+    }
+    fprintf(stderr, "SEARCH: baseline ready, scanning for peer beacon...\n");
+    status_set("search_scanning", "scanning grid for peer beacon");
+    log_event("SEARCH", "baseline-done, scanning");
+    for (int i = 0; i < GRID_BLOCKS; i++) bright_since[i] = 0;
+
+    /* Phase 2: scan loop. Look for any block elevated by SEARCH_DELTA for
+       SEARCH_HOLD_MS continuously. Track the strongest current candidate
+       so a stronger block displaces a weaker one (handles ambient drift). */
+    int useconds_per_scan = 1000000 / SEARCH_SCAN_HZ;
+    int64_t deadline = start_ms + max_wait_ms;
+
+    while (now_ms() < deadline && running) {
+        uint8_t blocks[GRID_BLOCKS];
+        int64_t ts;
+        if (read_grid(&ts, blocks, GRID_BLOCKS) <= 0) {
+            usleep(useconds_per_scan);
+            continue;
+        }
+
+        int best_block = -1, best_delta = 0;
+        for (int i = 0; i < GRID_BLOCKS; i++) {
+            int delta = (int)blocks[i] - (int)baseline[i];
+            if (delta >= SEARCH_DELTA) {
+                if (bright_since[i] == 0) bright_since[i] = ts;
+                if (delta > best_delta) { best_delta = delta; best_block = i; }
+            } else {
+                bright_since[i] = 0;
+            }
+        }
+
+        if (best_block >= 0 &&
+            (ts - bright_since[best_block]) >= SEARCH_HOLD_MS) {
+            int held_ms = (int)(ts - bright_since[best_block]);
+            int active_val = blocks[best_block];
+            fprintf(stderr,
+                "SEARCH: ACQUIRED block %d (delta=%d, baseline=%d, "
+                "active=%d, held=%dms)\n",
+                best_block, best_delta, baseline[best_block],
+                active_val, held_ms);
+            log_event("SEARCH",
+                "acquired block=%d delta=%d held=%dms",
+                best_block, best_delta, held_ms);
+            status_peak_block = best_block;
+            status_peak_delta = best_delta;
+            char ev[STATUS_EVENT_LEN];
+            snprintf(ev, sizeof(ev),
+                "block %d delta %d; refining to pixel",
+                best_block, best_delta);
+            status_set("search_refining", ev);
+
+            /* Phase 3: refine to pixel. Freeze AE here — find_peak_pixel
+               compares ROI brightness across rapid sweeps and any AE drift
+               between samples invalidates the comparison. Peer must still be
+               holding LEDs ON for the next ~5s of ROI sweep. */
+            set_ae_freeze(1);
+            usleep(500 * 1000);  /* AE settle after freeze */
+            int px = -1, py = -1;
+            uint8_t pb = 0;
+            int rc = find_peak_pixel_in_block(best_block, &px, &py, &pb);
+            set_ae_freeze(0);
+            if (rc < 0) {
+                fprintf(stderr, "SEARCH: pixel refinement failed\n");
+                log_event("SEARCH", "refine-fail block=%d", best_block);
+                status_set("search_failed", "pixel refinement failed");
+                return 1;
+            }
+            *out_block = best_block;
+            *out_px = px;
+            *out_py = py;
+            *out_baseline = baseline[best_block];
+            *out_active = active_val;
+            *out_delta = best_delta;
+            status_peak_x = px;
+            status_peak_y = py;
+            status_peak_brightness = pb;
+            log_event("SEARCH",
+                "pixel=(%d,%d) peak_b=%d", px, py, pb);
+            char ev2[STATUS_EVENT_LEN];
+            snprintf(ev2, sizeof(ev2),
+                "pixel (%d,%d) peak_b=%d", px, py, pb);
+            status_set("search_done", ev2);
+            (void)baseline_taken_ms;  /* reserved for future timing report */
+            return 0;
+        }
+
+        usleep(useconds_per_scan);
+    }
+
+    fprintf(stderr, "SEARCH: timeout (%dms) — no peer beacon detected\n",
+            max_wait_ms);
+    log_event("SEARCH", "timeout=%dms", max_wait_ms);
+    status_set("search_timeout", "no peer beacon detected");
+    return 1;
+}
+
+/* ================================================================
+ *  Light-triggered bootstrap helpers
+ *
+ *  hold_leds_on()  is reused by:
+ *    - cam2's `irlink monocal` bootstrap fallback (long LED hold to wake
+ *      cam1's grid-watchdog when the saved-pixel handshake fails)
+ *    - cam1's grid-watchdog trigger handler (the responding hold so cam2
+ *      can find cam1 in its do_search phase)
+ *
+ *  The wire-level signal is "LEDs solid for N seconds, no Manchester."
+ *  Manchester-encoded frames always transition every symbol period
+ *  (≤200ms at the slowest rate), so a multi-second sustained LED-on
+ *  pulse is unambiguously NOT a normal protocol frame — cam1's grid-
+ *  watchdog uses that to distinguish "peer wants discovery" from
+ *  "peer is talking to me normally."  See the grid-watchdog section
+ *  below for the detection logic, and do_monocal_request for the cam2
+ *  side fallback flow.
+ * ================================================================ */
+
+/* Tuning constants for the cam2-side bootstrap fallback in monocal.
+ * BOOTSTRAP_HOLD_MS must satisfy:
+ *   trigger_window (~5s, watchdog dwell) + scan + refine (~10s) + slack
+ * Plus enough margin that cam1 can finish refining BEFORE cam2 turns off
+ * and switches to its own search. We pick 25s = generous. */
+#define BOOTSTRAP_HOLD_MS         25000  /* cam2 holds LEDs solid this long */
+#define BOOTSTRAP_BASELINE_GRACE_MS 2000 /* cam2 OFF before its own do_search */
+
+static void hold_leds_on(int duration_ms)
+{
+    /* Direct GPIO toggle — no Manchester, no AE concern from RX side
+       (we're TXing). 850nm and 940nm together for max emitted power.
+       Stays in tx_mutex/tx_active so any rx_thread on this side correctly
+       gates its self-suppression. */
+    fprintf(stderr, "BOOTSTRAP: LEDs ON for %dms\n", duration_ms);
+    log_event("BOOTSTRAP", "leds-on duration=%d", duration_ms);
+    pthread_mutex_lock(&tx_mutex);
+    tx_active = 1;
+    gpio_set(1);
+    /* Poll `running` so SIGTERM can interrupt a long hold. */
+    int chunks = duration_ms / 100;
+    for (int i = 0; i < chunks && running; i++) usleep(100000);
+    int remainder = duration_ms - chunks * 100;
+    if (remainder > 0 && running) usleep((useconds_t)remainder * 1000);
+    gpio_set(0);
+    tx_active = 0;
+    pthread_mutex_unlock(&tx_mutex);
+    fprintf(stderr, "BOOTSTRAP: LEDs OFF\n");
+    log_event("BOOTSTRAP", "leds-off");
+}
+
+/* ================================================================
+ *  Grid-watchdog (cam1-side bootstrap detector)
+ *
+ *  Runs alongside rx_thread. While daemon-listen is in a state where the
+ *  saved pixel might be wrong (no valid frame ever decoded yet, OR no
+ *  valid frame in IDLE_THRESHOLD_MS), the watchdog samples the brightness
+ *  grid at 1 Hz and looks for any block that stays elevated above its
+ *  rolling baseline by ≥WATCHDOG_DELTA for ≥WATCHDOG_TRIGGER_SAMPLES
+ *  consecutive samples.
+ *
+ *  A multi-second sustained brightness rise is unambiguously NOT a
+ *  Manchester frame (every symbol transitions ≤200ms); the only thing
+ *  that produces it is a deliberate "hold LEDs solid" beacon — which is
+ *  exactly what cam2 emits in its monocal bootstrap-fallback path.
+ *
+ *  When the watchdog fires, it runs handle_watchdog_trigger directly:
+ *  refines to a pixel via find_peak_pixel_in_block, writes the new cal,
+ *  waits for cam2's beacon to end (the falling edge), 2s OFF grace for
+ *  cam2's own do_search baseline, then holds LEDs 15s so cam2's search
+ *  finds cam1.
+ *
+ *  Concurrency:
+ *    cal_flow_active=1 during the handler — gates the AE-drift defense
+ *    and split-brain timer in rx_thread. tx_active=1 inside hold_leds_on
+ *    suppresses self-RX during our own beacon. After the handler returns
+ *    rx_thread naturally resumes at the new pixel (write_roi_config takes
+ *    effect at the next BrightnessMonitor frame).
+ * ================================================================ */
+
+#define IDLE_THRESHOLD_MS         180000  /* 3 min silence → watchdog re-arms */
+/* WATCHDOG_DELTA tuning: measured cam2-beacon delta at the bench is
+ * +13..+21 on the brightest block. Ambient lighting features (wall
+ * edges, lamps, partial sunlight) routinely sustain +7..+10 above the
+ * EMA baseline without being a peer beacon. Setting threshold at 15
+ * comfortably rejects ambient while still catching real beacons. */
+#define WATCHDOG_DELTA              15
+/* Sampling math: at 200ms cadence (5 Hz), Manchester at 160ms/sym lands
+ * different phases on every sample. Over 5s = 25 consecutive samples,
+ * Manchester traffic averages ~50% elevated; the chance of 25 in a row
+ * elevated is ≈0.5^25 ≈ 0 — i.e. Manchester WILL produce OFF samples
+ * within a 5s window. A solid LED hold (no transitions) keeps every
+ * sample elevated, so 25-in-a-row is the correct discriminator between
+ * "peer is talking to me normally" and "peer wants discovery". */
+#define WATCHDOG_SAMPLE_MS          200   /* 5 Hz scan cadence */
+#define WATCHDOG_TRIGGER_SAMPLES    25    /* 25 × 200ms = 5s sustained */
+#define WATCHDOG_STARTUP_GRACE_MS 30000   /* don't fire in first 30s — let
+                                             EMA settle and let cam2's
+                                             short-handshake (~35s) play
+                                             out before pivoting */
+/* Max wait for cam2's LEDs to drop. Used to be 60s but the falling-edge
+ * detection (delta < WATCHDOG_DELTA/2) frequently times out: handle_watchdog_trigger
+ * froze AE *after* cam2's LEDs were already on, so AE locked at the compressed
+ * exposure. After cam2 drops LEDs, blocks[block_idx] reads at the frozen
+ * exposure but watchdog_baseline was captured pre-freeze at active AE — the
+ * delta stays large positive and never falls below WATCHDOG_DELTA/2. With a
+ * 60s ceiling, cam1's hold started at ~+77s after cam2's hold began, but cam2's
+ * 25s search window had already closed at ~+51s — they never overlapped, cam2
+ * gave up with "did not see cam1's responding hold". 22s ceiling guarantees
+ * cam1's hold lands inside cam2's search window even on AE-baseline failure:
+ *   cam1 hold (15s) at +39s..+54s vs cam2 search +26s..+51s → 12s overlap.
+ * Proper fix is to re-baseline after AE freeze; this is the safety net. */
+#define WATCHDOG_FALLING_EDGE_MS  22000
+/* cam1's OFF window must FULLY cover cam2's BOOTSTRAP_BASELINE_GRACE_MS
+ * (2s) + cam2's do_search baseline window (~1.5s) + falling-edge detect
+ * latency on this side (~150ms) + safety margin. 4.5s gives clear room
+ * for cam2's baseline to be captured entirely in cam1's OFF state. */
+#define WATCHDOG_OFF_GRACE_MS      4500
+#define WATCHDOG_HOLD_MS          15000   /* cam1's responding hold for cam2's search */
+
+/* Set in daemon_mode (listener side) when watchdog is armed; used to gate
+ * the startup grace period before the watchdog can actually fire. */
+static int64_t watchdog_armed_at_ms = 0;
+
+static volatile int watchdog_enabled = 0;       /* daemon_mode arms us */
+static volatile int watchdog_active = 0;        /* handler currently running */
+
+/* Block-level rolling baselines + consecutive-elevated counters, owned by
+ * the watchdog thread. */
+static uint8_t  watchdog_baseline[GRID_BLOCKS];
+static int      watchdog_run_len[GRID_BLOCKS];
+static int      watchdog_baseline_init = 0;
+
+static int watchdog_should_run(void)
+{
+    if (!watchdog_enabled) return 0;
+    if (cal_flow_active) return 0;
+    if (watchdog_active) return 0;
+    /* Suppress during our own TX. cam1's own LEDs cause self-reflection
+     * in its grid; if not gated, a long classic SYN_ACK (20.8s at 200ms/sym)
+     * generates enough sustained elevation for the watchdog to false-fire
+     * before the peer ever transmits anything. Symptom: watchdog refines
+     * onto a self-reflection block (typically the bottom edge of the frame
+     * near where cam1's own LEDs sit) and either overwrites the cal or, with
+     * the new guard, logs "refuse-overwrite" — either way it preempts the
+     * imminent CAL_REQ handling and the protocol stalls. */
+    if (tx_active) return 0;
+    /* Startup grace: don't fire within the first WATCHDOG_STARTUP_GRACE_MS
+       after arming. This gives the EMA baseline time to settle on real
+       ambient brightness, AND gives cam2's short-handshake (~35s) room to
+       complete on the protocol path before we'd pivot. Without this, an
+       ambient bright spot present at daemon-listen launch can fire the
+       watchdog before any peer transmission, breaking the happy path. */
+    if (watchdog_armed_at_ms > 0
+        && now_ms() - watchdog_armed_at_ms < WATCHDOG_STARTUP_GRACE_MS)
+        return 0;
+    /* While the rate lock is on (no successful cal yet), keep the watchdog
+       hot: a half-completed handshake can update last_valid_frame_ms even
+       though no cal happened, and the original 3-min idle gate would then
+       block bootstrap recovery for the entire IDLE_THRESHOLD_MS window.
+       Symptom: cam1 receives SYN + sends SYN_ACK, peer's ACK doesn't
+       decode, peer pivots to bootstrap_hold (25s of solid LEDs), but
+       cam1's watchdog stays gated because the SYN counts as "recent
+       valid frame." Manchester transmission can't satisfy the watchdog's
+       "25 consecutive samples ≥ WATCHDOG_DELTA" threshold (LED toggles
+       at ~100ms intervals), so being eligible here is safe — only
+       sustained LED-on (≥5s) trips it. */
+    if (rate_locked_at_floor) return 1;
+    /* Post-cal: only fire when no valid frame yet (startup) OR long-idle. */
+    if (last_valid_frame_ms == 0) return 1;
+    if (now_ms() - last_valid_frame_ms > IDLE_THRESHOLD_MS) return 1;
+    return 0;
+}
+
+/* The handler. Runs entirely within the watchdog thread. Sets
+ * cal_flow_active across its lifetime so other timers (split-brain,
+ * AE-drift defense) treat the work as a legitimate cal flow. */
+static void handle_watchdog_trigger(int block_idx)
+{
+    log_event("WATCHDOG", "fired block=%d (%d×%d=col,row)",
+              block_idx, block_idx % 20, block_idx / 20);
+    fprintf(stderr, "WATCHDOG: triggered on block %d — refining pixel\n",
+            block_idx);
+    status_set("watchdog_refining",
+               "bootstrap trigger: refining pixel from grid");
+    cal_flow_active = 1;
+    watchdog_active = 1;
+
+    /* Phase 1: refine to pixel while peer's LEDs are still on. AE freeze
+       is required for stable ROI sweep brightness comparisons. */
+    set_ae_freeze(1);
+    usleep(500 * 1000);
+    int px = -1, py = -1;
+    uint8_t pb = 0;
+    int rc = find_peak_pixel_in_block(block_idx, &px, &py, &pb);
+    if (rc < 0 || px < 0 || py < 0) {
+        fprintf(stderr, "WATCHDOG: pixel refinement failed; aborting\n");
+        log_event("WATCHDOG", "refine-fail block=%d", block_idx);
+        status_set("watchdog_failed", "pixel refinement failed");
+        set_ae_freeze(0);
+        cal_flow_active = 0;
+        watchdog_active = 0;
+        return;
+    }
+    /* Persist new cal. We don't have an "off_value" measurement for the
+       json (we only saw the ON state). Use the rolling baseline as the
+       OFF estimate — close enough for diagnostic display. */
+    int off_v = watchdog_baseline[block_idx];
+    int on_v  = off_v + WATCHDOG_DELTA;  /* nominal — find_peak gives us pb */
+    int delta_v = WATCHDOG_DELTA;
+
+    /* Guard: refuse to overwrite a strong saved cal with a much weaker one.
+     * Wyze V3 has 8 IR LEDs in a ring + nearby surfaces (desk, wall) reflect
+     * IR — the brightest grid block on any given watchdog trigger may be a
+     * weak reflection rather than a direct LED hit. Without this guard a
+     * single bad watchdog refinement (e.g. peak_b=158 from a floor bounce)
+     * trashes a previously-good cal (peak_b=235 from direct LED). Threshold
+     * of 30 units = roughly one ISP step; tighter than that risks rejecting
+     * legitimate re-cals after physical shifts. */
+    int saved_pb = read_saved_peak_brightness();
+    if (saved_pb > 0 && pb + 30 < saved_pb) {
+        fprintf(stderr,
+            "WATCHDOG: refusing to overwrite saved cal — "
+            "new pb=%d < saved pb=%d - 30 (likely reflection, not direct LED)\n",
+            pb, saved_pb);
+        log_event("WATCHDOG",
+            "refuse-overwrite new_pb=%d saved_pb=%d block=%d pixel=(%d,%d)",
+            pb, saved_pb, block_idx, px, py);
+        /* Don't update pixel_x/pixel_y or roi_config either — keep the
+         * current ROI so subsequent RX continues at the saved-cal pixel. */
+        status_set("watchdog_skipped", "weak refinement; kept saved cal");
+        set_ae_freeze(1);
+        last_valid_frame_ms = now_ms();
+        last_substantial_decode_fail_ms = 0;
+        watchdog_baseline_init = 0;
+        cal_flow_active = 0;
+        watchdog_active = 0;
+        return;
+    }
+
+    write_calibration_json(px, py, off_v, on_v, delta_v, pb);
+    pixel_x = px;
+    pixel_y = py;
+    /* Also mirror to the status fields the webui reads — `pixel` in
+       /run/irlink-status.json reflects the live tracked pixel. Without
+       this, the webui keeps showing the daemon's launch-time pixel
+       even though rx_thread + roi_config are now at the new one. */
+    status_pixel_x = px;
+    status_pixel_y = py;
+    write_roi_config(pixel_x, pixel_y, pixel_roi_size);
+    status_peak_x = px;
+    status_peak_y = py;
+    status_peak_brightness = pb;
+    status_peak_block = block_idx;
+    fprintf(stderr,
+        "WATCHDOG: cal saved — block=%d pixel=(%d,%d) peak_b=%d\n",
+        block_idx, px, py, pb);
+    log_event("WATCHDOG", "cal-saved pixel=(%d,%d) peak_b=%d", px, py, pb);
+
+    /* Phase 2: wait for the peer's hold to end. We poll the brightness
+       grid for our trigger block to drop; that's the implicit "your turn"
+       signal.
+
+       Subtle: the original implementation compared `blocks[block_idx]`
+       against `watchdog_baseline[block_idx]`. That baseline was captured
+       at ACTIVE-AE before cam2's LEDs ever turned on. Once we froze AE in
+       Phase 1, the ISP locked the exposure at the value chosen for the
+       LED-bright frame — which is much darker than the ambient exposure
+       the baseline was sampled at. After cam2 drops LEDs, the locked-AE
+       OFF reading often stays well above the active-AE baseline, so the
+       `delta < WATCHDOG_DELTA/2` predicate never fires and the loop
+       times out at WATCHDOG_FALLING_EDGE_MS. With a 60s ceiling that
+       blew past cam2's ~50s search window; even at the new 22s ceiling
+       it relies on dumb luck.
+
+       Fix: capture a fresh `on_ref` NOW (AE frozen, cam2 still holding)
+       and watch for that to drop by WATCHDOG_DELTA. Both samples are at
+       the same locked exposure, so the comparison is well-defined. */
+    int on_ref = -1;
+    {
+        uint8_t blocks0[GRID_BLOCKS];
+        int64_t ts0;
+        if (read_grid(&ts0, blocks0, GRID_BLOCKS) > 0)
+            on_ref = (int)blocks0[block_idx];
+    }
+    status_set("watchdog_wait_falling",
+               "waiting for peer LEDs to drop (their turn → ours)");
+    log_event("WATCHDOG", "wait_falling on_ref=%d", on_ref);
+    int64_t falling_deadline = now_ms() + WATCHDOG_FALLING_EDGE_MS;
+    while (now_ms() < falling_deadline && running) {
+        uint8_t blocks[GRID_BLOCKS];
+        int64_t ts;
+        if (read_grid(&ts, blocks, GRID_BLOCKS) > 0) {
+            int cur = (int)blocks[block_idx];
+            if (on_ref > 0) {
+                /* Drop by ≥ WATCHDOG_DELTA below the locked-AE on-value
+                   means cam2's LEDs are off. */
+                if (on_ref - cur >= WATCHDOG_DELTA) break;
+            } else {
+                /* Fallback (on_ref capture failed): old pre-freeze
+                   baseline check. Less reliable but better than nothing. */
+                if (cur - (int)watchdog_baseline[block_idx]
+                    < WATCHDOG_DELTA / 2) break;
+            }
+        }
+        usleep(150 * 1000);
+    }
+    log_event("WATCHDOG", "falling-edge detected (or timed out)");
+
+    /* Phase 3: OFF grace — cam2's do_search captures its baseline during
+       this window, expecting our LEDs OFF. */
+    set_ae_freeze(0);   /* unfreeze briefly so peer's AE matches ours? No
+                           — we're just OFF and not RXing. Keep frozen
+                           is also fine. Defensively unfreeze: don't
+                           interfere with peer's grid view. */
+    usleep(WATCHDOG_OFF_GRACE_MS * 1000);
+
+    /* Phase 4: hold LEDs so peer's search can find us. */
+    status_set("watchdog_hold",
+               "holding LEDs so peer can find us");
+    hold_leds_on(WATCHDOG_HOLD_MS);
+
+    /* Done — restore daemon-listen state at the new pixel. The next
+       protocol flow (e.g. cam2's normal monocal that follows the
+       bootstrap) will succeed because pixel_x/pixel_y are now correct. */
+    set_ae_freeze(1);
+    last_valid_frame_ms = now_ms();          /* reset split-brain timers */
+    last_substantial_decode_fail_ms = 0;
+    /* Reset watchdog baselines so we don't re-fire on lingering elevation. */
+    watchdog_baseline_init = 0;
+    status_set("listening", "watchdog complete; resumed pixel-listen at new pixel");
+    log_event("WATCHDOG", "complete pixel=(%d,%d)", px, py);
+    unlock_rate_after_cal("handle_watchdog_trigger complete");
+    cal_flow_active = 0;
+    watchdog_active = 0;
+}
+
+static void *grid_watchdog_thread(void *unused)
+{
+    (void)unused;
+    while (running) {
+        usleep(WATCHDOG_SAMPLE_MS * 1000);
+        if (!watchdog_should_run()) {
+            watchdog_baseline_init = 0;
+            continue;
+        }
+
+        uint8_t blocks[GRID_BLOCKS];
+        int64_t ts;
+        if (read_grid(&ts, blocks, GRID_BLOCKS) <= 0) continue;
+
+        if (!watchdog_baseline_init) {
+            memcpy(watchdog_baseline, blocks, GRID_BLOCKS);
+            for (int i = 0; i < GRID_BLOCKS; i++) watchdog_run_len[i] = 0;
+            watchdog_baseline_init = 1;
+            continue;
+        }
+
+        int triggered = -1;
+        int best_delta = 0;
+        for (int i = 0; i < GRID_BLOCKS; i++) {
+            int delta = (int)blocks[i] - (int)watchdog_baseline[i];
+            if (delta >= WATCHDOG_DELTA) {
+                watchdog_run_len[i]++;
+                if (watchdog_run_len[i] >= WATCHDOG_TRIGGER_SAMPLES
+                    && delta > best_delta) {
+                    best_delta = delta;
+                    triggered = i;
+                }
+            } else {
+                watchdog_run_len[i] = 0;
+                /* Slow EMA on quiet blocks — tracks ambient drift. */
+                watchdog_baseline[i] =
+                    (uint8_t)((7 * watchdog_baseline[i] + blocks[i]) / 8);
+            }
+        }
+
+        if (triggered >= 0) {
+            handle_watchdog_trigger(triggered);
+        }
+    }
+    return NULL;
+}
+
+/* ================================================================
  *  RX Thread
  * ================================================================ */
 
@@ -1527,16 +2569,26 @@ static void *rx_thread(void *arg)
            ack_timeout_ms so handshake flows don't false-trigger.
            Note: we do NOT require carrier-absence, because a peer stuck at
            a mismatched rate still produces carrier (we see TX activity) but
-           can never produce a valid decode — that's exactly split-brain. */
+           can never produce a valid decode — that's exactly split-brain.
+           HOWEVER, we DO require that recent "carrier" was substantial: a
+           failed decode of a real-looking frame, not just 2-sample ambient
+           drift. Otherwise, daemon-listen sitting idle for hours would trip
+           split-brain on slow lighting drift and silently drop the rate. */
         int split_brain_window_ms = 2 * ack_timeout_ms;
         if (split_brain_window_ms < SPLIT_BRAIN_TIMEOUT_MS)
             split_brain_window_ms = SPLIT_BRAIN_TIMEOUT_MS;
         if (!tx_active && !cal_flow_active && last_valid_frame_ms > 0
             && current_rung < RATE_LADDER_LEN - 1
-            && now_ms() - last_valid_frame_ms > split_brain_window_ms) {
+            && last_substantial_decode_fail_ms > 0
+            && now_ms() - last_substantial_decode_fail_ms < split_brain_window_ms
+            && now_ms() - last_valid_frame_ms > split_brain_window_ms
+            && now_ms() - last_split_brain_fire_ms > split_brain_window_ms) {
             apply_rate(RATE_LADDER_MS[RATE_LADDER_LEN - 1],
                        RATE_LADDER_LEN - 1, "split-brain-recovery");
-            last_valid_frame_ms = now_ms();  /* reset so we don't immediately refire */
+            /* Debounce via separate timer — DO NOT touch last_valid_frame_ms
+               (the grid-watchdog reads that to determine "long-idle" and
+               we'd block its re-arm for another IDLE_THRESHOLD_MS). */
+            last_split_brain_fire_ms = now_ms();
             success_at_rate = 0;
             fail_at_rate = 0;
             probe_in_progress = 0;
@@ -1620,6 +2672,12 @@ static void *rx_thread(void *arg)
         int diff = (int)brightness - (int)baseline;
         if (diff < 0) diff = -diff;
 
+        /* Mirror to globals so write_irlink_status can serve them via HTTP.
+           These are diagnostic-only — no protocol behavior depends on them. */
+        status_rx_brightness = brightness;
+        status_rx_baseline   = baseline;
+        status_rx_active     = (state == ACTIVE) ? 1 : 0;
+
         switch (state) {
         case IDLE:
             if (diff >= MIN_BRIGHTNESS_DELTA) {
@@ -1681,6 +2739,8 @@ static void *rx_thread(void *arg)
                     const char *n = (msg.msg_type <= MSG_RATE_CHANGE) ? names[msg.msg_type] : "?";
                     fprintf(stderr, "RX: <<< %s seq=%d len=%d >>>\n",
                             n, msg.seq, msg.data_len);
+                    log_event("RX", "%s seq=%d len=%d dpll=%d",
+                              n, msg.seq, msg.data_len, dpll_ok);
 
                     if (msg.msg_type == MSG_DATA && msg.data_len > 0) {
                         /* Hex form is binary-safe (app-layer payloads may contain \0).
@@ -1731,6 +2791,17 @@ static void *rx_thread(void *arg)
                 } else {
                     crc_fail_count++;
                     fprintf(stderr, "RX: decode failed\n");
+                    log_event("RX", "decode_fail samples=%d", n_samples);
+                    /* Only "substantial" failures are evidence that a real
+                       peer is transmitting at a rate we can't decode — the
+                       split-brain signal. Brief 2-sample ambient drift blips
+                       must not arm split-brain or daemon-listen will rate-
+                       drop after hours of idle. Also skip during cal flows:
+                       AE-toggling and ROI sweeps inside do_calibrate_pixel
+                       cause large failed decodes that aren't rate-mismatch. */
+                    if (n_samples >= SUBSTANTIAL_DECODE_SAMPLES
+                        && !cal_flow_active)
+                        last_substantial_decode_fail_ms = now_ms();
                 }
 
                 state = IDLE;
@@ -1880,6 +2951,29 @@ static int do_connect(void)
     return -1;
 }
 
+/* Single-attempt connect with caller-controlled timeout. Used by monocal's
+   bootstrap-fallback path: send one SYN, wait briefly, return -1 fast if
+   the peer doesn't ACK so we can pivot to a light-only bootstrap instead
+   of waiting through MAX_RETRIES * ack_timeout_ms (~3.5min default).
+   On the happy path (peer ACKs quickly), behavior matches do_connect's
+   first iteration exactly. */
+static int do_connect_short(int wait_ms)
+{
+    fprintf(stderr, "PROTO: short-handshake SYN (%dms wait)...\n", wait_ms);
+    send_message(MSG_SYN, 0, NULL, 0);
+
+    rx_message_t reply;
+    if (wait_for_msg(MSG_SYN_ACK, &reply, wait_ms) == 0) {
+        fprintf(stderr, "PROTO: got SYN_ACK! Sending ACK...\n");
+        send_message(MSG_ACK, 0, NULL, 0);
+        fprintf(stderr, "PROTO: connected!\n");
+        status_set("connected", "got SYN_ACK; sent ACK");
+        return 0;
+    }
+    fprintf(stderr, "PROTO: short-handshake SYN_ACK timeout (%dms)\n", wait_ms);
+    return -1;
+}
+
 /* ---- Listen: wait for incoming connection ---- */
 
 static int do_listen(void)
@@ -1929,6 +3023,9 @@ static int do_rate_change(int new_ms, const char *reason)
 /* Maybe probe a faster rung before the next DATA send. */
 static void maybe_probe_up(void)
 {
+    /* Locked at floor until first cal completes — prevents startup-window
+       split-brain. See rate_locked_at_floor. */
+    if (rate_locked_at_floor) return;
     if (probe_in_progress) return;
     if (current_rung <= 0) return;
     if (success_at_rate < PROBE_UP_AFTER) return;
@@ -2087,18 +3184,16 @@ static int do_cal_request_internal(int bidi)
             pixel_cal_result_t r;
             int rc = do_calibrate_pixel_to(&r);
 
-            uint8_t payload[6];
+            uint8_t payload[CAL_DONE_PAYLOAD_LEN];
             if (rc == 0) {
-                payload[0] = (uint8_t)((r.pixel_x >> 8) & 0xFF);
-                payload[1] = (uint8_t)(r.pixel_x & 0xFF);
-                payload[2] = (uint8_t)((r.pixel_y >> 8) & 0xFF);
-                payload[3] = (uint8_t)(r.pixel_y & 0xFF);
-                payload[4] = r.peak_b;
-                payload[5] = (uint8_t)(r.grid_delta > 255 ? 255
-                                       : (r.grid_delta < 0 ? 0 : r.grid_delta));
-                fprintf(stderr, "PROTO: pixel cal OK, sending CAL_DONE "
-                                "(x=%d y=%d b=%d d=%d)\n",
-                        r.pixel_x, r.pixel_y, r.peak_b, r.grid_delta);
+                pack_cal_done(r.pixel_x, r.pixel_y, payload);
+                int rx_x, rx_y;
+                unpack_cal_done(payload, &rx_x, &rx_y);
+                fprintf(stderr,
+                    "PROTO: pixel cal OK, sending CAL_DONE "
+                    "(x=%d y=%d b=%d d=%d → quantized payload [%d, %d] → recovered (%d, %d))\n",
+                    r.pixel_x, r.pixel_y, r.peak_b, r.grid_delta,
+                    payload[0], payload[1], rx_x, rx_y);
                 status_peak_x = r.pixel_x;
                 status_peak_y = r.pixel_y;
                 status_peak_brightness = r.peak_b;
@@ -2110,7 +3205,7 @@ static int do_cal_request_internal(int bidi)
                 printf("PIXEL: %d %d %d %d %d\n",
                        r.pixel_x, r.pixel_y, (int)r.peak_b, r.grid_delta, r.block_idx);
                 fflush(stdout);
-                send_message(MSG_CAL_DONE, 0, payload, 6);
+                send_message(MSG_CAL_DONE, 0, payload, CAL_DONE_PAYLOAD_LEN);
 
                 /* CAL_VISUAL: 15-byte single DATA frame (1 type + 14 body),
                    fits the 16-byte single-frame ceiling. Body =
@@ -2245,23 +3340,27 @@ static void handle_cal_request(int bidi)
     status_set("cal_awaiting_done", "LED hold ended; waiting for peer CAL_DONE");
     rx_message_t msg;
     if (wait_for_msg(MSG_CAL_DONE, &msg, 90000) == 0) {
-        if (msg.data_len >= 6) {
-            int x = (msg.data[0] << 8) | msg.data[1];
-            int y = (msg.data[2] << 8) | msg.data[3];
-            int peak_b = msg.data[4];
-            int delta = msg.data[5];
-            fprintf(stderr, "PROTO: peer cal complete → x=%d y=%d b=%d d=%d\n",
-                    x, y, peak_b, delta);
+        if (msg.data_len >= CAL_DONE_PAYLOAD_LEN) {
+            int x, y;
+            unpack_cal_done(msg.data, &x, &y);
+            fprintf(stderr,
+                "PROTO: peer cal complete → received payload [%d, %d] → "
+                "x=%d y=%d (4-px quantized)\n",
+                msg.data[0], msg.data[1], x, y);
             status_peak_x = x;
             status_peak_y = y;
-            status_peak_brightness = peak_b;
-            status_peak_delta = delta;
+            /* peak_brightness / grid_delta are no longer carried in the
+             * CAL_DONE payload (compressed 6→2 B). Leave the status fields
+             * untouched so prior values remain visible. */
             char ev[STATUS_EVENT_LEN];
-            snprintf(ev, sizeof(ev), "peer cal complete x=%d y=%d d=%d", x, y, delta);
+            snprintf(ev, sizeof(ev), "peer cal complete x=%d y=%d", x, y);
             status_set("cal_done_recv", ev);
-            /* Stable parseable line for orchestrators (peer's view of US). */
-            printf("PEER-CAL: %d %d %d %d\n", x, y, peak_b, delta);
+            /* Stable parseable line for orchestrators (peer's view of US).
+             * b/d remain in format for back-compat — emit -1 since we don't
+             * have them. */
+            printf("PEER-CAL: %d %d -1 -1\n", x, y);
             fflush(stdout);
+            unlock_rate_after_cal("handle_cal_request success");
         } else {
             fprintf(stderr, "PROTO: peer cal returned empty CAL_DONE (failed)\n");
             status_set("cal_failed", "empty CAL_DONE from peer");
@@ -2355,25 +3454,24 @@ static int do_monocal_request(void)
             return -1;
         }
 
-        if (done_msg.data_len >= 6) {
-            int x = (done_msg.data[0] << 8) | done_msg.data[1];
-            int y = (done_msg.data[2] << 8) | done_msg.data[3];
-            int peak_b = done_msg.data[4];
-            int delta = done_msg.data[5];
-            fprintf(stderr, "PROTO: monocal complete → peer x=%d y=%d b=%d d=%d\n",
-                    x, y, peak_b, delta);
+        if (done_msg.data_len >= CAL_DONE_PAYLOAD_LEN) {
+            int x, y;
+            unpack_cal_done(done_msg.data, &x, &y);
+            fprintf(stderr,
+                "PROTO: monocal complete → received payload [%d, %d] → "
+                "peer x=%d y=%d (4-px quantized)\n",
+                done_msg.data[0], done_msg.data[1], x, y);
             monocal_peer_x = x;
             monocal_peer_y = y;
-            monocal_peer_b = peak_b;
-            monocal_peer_d = delta;
+            monocal_peer_b = 0;   /* not carried in 2-byte payload */
+            monocal_peer_d = 0;
             monocal_have_peer_pixel = 1;
             /* Reuse status_peak_* so /x/cal-status.cgi reflects monocal too. */
             status_peak_x = x;
             status_peak_y = y;
-            status_peak_brightness = peak_b;
-            status_peak_delta = delta;
+            /* peak_brightness / grid_delta untouched — see RX-site-1 note. */
             /* Same parseable line as bicall's responder path uses. */
-            printf("PEER-CAL: %d %d %d %d\n", x, y, peak_b, delta);
+            printf("PEER-CAL: %d %d -1 -1\n", x, y);
             fflush(stdout);
             monocal_ended_ms = now_ms();
             monocal_ok = 1;
@@ -2446,17 +3544,15 @@ static void handle_monocal_request(void)
     }
 
     if (rc == 0) {
-        uint8_t payload[6];
-        payload[0] = (uint8_t)((r.pixel_x >> 8) & 0xFF);
-        payload[1] = (uint8_t)(r.pixel_x & 0xFF);
-        payload[2] = (uint8_t)((r.pixel_y >> 8) & 0xFF);
-        payload[3] = (uint8_t)(r.pixel_y & 0xFF);
-        payload[4] = r.peak_b;
-        payload[5] = (uint8_t)(r.grid_delta > 255 ? 255
-                               : (r.grid_delta < 0 ? 0 : r.grid_delta));
-        fprintf(stderr, "PROTO: monocal scan OK, sending CAL_DONE "
-                        "(x=%d y=%d b=%d d=%d)\n",
-                r.pixel_x, r.pixel_y, r.peak_b, r.grid_delta);
+        uint8_t payload[CAL_DONE_PAYLOAD_LEN];
+        pack_cal_done(r.pixel_x, r.pixel_y, payload);
+        int rx_x, rx_y;
+        unpack_cal_done(payload, &rx_x, &rx_y);
+        fprintf(stderr,
+            "PROTO: monocal scan OK, sending CAL_DONE "
+            "(x=%d y=%d b=%d d=%d → quantized payload [%d, %d] → recovered (%d, %d))\n",
+            r.pixel_x, r.pixel_y, r.peak_b, r.grid_delta,
+            payload[0], payload[1], rx_x, rx_y);
         status_peak_x = r.pixel_x;
         status_peak_y = r.pixel_y;
         status_peak_brightness = r.peak_b;
@@ -2466,13 +3562,27 @@ static void handle_monocal_request(void)
         printf("PIXEL: %d %d %d %d %d\n",
                r.pixel_x, r.pixel_y, (int)r.peak_b, r.grid_delta, r.block_idx);
         fflush(stdout);
-        send_message(MSG_CAL_DONE, 0, payload, 6);
+        send_message(MSG_CAL_DONE, 0, payload, CAL_DONE_PAYLOAD_LEN);
+        unlock_rate_after_cal("handle_monocal_request success");
     } else {
         fprintf(stderr, "PROTO: monocal scan failed, sending empty CAL_DONE\n");
         status_set("monocal_resp_failed", "pixel scan failed");
         send_message(MSG_CAL_DONE, 0, NULL, 0);
     }
 
+    /* do_calibrate_pixel_to() always unfreezes AE on its way out, but the
+       enclosing daemon-listen needs AE frozen for reliable RX of subsequent
+       SYNs / DATA / CAL_REQs. handle_cal_request restores it (line ~2187);
+       this path was missing the same restore — symptom: daemon left running
+       with AE active, peer's next SYN goes undecoded. Mirror that here. */
+    set_ae_freeze(1);
+    /* Reset split-brain timers so the post-monocal idle window starts
+       fresh — without this, last_valid_frame_ms is stale (last decoded
+       CAL_REQ might be 30+s old) and split-brain can fire 2*ack_timeout
+       later even though the link is healthy. */
+    last_valid_frame_ms = now_ms();
+    last_substantial_decode_fail_ms = 0;
+    status_set("listening", "monocal complete; ready for next request");
     cal_flow_active = 0;
 }
 
@@ -2605,10 +3715,27 @@ static int interactive_mode(int is_listener)
 
 static int daemon_mode(int is_listener)
 {
+    /* Rate floor + lock are applied from main() before we get here, common
+       to all communication modes. */
     pthread_t rx_tid;
     if (pthread_create(&rx_tid, NULL, rx_thread, NULL) != 0) {
         perror("pthread_create");
         return 1;
+    }
+
+    /* Grid-watchdog: only meaningful for the listener side (cam1's
+       bootstrap detector). Detached — exits when running=0 + process
+       exit. Active state is gated by watchdog_should_run() based on
+       last_valid_frame_ms (no decode yet OR long-idle), with a
+       WATCHDOG_STARTUP_GRACE_MS delay measured from arming. */
+    if (is_listener) {
+        watchdog_armed_at_ms = now_ms();
+        watchdog_enabled = 1;
+        pthread_t wd_tid;
+        if (pthread_create(&wd_tid, NULL, grid_watchdog_thread, NULL) == 0)
+            pthread_detach(wd_tid);
+        else
+            fprintf(stderr, "WATCHDOG: failed to spawn thread (continuing)\n");
     }
 
     /* Handshake */
@@ -2652,6 +3779,16 @@ static int daemon_mode(int is_listener)
             default:
                 break;
             }
+
+            /* Belt-and-suspenders: any handler that completes should leave
+               us back in a known good steady state — AE frozen, status
+               "listening". Idempotent on the happy path (no-op cost), and
+               catches the class of bug where a future handler forgets to
+               restore one of these (the missing AE refreeze in the original
+               handle_monocal_request was exactly this). */
+            set_ae_freeze(1);
+            if (strcmp(status_state, "listening") != 0)
+                status_set("listening", "handler returned; ready");
         }
     }
 
@@ -2675,6 +3812,14 @@ int main(int argc, char *argv[])
         status_mode[sizeof(status_mode) - 1] = '\0';
     }
     status_set("starting", "irlink launched");
+
+    /* Heartbeat: 1 Hz status re-write so ts_ms ticks even in steady states.
+       Detached — terminates implicitly when running=0 + process exit. */
+    {
+        pthread_t hb_tid;
+        if (pthread_create(&hb_tid, NULL, heartbeat_thread, NULL) == 0)
+            pthread_detach(hb_tid);
+    }
 
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <command> [options]\n", argv[0]);
@@ -2770,44 +3915,96 @@ int main(int argc, char *argv[])
         return do_calibrate_pixel();
     }
 
+    if (strcmp(cmd, "search") == 0) {
+        int wait_ms = 60000;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--wait") == 0 && i + 1 < argc)
+                wait_ms = atoi(argv[i + 1]);
+        }
+        int block, px, py, off_v, on_v, delta_v;
+        int rc = do_search(wait_ms, &block, &px, &py, &off_v, &on_v, &delta_v);
+        if (rc == 0) {
+            /* Stable parseable line. Mirrors do_calibrate_pixel's PIXEL line
+               format so existing orchestrators can consume either source.  */
+            printf("PIXEL: %d %d %d %d %d\n", px, py, on_v, delta_v, block);
+            printf("SEARCH: block=%d pixel=%d,%d baseline=%d active=%d delta=%d\n",
+                   block, px, py, off_v, on_v, delta_v);
+            fflush(stdout);
+            return 0;
+        }
+        return 1;
+    }
+
     /* All communication modes: freeze AE first, unfreeze on exit */
 
+    /* Force AE to adapt to current ambient before freezing. Without this,
+       restarting daemon-listen while a prior run left AE frozen at a stale
+       exposure (e.g. peer LEDs were on when AE last settled) keeps the cam
+       saturated at the wrong brightness — subsequent peer SYNs at lower
+       brightness modulation never cross MIN_BRIGHTNESS_DELTA, every
+       handshake fails into bootstrap_fallback. The unfreeze→3s→freeze
+       handshake forces AE to converge on whatever the current scene
+       actually is, then locks. */
+    #define AE_PRE_FREEZE_SETTLE_MS  3000
+    #define AE_FREEZE_APPLY_MS        500
+
     if (strcmp(cmd, "listen") == 0) {
+        lock_rate_at_floor("listen");
+        set_ae_freeze(0);
+        usleep(AE_PRE_FREEZE_SETTLE_MS * 1000);
         set_ae_freeze(1);
-        usleep(1000000); /* 1s for AE to apply final update and settle */
+        usleep(AE_FREEZE_APPLY_MS * 1000);
         int ret = interactive_mode(1);
         set_ae_freeze(0);
         return ret;
     }
 
     if (strcmp(cmd, "connect") == 0) {
+        lock_rate_at_floor("connect");
+        set_ae_freeze(0);
+        usleep(AE_PRE_FREEZE_SETTLE_MS * 1000);
         set_ae_freeze(1);
-        usleep(1000000); /* 1s AE settle */
+        usleep(AE_FREEZE_APPLY_MS * 1000);
         int ret = interactive_mode(0);
         set_ae_freeze(0);
         return ret;
     }
 
     if (strcmp(cmd, "daemon-listen") == 0) {
+        lock_rate_at_floor("daemon-listen");
+        set_ae_freeze(0);
+        usleep(AE_PRE_FREEZE_SETTLE_MS * 1000);
         set_ae_freeze(1);
-        usleep(1000000); /* 1s AE settle */
+        usleep(AE_FREEZE_APPLY_MS * 1000);
         int ret = daemon_mode(1);
         set_ae_freeze(0);
         return ret;
     }
 
     if (strcmp(cmd, "daemon-connect") == 0) {
+        lock_rate_at_floor("daemon-connect");
+        set_ae_freeze(0);
+        usleep(AE_PRE_FREEZE_SETTLE_MS * 1000);
         set_ae_freeze(1);
-        usleep(1000000); /* 1s AE settle */
+        usleep(AE_FREEZE_APPLY_MS * 1000);
         int ret = daemon_mode(0);
         set_ae_freeze(0);
         return ret;
     }
 
     if (strcmp(cmd, "monocal") == 0) {
-        /* One-shot non-interactive: connect, send CAL_REQ(peer_scans=1), hold
-           LEDs while peer scans, receive CAL_DONE, write monocal-status.json,
-           exit. Spawned by /x/monocal-trigger.cgi on cam2. */
+        /* Two-path flow:
+           1) Try a short-handshake SYN (one attempt, ~35s budget).
+              If it succeeds, the saved cam1 pixel is approximately correct
+              → run the existing protocol monocal (do_monocal_request) to
+              refresh both cals via SYN/CAL_REQ/hold/CAL_DONE.
+           2) If the short handshake times out, cam1's saved pixel can't
+              decode our SYN. Fall back to a LIGHT-ONLY bootstrap:
+                a) Hold LEDs solid 25s — cam1's grid-watchdog detects this
+                   non-Manchester signal and self-engages refine + hold-back.
+                b) 2s OFF grace (cam2's own do_search baseline window).
+                c) do_search to find cam1's responding hold; write our cal.
+              Spawned by /x/monocal-trigger.cgi on cam2. */
         if (pixel_x < 0 || pixel_y < 0) {
             fprintf(stderr, "irlink monocal: --pixel X,Y is required\n");
             return 1;
@@ -2816,6 +4013,7 @@ int main(int argc, char *argv[])
         monocal_started_ms = now_ms();
         monocal_set_state("starting", NULL);
 
+        lock_rate_at_floor("monocal");
         set_ae_freeze(1);
         usleep(1000000); /* 1s AE settle for RX of CAL_ACK + CAL_DONE */
 
@@ -2830,23 +4028,94 @@ int main(int argc, char *argv[])
         }
 
         monocal_set_state("handshaking", NULL);
-        if (do_connect() != 0) {
-            fprintf(stderr, "irlink monocal: handshake failed\n");
-            monocal_ended_ms = now_ms();
-            monocal_ok = 0;
-            monocal_set_state("monocal_failed", "handshake failed");
+        const int SHORT_HANDSHAKE_MS = 35000;  /* one SYN + SYN_ACK round
+                                                 trip at 160ms/sym ≈ 33s */
+        int handshake_ok = (do_connect_short(SHORT_HANDSHAKE_MS) == 0);
+
+        if (handshake_ok) {
+            /* HAPPY PATH: cam1 decoded our SYN → existing protocol monocal */
+            int rc = do_monocal_request();
             running = 0;
             pthread_join(rx_tid, NULL);
+            set_ae_freeze(0);
+            return rc == 0 ? 0 : 1;
+        }
+
+        /* FALLBACK: cam1 didn't decode our SYN — pixel must be wrong.
+           Drop the rx_thread (we don't need protocol decode in bootstrap
+           mode) and pivot to a light-only sequence. */
+        fprintf(stderr,
+            "PROTO: short-handshake failed → bootstrap fallback "
+            "(cam1's saved pixel is off; using light-only bootstrap)\n");
+        log_event("BOOTSTRAP", "fallback engaged after short-handshake fail");
+        monocal_set_state("bootstrap_fallback",
+            "saved pixel may be wrong; light-only bootstrap");
+
+        running = 0;
+        pthread_join(rx_tid, NULL);
+        running = 1;  /* re-arm for the search loop in do_search */
+
+        /* Phase 1: hold LEDs solid 25s. The first ~5s wakes cam1's grid-
+           watchdog (it requires WATCHDOG_TRIGGER_SAMPLES consecutive
+           elevated samples). The remaining ~20s gives cam1 time to refine
+           pixel and observe our falling edge. AE OFF on cam2 because we're
+           only TXing — exposure freeze on the holder side is unnecessary. */
+        set_ae_freeze(0);
+        monocal_hold_start_ms = now_ms();
+        monocal_set_state("bootstrap_hold",
+            "holding LEDs solid 25s for cam1 grid-watchdog");
+        hold_leds_on(BOOTSTRAP_HOLD_MS);
+        monocal_hold_end_ms = now_ms();
+
+        /* Phase 2: 2s OFF grace — covers cam2's own do_search baseline,
+           AND gives cam1 the OFF-grace window before cam1 starts holding
+           for our search. */
+        usleep(BOOTSTRAP_BASELINE_GRACE_MS * 1000);
+
+        /* Phase 3: cam2's own do_search. cam1 is now holding (per the
+           watchdog handler's flow: refine → wait falling edge → OFF
+           grace → hold 15s). do_search captures baseline, scans for
+           cam1's beacon, refines to pixel, returns. */
+        monocal_set_state("bootstrap_search",
+            "searching for cam1's responding hold");
+        int block, px, py, off_v, on_v, delta_v;
+        int rc = do_search(BOOTSTRAP_HOLD_MS, &block, &px, &py,
+                           &off_v, &on_v, &delta_v);
+        if (rc != 0) {
+            fprintf(stderr,
+                "PROTO: bootstrap fallback — do_search did not acquire\n");
+            monocal_ended_ms = now_ms();
+            monocal_ok = 0;
+            monocal_set_state("monocal_failed",
+                "bootstrap fallback: did not see cam1's responding hold");
             set_ae_freeze(0);
             return 1;
         }
 
-        int rc = do_monocal_request();
+        /* Persist cam2's fresh cal. status_peak_brightness was set by
+           find_peak_pixel_in_block inside do_search. */
+        write_calibration_json(px, py, off_v, on_v, delta_v,
+                               (uint8_t)status_peak_brightness);
+        fprintf(stderr,
+            "PROTO: bootstrap complete — cam2 sees cam1 at (%d,%d) "
+            "block=%d delta=%d\n", px, py, block, delta_v);
+        log_event("BOOTSTRAP", "complete pixel=(%d,%d)", px, py);
+        printf("PIXEL: %d %d %d %d %d\n", px, py, on_v, delta_v, block);
+        fflush(stdout);
 
-        running = 0;
-        pthread_join(rx_tid, NULL);
+        /* Surface the result through the same monocal-status fields the
+           webui already polls (peer_pixel + monocal_done). */
+        monocal_peer_x = px;
+        monocal_peer_y = py;
+        monocal_peer_b = (uint8_t)status_peak_brightness;
+        monocal_peer_d = delta_v;
+        monocal_have_peer_pixel = 1;
+        monocal_ended_ms = now_ms();
+        monocal_ok = 1;
+        monocal_set_state("monocal_done",
+            "bootstrap fallback: both cams refreshed via light-only path");
         set_ae_freeze(0);
-        return rc == 0 ? 0 : 1;
+        return 0;
     }
 
     if (strcmp(cmd, "send") == 0) {

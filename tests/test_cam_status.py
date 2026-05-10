@@ -202,7 +202,7 @@ def test_imp_cmd_int_value():
     with patch.object(c, "_post", return_value=(200, body)) as p:
         assert c.imp_cmd("ir850", 1) is True
     p.assert_called_once_with("/x/json-imp.cgi",
-                              '{"cmd": "ir850", "val": 1}',
+                              '{"cmd":"ir850","val":1}',
                               content_type="application/json")
 
 
@@ -212,7 +212,7 @@ def test_imp_cmd_string_value():
     with patch.object(c, "_post", return_value=(200, body)) as p:
         assert c.imp_cmd("daynight", "night") is True
     p.assert_called_once_with("/x/json-imp.cgi",
-                              '{"cmd": "daynight", "val": "night"}',
+                              '{"cmd":"daynight","val":"night"}',
                               content_type="application/json")
 
 

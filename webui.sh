@@ -142,20 +142,13 @@ cmd_start() {
   local py; py=$(find_python) || exit 1
   echo -e "${C_DIM}python: $py${C_RESET}"
 
-  # 1. preflight
-  if [ "$do_preflight" -eq 1 ]; then
-    if [ -x "$ROOT/host/cam_setup.sh" ]; then
-      echo -e "${C_BOLD}▸ preflight${C_RESET}  host/cam_setup.sh"
-      "$ROOT/host/cam_setup.sh" || \
-        echo -e "${C_AMBER}!${C_RESET} preflight returned non-zero — continuing."
-    else
-      echo -e "${C_AMBER}!${C_RESET} host/cam_setup.sh missing or not executable, skipping preflight."
-    fi
-  else
-    echo -e "${C_DIM}skipping preflight${C_RESET}"
-  fi
+  # NOTE on order: preflight is now POST /api/setup-all, served by the webui
+  # server itself (which fans out to each cam's /x/setup.cgi). So we have to
+  # start the servers first, then trigger preflight. The legacy SSH-driven
+  # host/cam_setup.sh is still on disk for recovery cases that need SSH-only
+  # paths (prudynt restart, /opt mount, irlink redeploy).
 
-  # 2. photos server
+  # 1. photos server
   if is_running "$PHOTOS_PID"; then
     echo -e "${C_DIM}photos server already up (pid $(cat "$PHOTOS_PID"))${C_RESET}"
   else
@@ -170,7 +163,7 @@ cmd_start() {
       "$py" -m http.server "$PHOTOS_PORT" --bind 127.0.0.1
   fi
 
-  # 3. webui server
+  # 2. webui server
   if is_running "$WEBUI_PID"; then
     echo -e "${C_DIM}webui server already up (pid $(cat "$WEBUI_PID"))${C_RESET}"
   else
@@ -184,7 +177,7 @@ cmd_start() {
       "$py" -m webui.server --bind "$WEBUI_HOST" --port "$WEBUI_PORT"
   fi
 
-  # 4. give them a moment to bind, then verify
+  # 3. give them a moment to bind, then verify
   sleep 0.8
   is_running "$PHOTOS_PID" || {
     echo -e "${C_RED}✗${C_RESET} photos server failed to start — see $PHOTOS_LOG"
@@ -196,6 +189,44 @@ cmd_start() {
     tail -n 20 "$WEBUI_LOG" 2>/dev/null | sed 's/^/    /'
     exit 1
   }
+
+  # 4. preflight via the webui server itself (POST /api/setup-all)
+  if [ "$do_preflight" -eq 1 ]; then
+    echo -e "${C_BOLD}▸ preflight${C_RESET}  POST /api/setup-all"
+    local out
+    out=$(curl -fsS -m 30 -X POST "http://$WEBUI_HOST:$WEBUI_PORT/api/setup-all" 2>&1) || {
+      echo -e "${C_AMBER}!${C_RESET} setup-all curl failed: $out"
+      out=""
+    }
+    if [ -n "$out" ]; then
+      "$py" -c '
+import json, sys
+r = json.loads(sys.stdin.read())
+overall = "OK" if r.get("ok") else "FAIL"
+print(f"  overall: {overall}")
+for cam, rep in (r.get("cams") or {}).items():
+    cam_ok = rep.get("ok")
+    label = "OK" if cam_ok else "FAIL"
+    err = rep.get("error", "")
+    suffix = f"  {err}" if not cam_ok and err else ""
+    print(f"  [{cam}] {label}{suffix}")
+    for s in rep.get("steps", []) or []:
+        mark = "OK " if s.get("ok") else "ERR"
+        name = s.get("name", "")
+        detail = s.get("detail", "")
+        print(f"    [{mark}] {name:<22} {detail}")
+    ts = rep.get("time_sync") or {}
+    if ts.get("ok"):
+        drift = ts.get("drift_s")
+        print(f"    [OK ] time-sync             corrected drift {drift:+}s")
+    elif ts:
+        msg = ts.get("error", "unknown")
+        print(f"    [ERR] time-sync             {msg}")
+' <<< "$out" || echo "$out"
+    fi
+  else
+    echo -e "${C_DIM}skipping preflight${C_RESET}"
+  fi
 
   echo
   cmd_status

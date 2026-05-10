@@ -725,14 +725,13 @@ if __name__ == "__main__":
             coords = f"{prev_cam1_sees_cam2[0]},{prev_cam1_sees_cam2[1]}"
         else:
             # Read cam1's persisted coords. This is what rc.local autostart uses.
-            r = subprocess.run(
-                ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
-                 f"root@{cam1_ip}",
-                 "grep '\"tx_pixel\"' /opt/etc/calibration.json "
-                 "| grep -oE '[0-9]+' | head -2 | tr '\\n' ',' | sed 's/,$//'"],
-                capture_output=True, text=True, timeout=10,
-            )
-            coords = r.stdout.strip() or "320,180"  # last-resort frame center
+            from host.cam_status import CamStatusClient  # lazy: only here
+            saved = CamStatusClient(cam1_ip).get_saved_cal()
+            tx = (saved or {}).get("tx_pixel")
+            if isinstance(tx, list) and len(tx) == 2:
+                coords = f"{int(tx[0])},{int(tx[1])}"
+            else:
+                coords = "320,180"  # last-resort frame center
         print(f"  using cam1 daemon-listen --pixel {coords}")
         try:
             subprocess.run(

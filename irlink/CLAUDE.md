@@ -68,13 +68,28 @@ ssh dacam2 "/opt/bin/irlink monocal --pixel 243,177 --speed 160"
 
 **Status JSON (`/run/monocal-status.json`):** atomic write at every state transition. State machine on cam2:
 ```
-spawning → starting → handshaking → monocal_req → monocal_ack_wait
-  → monocal_holding_off → monocal_holding_on → monocal_awaiting_done
-  → monocal_done | monocal_failed
+spawning → starting → handshaking
+  → [protocol path]   monocal_req → monocal_ack_wait
+                      → monocal_holding_off → monocal_holding_on
+                      → monocal_awaiting_done → monocal_done | monocal_failed
+  → [bootstrap path]  bootstrap_fallback → bootstrap_hold → bootstrap_search
+                      → monocal_done | monocal_failed
 ```
 Fields: `state`, `started_ms`, `updated_ms`, `ended_ms`, `ok`, `error`, `ack_received_ms`, `led_hold_started_ms`, `led_hold_ended_ms`, `peer_pixel: {x, y, peak_b, grid_delta}`, `speed_ms`. The webui polls cam2's `/x/monocal-status.cgi` for these and merges with cam1's `/x/cal-status.cgi` for a two-cam view.
 
 **Backwards compat:** old peers see CAL_REQ payload `0x02` and check `data[0] == 1` for bidi → bidi=0 → fall through to `handle_cal_request(0)` (regular cal — both sides try to hold LEDs, neither scans). Deploy the new binary to BOTH cams before using monocal.
+
+### Bootstrap fallback — handles wrong/missing cam1 pixel automatically
+
+The protocol monocal path requires cam1's saved pixel to be approximately correct so cam1 can decode our SYN. If cam1 has been bumped or never calibrated, the SYN goes undecoded and the protocol path stalls. Cam2's `irlink monocal` handles this by trying ONE short-handshake SYN (35s budget, vs the default 230s of 3 retries × 77s); if no SYN_ACK comes back, it pivots to a **light-only bootstrap**:
+
+1. **`bootstrap_fallback`** — short SYN unanswered; pivot announced.
+2. **`bootstrap_hold`** — cam2 holds LEDs solid 25s. The first ~5s wakes cam1's grid-watchdog (a multi-second sustained brightness rise is unambiguously NOT a Manchester frame); the remaining ~20s gives cam1 time to refine its pixel and observe cam2's falling edge.
+3. **`bootstrap_search`** — cam2's own `do_search` scans the grid for cam1's responding hold (cam1's watchdog handler ends with a 15s LED hold for exactly this), refines to pixel, writes cam2's `/opt/etc/calibration.json`.
+
+cam1 self-engages without any SSH or protocol message. cam1's daemon-listen runs a `grid_watchdog_thread` (1 Hz cadence) that's gated to fire **only** when there has been no valid frame yet (startup) OR no valid frame in `IDLE_THRESHOLD_MS` (3 min default). It tracks per-block consecutive-elevated samples (≥`WATCHDOG_DELTA`=7 for ≥`WATCHDOG_TRIGGER_SAMPLES`=5 consecutive 1Hz samples = 5s sustained). On fire it: refines pixel via `find_peak_pixel_in_block`, writes `/opt/etc/calibration.json`, waits for cam2's beacon falling edge, 2s OFF grace, holds LEDs 15s, resumes pixel-listen at the new pixel. State exposed in `/run/irlink-status.json` as `watchdog_refining` / `watchdog_wait_falling` / `watchdog_hold` so the webui can mirror progress.
+
+Total bootstrap wall time ≈ 60s (vs ~50s for protocol path). Both cams' `/opt/etc/calibration.json` are refreshed regardless of which path was taken — the user-visible MONOCAL CAM1 button outcome is identical.
 
 ## Usage
 
@@ -173,6 +188,7 @@ scp -O irlink/cgi/brightness-grid.cgi  root@dacamN:/var/www/x/
 scp -O irlink/cgi/ae-freeze.cgi        root@dacamN:/var/www/x/
 scp -O irlink/cgi/proc-status.cgi      root@dacamN:/var/www/x/
 scp -O irlink/cgi/gpio-state.cgi       root@dacamN:/var/www/x/
+scp -O irlink/cgi/grid-deltas.cgi      root@dacamN:/var/www/x/
 # Monocal CGIs go to cam2 ONLY (cam2 is requestor / laptop-tethered;
 # cam1 is responder, no trigger CGI needed):
 scp -O irlink/cgi/monocal-trigger.cgi  root@dacam2:/var/www/x/
@@ -194,6 +210,7 @@ ssh dacam2 "chmod 755 /var/www/x/monocal-trigger.cgi /var/www/x/monocal-status.c
 | `/x/json-imp.cgi` POST `{"cmd":<C>,"val":<V>}` | Stock Thingino IMP control (daynight, color, ircut, ir850, ir940) | `cam_status.CamStatusClient.imp_cmd()` → `aim_assist.turn_leds_on/force_leds_off`, `cal_procedure.leds_on_hold/_off`, `cam_setup.sh:imp_cmd` |
 | `/x/gpio-state.cgi` | `gpio read 47` (ir850) + `gpio read 49` (ir940) → JSON `{ir850, ir940}` | `cam_status.CamStatusClient.get_led_state()` → `webui` real-time IR LED reflection |
 | `/x/monocal-trigger.cgi` POST `coords=X,Y[&speed=N]` (cam2 only) | spawns `irlink monocal --pixel X,Y --speed N` via `setsid nohup`; refuses 409 if any `irlink` already running; pre-writes `/run/monocal-status.json` so the first poll sees `state=spawning` | `cam_status.CamStatusClient.start_monocal()` → `webui` MONOCAL CAM1 button |
+| `/x/grid-deltas.cgi` | `cat /run/grid-deltas.json` (last `do_grid_calibration` result: post-OSD-mask 240-block deltas + best-block); 404 + `{"state":"never_run"}` if no scan since boot | `cam_status.CamStatusClient.get_grid_deltas()` → webui `/api/{cam}/grid-deltas` |
 | `/x/monocal-status.cgi` (cam2 only) | `cat /run/monocal-status.json`; HTTP 503 + `{state: transient}` on mid-rename empty file; HTTP 200 + `{state: never_run}` if file missing | `cam_status.CamStatusClient.get_monocal_status()` → `webui` M1..M5 step polling |
 
 All endpoints share the cookie auth from `/x/login.cgi`; the laptop client logs in once and replays the cookie.
@@ -224,6 +241,7 @@ All endpoints share the cookie auth from `/x/login.cgi`; the laptop client logs 
 - **Cameras too close (<6 inches) gives poor signal.** The IR LEDs flood the entire sensor when very close, and the image is out of focus (min focus ~50cm). Best at 2-3 feet where the LEDs form a focused spot.
 - **GPIO mux state persists.** Running `tx_pwm` (legacy) switches GPIO 49 to PWM function mode. If the binary exits without resetting, the pin stays in PWM mode and GPIO commands have no effect. Reset with `gpio-diag PB17 func 1` or reboot.
 - **`calibrate-pixel` peak-on-edge auto-expansion.** The 6×6 stride-5 ROI sweep within the picked grid block can land its peak on the rectangle edge if the actual IR center sits near a block boundary. `find_peak_pixel_in_block` then expands the swept rectangle by one stride in each edge-adjacent direction and rescans only the new strips, capped at `MAX_EDGE_EXPANSIONS = 4`. Adds ~700 ms when triggered; 0 ms when peak is interior. Without this, a peak at xmax=315 in block 89 gets reported truthfully but offers no proof it isn't actually further right. With it, we scan x=320 column too and confirm.
+- **`do_grid_calibration` masks OSD-tainted block rows.** Channel 1 (the 640×360 substream BrightnessMonitor reads) carries OSD overlays in the top 30 px (timestamp + name + uptime) and bottom 30 px (`thingino` watermark). Their per-second character changes inject false delta into block rows `by=0` (blocks 0..19) and `by=11` (blocks 220..239). Without masking, the argmax can pick an OSD-edge block over the true TX block — observed 2026-05-09 with cam1 landing at `(34, 57)` (block 21, row 1, adjacent to OSD strip) when the real TX was at host-confirmed `(328, 114)` (block 70). The fix zeros those 40 blocks before argmax, mirroring `cal_procedure.py`'s `[:30, :]` / `[h-30:, :]` masking so on-camera and laptop scans converge. Also writes the full 240-block post-mask delta vector + best-block to `/run/grid-deltas.json` (atomic temp+rename) and serves it via `/x/grid-deltas.cgi` → `CamStatusClient.get_grid_deltas()` → webui `/api/{cam}/grid-deltas`. Operators inspect runner-up blocks over HTTP without SSHing the cam. `do_search` (bootstrap-fallback scanner) has the same vulnerability shape but is partially shielded by its sustained-elevation requirement (`SEARCH_HOLD_MS=3000`) — left unmasked for now; revisit if a bootstrap result lands in row 0 or row 11.
 - **Bicall split-brain trip during long CAL_DONE wait.** When the responder's wait_for_msg(CAL_DONE) takes longer than `2 × ack_timeout_ms` (e.g. CAL_DONE was lost or scanner's pixel cal couldn't decode our TX), the responder hits split-brain recovery and force-drops to the slowest rate rung (200 ms) — but the peer is still at 160 ms. Phase 2 then deadlocks at CAL_ACK timeout because the rates desynced silently. Fix is to either (a) suppress split-brain during CAL_REQ flows, or (b) require split-brain to send a RATE_CHANGE before changing locally. **Open issue.**
 - **Bicall phase 2 timing margin is thin.** Holder's LED hold = 1.5 s OFF + 12 s ON = 13.5 s total. Scanner's `do_calibrate_pixel_to` takes ~12 s (1 s baseline + 4 s grid + ~6 s ROI sweep + edge expansion). If the scanner's scan finishes more than ~1.5 s before the holder's LED hold ends, the scanner's CAL_DONE TX starts during the holder's `tx_active=1` window and the holder misses the preamble (1.28 s @ 160 ms). Phase 1 always works because the responder's wait window starts when its LED hold ends, aligned with the scanner's TX start. Phase 2 is more fragile — if you lengthen the pixel sweep (e.g., add stride-1 sub-block refinement), bump the holder's hold to keep the margin.
 - **AE freeze stuck at 1 after `killall -9 irlink`.** The `-9` skips irlink's SIGTERM cleanup that writes `0` to `/run/prudynt/ae_freeze`. Subsequent operations (e.g. `cal_procedure.py`) silently fail because exposure is still locked to whatever it was when irlink was killed. `cam_setup.sh` now detects and resets this; manual fix is `echo 0 > /run/prudynt/ae_freeze`. Prefer `kill` (SIGTERM) over `kill -9` so cleanup fires.

@@ -786,7 +786,11 @@ main {
 }
 .step {
   display: grid;
-  grid-template-columns: auto 1fr auto auto;
+  /* Cap the info column so .step-sub wraps under the heading instead of
+     stretching the row out and crowding .step-result. The auto state column
+     between info and result puts "time elapsed" in the visual middle of the
+     row; result takes 1fr and fills everything to the right edge. */
+  grid-template-columns: auto minmax(0, 320px) auto minmax(220px, 1fr);
   align-items: center;
   gap: 14px;
   padding: 12px 14px;
@@ -815,30 +819,106 @@ main {
   text-align: center;
   flex-shrink: 0;
 }
-.step-info { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.step-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  overflow-wrap: break-word;
+  position: relative;     /* anchors the .step-sub tooltip */
+  cursor: help;
+}
 .step-title {
   font-size: 11px;
   color: var(--green);
   text-shadow: 0 0 4px var(--green);
   letter-spacing: 1px;
+  line-height: 1.2;
+  /* dotted underline = "more info available" affordance, retro-correct */
+  border-bottom: 1px dotted var(--green-dim);
+  padding-bottom: 1px;
+  align-self: flex-start;
 }
-.step-sub { font-size: 7px; color: var(--green-dim); letter-spacing: 1px; }
+/* .step-sub is now a hover tooltip rather than always-visible inline copy.
+   Reasoning: the explanation is reference text — useful when you forget what
+   M1 does, but visual noise on every row otherwise. Hover anywhere on the
+   .step-info column (title or its area) to reveal. The dotted underline on
+   .step-title cues the affordance. */
+.step-sub {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 100;
+  width: max-content;
+  max-width: 380px;
+  font-size: 10px;          /* readable size now that it's not always shown */
+  color: var(--green);
+  letter-spacing: 0.5px;
+  line-height: 1.55;
+  background: var(--bg);
+  border: 2px solid var(--green-dim);
+  padding: 10px 14px;
+  box-shadow:
+    0 0 14px rgba(0,255,65,0.35),
+    0 6px 20px rgba(0,0,0,0.75),
+    inset 0 0 0 1px rgba(0,0,0,0.4);
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-6px);
+  transition: opacity 180ms, visibility 180ms, transform 180ms cubic-bezier(0.2,0.8,0.2,1);
+  pointer-events: none;     /* hover passes through to underlying elements */
+}
+
+/* Phosphor-green arrow pointing up from the bubble to the title */
+.step-sub::before {
+  content: '';
+  position: absolute;
+  top: -8px;
+  left: 18px;
+  width: 0; height: 0;
+  border-left: 7px solid transparent;
+  border-right: 7px solid transparent;
+  border-bottom: 7px solid var(--green-dim);
+}
+.step-sub::after {
+  content: '';
+  position: absolute;
+  top: -5px;
+  left: 20px;
+  width: 0; height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-bottom: 5px solid var(--bg);
+}
+
+.step-info:hover .step-sub,
+.step-info:focus-within .step-sub {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+}
 
 .step-state {
-  font-size: 9px;
+  font-family: 'VT323', monospace;
+  font-size: 22px;       /* time elapsed — sized to read at a glance, slightly
+                            smaller than .step-result to keep it secondary */
   color: var(--green-dim);
-  letter-spacing: 2px;
-  min-width: 92px;
-  text-align: right;
+  letter-spacing: 1px;
+  text-align: center;    /* sits centered in its grid cell, visually mid-row */
+  white-space: nowrap;
+  line-height: 1.1;
 }
 .step-result {
   font-family: 'VT323', monospace;
-  font-size: 14px;
+  font-size: 26px;       /* primary focus — bumped so short strings fill more cell */
   color: var(--amber);
-  text-shadow: 0 0 4px var(--amber);
-  min-width: 220px;
-  text-align: right;
+  text-shadow: 0 0 6px var(--amber);
+  text-align: left;      /* anchors at the cell's left edge (right after the
+                            time-elapsed center column) so text grows into the
+                            empty area instead of hugging the far right edge */
+  padding-left: 18px;    /* breathing room from the time-elapsed column */
   letter-spacing: 1px;
+  line-height: 1.1;
 }
 
 .step.pending { border-color: var(--gray); }
@@ -952,6 +1032,49 @@ main {
 }
 .refresh-btn:hover { background: var(--amber-dim); color: #000; text-shadow: none; }
 .refresh-btn:active { transform: translateY(2px); box-shadow: 0 2px 0 #2d1f00; }
+
+/* === LIVE CAL panel (fresh on-camera snapshots + cal pixel markers) === */
+.live-cal {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 18px;
+}
+.live-cal-card {
+  border: 3px solid var(--green-dim);
+  background: #001a00;
+  padding: 8px;
+  position: relative;
+}
+.live-cal-card h3 {
+  margin: 0 0 6px;
+  font-size: 10px;
+  color: var(--green);
+  letter-spacing: 2px;
+  text-shadow: 0 0 4px var(--green);
+}
+.live-cal-canvas-wrap {
+  position: relative;
+  width: 100%;
+  background: #000;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+}
+.live-cal-canvas-wrap img,
+.live-cal-canvas-wrap canvas {
+  position: absolute; top: 0; left: 0;
+  width: 100%; height: 100%;
+  display: block;
+}
+.live-cal-info {
+  margin-top: 6px;
+  font-size: 8px;
+  color: var(--green-dim);
+  line-height: 1.6;
+}
+.live-cal-info .key { color: var(--amber-dim); }
+.live-cal-info .val { color: #fff; }
+.live-cal-info .stale { color: var(--red); }
 
 footer {
   margin-top: 32px;
@@ -1210,10 +1333,37 @@ footer span { color: var(--amber); }
 
   <!-- CAL RESULTS PANEL -->
   <div class="tab-panel hidden" data-panel="cal">
-    <div class="cal-frame">
-      <iframe src="http://localhost:8889/calibration.html" id="cal-iframe"></iframe>
+
+    <!-- LIVE CAL — fresh on-camera snapshots + cal pixel markers.
+         For monocal/disco cals (over-light, no laptop frame-diff), this
+         is the only way to see the result visually since photos/calibration.html
+         is only updated by RUN CAL SEQUENCE. -->
+    <div class="live-cal">
+      <div class="live-cal-card">
+        <h3>▌ CAM1 SEES CAM2</h3>
+        <div class="live-cal-canvas-wrap">
+          <img id="live-cam1-img" alt="cam1 snapshot">
+          <canvas id="live-cam1-mark" width="640" height="360"></canvas>
+        </div>
+        <div class="live-cal-info" id="live-cam1-info">—</div>
+      </div>
+      <div class="live-cal-card">
+        <h3>▌ CAM2 SEES CAM1</h3>
+        <div class="live-cal-canvas-wrap">
+          <img id="live-cam2-img" alt="cam2 snapshot">
+          <canvas id="live-cam2-mark" width="640" height="360"></canvas>
+        </div>
+        <div class="live-cal-info" id="live-cam2-info">—</div>
+      </div>
     </div>
-    <button class="refresh-btn" id="cal-refresh">▸ RELOAD CAL VIEWER</button>
+    <button class="refresh-btn" id="live-cal-refresh">▸ REFRESH LIVE SNAPSHOTS</button>
+
+    <div style="margin-top: 24px;">
+      <div class="cal-frame">
+        <iframe src="http://localhost:8889/calibration.html" id="cal-iframe"></iframe>
+      </div>
+      <button class="refresh-btn" id="cal-refresh">▸ RELOAD CAL VIEWER</button>
+    </div>
   </div>
 </section>
 
@@ -1228,12 +1378,25 @@ footer span { color: var(--amber); }
 // ============================================================
 // UTILITIES
 // ============================================================
+/* All fetches go through here. Default 3s AbortController prevents a stuck
+   localhost request (cam down → server-side curl timing out) from holding a
+   Chrome connection slot. With Chrome's 6-slot per-origin cap, 5 cam2
+   endpoints in flight × 8s = page seizes; with abort, slots churn in 3s and
+   the LEDs poll keeps firing. opts.timeoutMs overrides per-call (snapshot
+   sets 5000). */
 async function fetchJSON(url, opts = {}) {
+  const { timeoutMs = 3000, ...rest } = opts;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const r = await fetch(url, opts);
+    const r = await fetch(url, { ...rest, signal: ctrl.signal });
     if (!r.ok) return null;
     return await r.json();
-  } catch (e) { return null; }
+  } catch (e) {
+    return null;          // AbortError, network error — both treated as null
+  } finally {
+    clearTimeout(t);
+  }
 }
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -1251,30 +1414,38 @@ setInterval(tickClock, 1000);
 // ============================================================
 // LED STATE → camera animation (real GPIO via /api/{cam}/leds)
 // ============================================================
-async function pollLeds() {
+async function pollLedsOnce() {
+  // Fetch both cams in parallel — halves wall time, and importantly any
+  // cache lock contention on the server happens once per cam not in series.
+  const [d1, d2] = await Promise.all([
+    fetchJSON('/api/cam1/leds'),
+    fetchJSON('/api/cam2/leds'),
+  ]);
   const ir = { cam1: false, cam2: false };
-  for (const cam of ['cam1', 'cam2']) {
-    const data = await fetchJSON(`/api/${cam}/leds`);
+  for (const [cam, data] of [['cam1', d1], ['cam2', d2]]) {
     const art = document.getElementById(cam + '-art');
     if (!art) continue;
-    if (!data || data.ir850 == null) {
-      art.classList.remove('ir-on');
-      continue;
-    }
+    if (!data || data.ir850 == null) { art.classList.remove('ir-on'); continue; }
     const anyOn = data.ir850 === 1 || data.ir940 === 1;
     art.classList.toggle('ir-on', anyOn);
     ir[cam] = anyOn;
   }
-  // Forward beam (cam1 → cam2) only travels when cam1 IR is firing.
-  // Reverse beam (cam2 → cam1) only travels when cam2 IR is firing.
-  // When both are dark, the channel sits quiet — no fake "data flow."
   document.getElementById('beam-fwd').classList.toggle('active', ir.cam1);
   document.getElementById('beam-fwd-label').classList.toggle('active', ir.cam1);
   document.getElementById('beam-rev').classList.toggle('active', ir.cam2);
   document.getElementById('beam-rev-label').classList.toggle('active', ir.cam2);
 }
-pollLeds();
-setInterval(pollLeds, 800);
+
+// Recursive setTimeout instead of setInterval(asyncFn) — guarantees the next
+// poll is scheduled only AFTER the current one resolves. setInterval here
+// piles up unresolved promises when the cam is slow (each /api/leds blocks
+// 1-2s on slow uhttpd if cache is cold), exhausting the browser's HTTP
+// connection pool to localhost. After 10-20 min the page hangs.
+async function pollLedsLoop() {
+  try { await pollLedsOnce(); } catch (e) { /* swallow — keep looping */ }
+  setTimeout(pollLedsLoop, 800);
+}
+pollLedsLoop();
 
 // ============================================================
 // TABS
@@ -1499,8 +1670,14 @@ async function runSequence() {
   runBtn.querySelector('.big-cal-icon').textContent = '▶';
   runBtn.querySelector('.big-cal-label').textContent = 'RUN CAL SEQUENCE';
 
-  if (results.every(Boolean)) {
-    setOverall('done-ok', 'DONE · OK');
+  /* The actual calibration is step 5 (cal_procedure). Steps 1-4 are Phase 1-5
+     HTTP-layer instrumentation — useful dev visibility but not the cal itself.
+     Drive the cal-results refresh off step 5's outcome so a transient blip in
+     step 3 (e.g. an auth retry mid-flight) doesn't hide a successful cal. */
+  const calOk = results[4] === true;
+  const checksOk = results.slice(0, 4).every(Boolean);
+  if (calOk) {
+    setOverall('done-ok', checksOk ? 'DONE · OK' : 'CAL OK · CHECKS WARN');
     runBtn.classList.add('done-ok');
     refreshCalViewer();
     activateTab('cal');
@@ -1596,6 +1773,30 @@ function applyMonocalState(merged, t0_ms) {
     return;
   }
 
+  // BOOTSTRAP FALLBACK — cam1's saved pixel didn't decode our SYN. cam2
+  // pivots to a light-only sequence: hold LEDs solid 25s (cam1's grid-
+  // watchdog detects + refines + holds back), then cam2 do_search to find
+  // cam1's responding hold. Total ~60s. Reuses M2/M3/M5; M4 is skipped
+  // since there's no protocol CAL_DONE round trip.
+  if (['bootstrap_fallback','bootstrap_hold','bootstrap_search'].includes(state)) {
+    setMStepState(1, 'done-err', 'fallback',
+      'short SYN unanswered · cam1 pixel may be stale');
+    showMStep(2);
+    if (state === 'bootstrap_fallback') {
+      setMStepState(2, 'running', `${elapsed}s`,
+        'engaging light-only bootstrap (cam1 watchdog should wake)…');
+    } else if (state === 'bootstrap_hold') {
+      setMStepState(2, 'running', `${elapsed}s`,
+        '25s LED hold · cam1 grid-watchdog detects + refines + holds back');
+    } else if (state === 'bootstrap_search') {
+      setMStepState(2, 'done-ok', '—', 'hold complete · cam1 should be holding now');
+      showMStep(3);
+      setMStepState(3, 'running', `${elapsed}s`,
+        'cam2 do_search scanning grid for cam1\'s responding hold…');
+    }
+    return;
+  }
+
   // First time we see anything past M1, mark M1 done-ok and the ACK timestamp.
   if (cam2.ack_received_ms && cam2.ack_received_ms > 0) {
     const took = cam2.ack_received_ms - cam2.started_ms;
@@ -1643,15 +1844,21 @@ function applyMonocalState(merged, t0_ms) {
 
   // M5 — terminal states
   if (state === 'monocal_done') {
+    /* In the bootstrap-fallback path M3/M4 may be in different states
+       from the protocol path; defensively close them both with —. */
     setMStepState(3, 'done-ok', '—', 'cam1 scan complete');
-    setMStepState(4, 'done-ok', '—', 'CAL_DONE received');
+    setMStepState(4, 'done-ok', '—', 'cal_done received');
     showMStep(5);
     const p = cam2.peer_pixel;
+    /* Distinguish bootstrap vs protocol path by checking whether cam2
+       saw a CAL_ACK (only the protocol path sets ack_received_ms > 0). */
+    const wasBootstrap = !cam2.ack_received_ms || cam2.ack_received_ms === 0;
+    const tag = wasBootstrap ? 'bootstrap OK' : 'OK';
     if (p) {
-      setMStepState(5, 'done-ok', 'OK',
+      setMStepState(5, 'done-ok', tag,
         `cam1 sees cam2 at (${p.x}, ${p.y}) · b=${p.peak_b}/255 · Δ=${p.grid_delta}`);
     } else {
-      setMStepState(5, 'done-ok', 'OK', 'monocal complete');
+      setMStepState(5, 'done-ok', tag, 'monocal complete');
     }
     return;
   }
@@ -1754,6 +1961,128 @@ monocalBtn.addEventListener('click', runMonocal);
 
 // CAL VIEWER REFRESH (manual button)
 document.getElementById('cal-refresh').addEventListener('click', refreshCalViewer);
+
+// ============================================================
+// LIVE CAL — fetch fresh snapshots from each cam + draw the calibrated
+// pixel as a crosshair on top. Pulls /api/{cam}/cal-info for the JSON
+// and /api/{cam}/snapshot for the JPEG. Useful for monocal/disco runs
+// where photos/calibration.html (the iframe target) is NOT regenerated.
+// ============================================================
+
+function drawCalMark(canvas, info) {
+  const ctx = canvas.getContext('2d');
+  // canvas internal size matches the 640x360 substream — that's also
+  // calibration.json's frame_size, so cal pixel coords map 1:1.
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!info) return;
+  // Prefer saved_cal.tx_pixel — it's the authoritative "where I see my
+  // peer" answer, populated whenever this cam was the scanner in any cal
+  // flow. Fall back to runtime info.pixel (the daemon's tracking ROI),
+  // which equals tx_pixel after a successful cal anyway.
+  let px, py;
+  if (info.saved_cal && Array.isArray(info.saved_cal.tx_pixel)) {
+    [px, py] = info.saved_cal.tx_pixel;
+  } else if (Array.isArray(info.pixel)) {
+    [px, py] = info.pixel;
+  } else {
+    return;
+  }
+  if (px < 0 || py < 0) return;
+
+  // Outer crosshair (high contrast)
+  ctx.strokeStyle = '#ff3030';
+  ctx.lineWidth = 2;
+  const arm = 24;
+  ctx.beginPath();
+  ctx.moveTo(px - arm, py); ctx.lineTo(px - 4, py);
+  ctx.moveTo(px + 4, py);   ctx.lineTo(px + arm, py);
+  ctx.moveTo(px, py - arm); ctx.lineTo(px, py - 4);
+  ctx.moveTo(px, py + 4);   ctx.lineTo(px, py + arm);
+  ctx.stroke();
+
+  // Inner ring
+  ctx.strokeStyle = '#ffd24a';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(px, py, 8, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Center dot
+  ctx.fillStyle = '#ffd24a';
+  ctx.beginPath();
+  ctx.arc(px, py, 1.6, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Label
+  ctx.font = 'bold 11px monospace';
+  ctx.fillStyle = '#000';
+  ctx.fillRect(px + 12, py - 22, 70, 14);
+  ctx.fillStyle = '#ffd24a';
+  ctx.fillText(`(${px}, ${py})`, px + 14, py - 11);
+}
+
+function fmtCalInfo(info) {
+  if (!info || Object.keys(info).length === 0) return '<span class="stale">(no data)</span>';
+  /* Prefer saved_cal — populated by every successful cal flow regardless
+     of which side scanned. The runtime cal.peak only has data when this
+     cam was the scanner in the most recent flow, so for protocol-path
+     monocal it's empty on the holder side. */
+  const saved = info.saved_cal || {};
+  const cal = info.cal || {};
+  const pixel = saved.tx_pixel || info.pixel || [-1, -1];
+  const peak = saved.tx_pixel || (cal.peak && cal.peak[0] >= 0 ? cal.peak : null);
+  const peakBright = saved.peak_brightness || cal.peak_brightness || 0;
+  const peakDelta = saved.grid_delta != null ? saved.grid_delta : (cal.peak_delta || 0);
+  const ageMs = info.ts_ms && info.last_event_ms
+                 ? (info.ts_ms - info.last_event_ms) : 0;
+  const ageStr = ageMs > 60000 ? `<span class="stale">${(ageMs/1000).toFixed(0)}s ago</span>`
+                                : `<span class="val">${(ageMs/1000).toFixed(0)}s ago</span>`;
+  return `
+    <div><span class="key">pixel:</span> <span class="val">[${pixel[0]}, ${pixel[1]}]</span></div>
+    <div><span class="key">peak:</span> <span class="val">${peak ? `[${peak[0]}, ${peak[1]}]` : '—'}</span>
+         <span class="key">delta:</span> <span class="val">${peakDelta}</span>
+         <span class="key">b:</span> <span class="val">${peakBright}</span></div>
+    <div><span class="key">state:</span> <span class="val">${info.state}</span>
+         <span class="key">rate:</span> <span class="val">${info.rate_ms}ms</span>
+         <span class="key">ae:</span> <span class="val">${info.ae_frozen ? 'frozen' : 'active'}</span></div>
+    <div><span class="key">last event:</span> <span class="val">${ageStr}</span></div>
+  `;
+}
+
+async function refreshLiveCal(cam) {
+  const img = document.getElementById(`live-${cam}-img`);
+  const mark = document.getElementById(`live-${cam}-mark`);
+  const info = document.getElementById(`live-${cam}-info`);
+
+  // Cache-bust the snapshot URL so each click reloads a fresh frame.
+  img.src = `/api/${cam}/snapshot?t=${Date.now()}`;
+
+  const data = await fetchJSON(`/api/${cam}/cal-info`);
+  if (data) {
+    info.innerHTML = fmtCalInfo(data);
+    drawCalMark(mark, data);
+  } else {
+    info.innerHTML = '<span class="stale">(fetch failed)</span>';
+    drawCalMark(mark, null);
+  }
+}
+
+async function refreshAllLiveCal() {
+  await Promise.all([refreshLiveCal('cam1'), refreshLiveCal('cam2')]);
+}
+
+document.getElementById('live-cal-refresh').addEventListener('click', refreshAllLiveCal);
+
+// Auto-refresh once when CAL RESULTS tab becomes active, and after monocal
+// completes (so the user sees fresh state without manually clicking).
+const calTabBtn = document.querySelector('.tab[data-tab="cal"]');
+if (calTabBtn) calTabBtn.addEventListener('click', () => setTimeout(refreshAllLiveCal, 200));
+
+// Hook into the existing post-cal switch (RUN CAL SEQUENCE auto-switches to
+// the CAL RESULTS tab on done-ok). Trigger live refresh there too. The hook
+// is best-effort — if the user closed/reloaded the page mid-run, the cal
+// tab's own click handler still fires the refresh.
+window.addEventListener('load', () => setTimeout(refreshAllLiveCal, 600));
 </script>
 </body>
 </html>

@@ -47,17 +47,18 @@ class CamStatusClient:
         self.password = password
         self.cookie_file = f"/tmp/cam_cookie_{ip}.txt"
 
-    def _login(self) -> bool:
+    def _login(self, timeout: float = 3.0) -> bool:
         """Authenticate and persist the session cookie. Returns False on
         timeout, network failure, or auth rejection. Never raises — callers
         rely on the get*/fetch contract that all failure modes return None."""
         try:
             r = subprocess.run(
-                ["curl", "-s", "-c", self.cookie_file,
+                ["curl", "-s", "--max-time", str(timeout), "-c", self.cookie_file,
                  f"http://{self.ip}/x/login.cgi",
                  "-H", "Content-Type: application/json",
-                 "-d", json.dumps({"username": "root", "password": self.password})],
-                capture_output=True, text=True, timeout=8,
+                 "-d", json.dumps({"username": "root", "password": self.password},
+                                  separators=(",", ":"))],
+                capture_output=True, text=True, timeout=timeout + 1,
             )
         except (subprocess.TimeoutExpired, OSError):
             return False
@@ -70,7 +71,7 @@ class CamStatusClient:
             return self._login()
         return True
 
-    def _fetch(self, path: str, timeout: float = 8.0,
+    def _fetch(self, path: str, timeout: float = 3.0,
                retry_login: bool = True) -> Optional[str]:
         """Authenticated GET against `http://<ip><path>`, returning the
         response body as text. Returns None on timeout, empty body, HTML
@@ -83,16 +84,21 @@ class CamStatusClient:
             return None
         try:
             r = subprocess.run(
-                ["curl", "-s", "-b", self.cookie_file,
+                ["curl", "-s", "--max-time", str(timeout), "-b", self.cookie_file,
                  f"http://{self.ip}{path}"],
-                capture_output=True, text=True, timeout=timeout,
+                capture_output=True, text=True, timeout=timeout + 1,
             )
         except (subprocess.TimeoutExpired, OSError):
             return None
         body = (r.stdout or "").strip()
         if not body:
             return None
-        if body.startswith("<") and "Forbidden" in body:
+        # Auth-required indicators come in two flavors depending on Thingino
+        # version: older builds return HTML `<title>Forbidden</title>`, newer
+        # return JSON `{"error":"Authentication required..."}` with HTTP 401.
+        # Both mean re-login (cookie is wiped on cam reboot).
+        if (body.startswith("<") and "Forbidden" in body) or \
+           (body.startswith("{") and "Authentication required" in body):
             if retry_login:
                 self._login()
                 return self._fetch(path, timeout=timeout, retry_login=False)
@@ -100,6 +106,48 @@ class CamStatusClient:
         if body.startswith("<"):
             return None  # HTML error page — not our endpoint
         return body
+
+    def _fetch_binary(self, path: str, timeout: float = 3.0,
+                       retry_login: bool = True) -> Optional[bytes]:
+        """Authenticated GET returning raw bytes. Used for snapshot endpoints
+        like /x/ch1.jpg that serve JPEG payloads. Same cookie-and-retry
+        machinery as _fetch but no text-decoding."""
+        if not self._ensure_cookie():
+            return None
+        try:
+            r = subprocess.run(
+                ["curl", "-s", "--max-time", str(timeout), "-b", self.cookie_file,
+                 f"http://{self.ip}{path}"],
+                capture_output=True, timeout=timeout + 1,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        body = r.stdout or b""
+        if not body:
+            return None
+        # Detect auth-required at the byte level — both old HTML and new JSON
+        # 401 flavors. See `_fetch` for the same logic on text endpoints.
+        head = body[:200]
+        if (body[:1] == b"<" and b"Forbidden" in head) or \
+           (body[:1] == b"{" and b"Authentication required" in head):
+            if retry_login:
+                self._login()
+                return self._fetch_binary(path, timeout=timeout,
+                                          retry_login=False)
+            return None
+        if body[:1] == b"<":
+            return None
+        return body
+
+    def get_snapshot(self, channel: int = 1) -> Optional[bytes]:
+        """Fetch a single JPEG snapshot from /x/ch{0,1}.jpg.
+
+        channel=1 is the 640x360 substream that matches calibration.json's
+        frame_size — use that for displaying cal results. channel=0 is the
+        full-resolution main stream. Returns JPEG bytes or None on failure."""
+        if channel not in (0, 1):
+            return None
+        return self._fetch_binary(f"/x/ch{channel}.jpg")
 
     def _post(self, path: str, data: str, content_type: Optional[str] = None,
               timeout: float = 8.0,
@@ -132,7 +180,7 @@ class CamStatusClient:
             code = int(out[nl + 1:].strip())
         except ValueError:
             return None
-        if code == 403 and retry_login:
+        if code in (401, 403) and retry_login:
             self._login()
             return self._post(path, data, content_type=content_type,
                               timeout=timeout, retry_login=False)
@@ -245,12 +293,68 @@ class CamStatusClient:
         `{"code":200,"result":"success","message":""}` — same substring check
         used in cam_setup.sh and cal_procedure.py). Phase 5 contract: writes
         fail loud, no SSH fallback."""
-        body = json.dumps({"cmd": cmd, "val": val})
+        body = json.dumps({"cmd": cmd, "val": val}, separators=(",", ":"))
         res = self._post("/x/json-imp.cgi", body, content_type="application/json")
         if res is None:
             return False
         code, response_body = res
         return code == 200 and '"success"' in response_body
+
+    def get_saved_cal(self) -> Optional[dict]:
+        """Return the parsed /opt/etc/calibration.json (saved cal, JFFS2-
+        persistent) via /x/saved-cal.cgi. This is the authoritative
+        "where this cam sees its peer" record — always current after any
+        cal flow, regardless of which side scanned. Distinct from
+        get(): /run/irlink-status.json's `cal.peak` only reflects this
+        cam's most recent scan and stays empty if the cam was the holder.
+
+        Returns None on transport failure or missing/malformed file."""
+        body = self._fetch("/x/saved-cal.cgi")
+        if body is None:
+            return None
+        try:
+            d = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(d, dict) or "tx_pixel" not in d:
+            return None
+        return d
+
+    def get_grid_deltas(self) -> Optional[dict]:
+        """Return the last on-camera `do_grid_calibration` result as parsed
+        JSON `{ts_ms, best_block, best_delta, deltas:[240 ints]}` via
+        /x/grid-deltas.cgi. The deltas array is post-OSD-mask (top + bottom
+        block rows already zeroed) — same vector irlink's argmax saw.
+
+        Use this to debug a wrong-block monocal pick: inspect the runner-up
+        block's delta vs the chosen one without SSHing in to read stderr.
+
+        Returns None on transport failure or if the cam has not run a grid
+        cal since boot (CGI returns 404 → `{"state":"never_run"}`)."""
+        body = self._fetch("/x/grid-deltas.cgi")
+        if body is None:
+            return None
+        try:
+            d = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(d, dict) or "deltas" not in d:
+            return None
+        return d
+
+    def get_events_log(self, tail: Optional[int] = None) -> Optional[str]:
+        """Return /tmp/irlink-events.log contents (plain text) via /x/events-log.cgi.
+
+        Optional tail=N returns only the last N lines (less data over the wire
+        for live tailing). None on transport failure. Returns the text body as
+        a single string with embedded newlines — caller splits if needed."""
+        path = "/x/events-log.cgi"
+        if tail is not None and tail > 0:
+            path += f"?tail={int(tail)}"
+        body = self._fetch(path)
+        if body is None:
+            return None
+        return body
 
     def start_monocal(self, coords: tuple[int, int],
                       speed_ms: int = 160) -> Optional[dict]:
@@ -297,6 +401,61 @@ class CamStatusClient:
         # Both the "transient" and "never_run" sentinel states are valid
         # responses — the caller distinguishes them. Don't filter here.
         return d
+
+    def set_time(self, epoch: Optional[int] = None,
+                 timeout: float = 6.0) -> Optional[dict]:
+        """POST /x/time-sync.cgi to set the cam's wall clock from the laptop.
+
+        Cameras have no battery-backed RTC and outbound NTP (UDP 123) is
+        commonly blocked, so ntpd never syncs. This pushes the laptop's
+        time over HTTP instead. Pass `epoch=None` to use the laptop's
+        current time. Returns the cam's report:
+
+            {ok, old_epoch, new_epoch, drift_s}
+
+        drift_s = old - new (positive = cam was ahead). None on transport
+        failure. Latency between this call's send and the cam's `date -s`
+        is sub-second on LAN, so accuracy is bounded by SSH RTT (~100ms)."""
+        import time as _time
+        if epoch is None:
+            epoch = int(_time.time())
+        body = f"epoch={int(epoch)}"
+        res = self._post("/x/time-sync.cgi", body, timeout=timeout)
+        if res is None:
+            return None
+        code, response_body = res
+        if code != 200:
+            return None
+        try:
+            d = json.loads(response_body)
+        except json.JSONDecodeError:
+            return None
+        return d if isinstance(d, dict) else None
+
+    def run_setup(self, timeout: float = 20.0) -> Optional[dict]:
+        """POST /x/setup.cgi to put this cam into a known IR-comm-ready state.
+
+        Single round-trip equivalent of the old multi-step laptop preflight:
+        kills daynightd, sets night/mono via prudyntctl, forces LEDs off
+        (`light` + raw `gpio clear`), resets ae_freeze, opens ircut last,
+        verifies grid + prudynt + irlink. Returns:
+
+            {ok: bool, steps: [{name, ok, detail}, ...]}
+
+        or None on transport failure. ~1-2s wall time on slow MIPS.
+        Higher default timeout than the readonly endpoints — this CGI does
+        ~10 cam-side ops with a 1s sleep after `killall daynightd`."""
+        res = self._post("/x/setup.cgi", "", timeout=timeout)
+        if res is None:
+            return None
+        code, body = res
+        if code != 200:
+            return None
+        try:
+            d = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+        return d if isinstance(d, dict) else None
 
     def get_proc_status(self) -> Optional[dict]:
         """Return process counts as `{irlink:N, daynightd:N, prudynt:N, ts_s:T}`

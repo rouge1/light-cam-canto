@@ -348,15 +348,21 @@ static void log_event(const char *tag, const char *fmt, ...)
    daemon-listen/daemon-connect/monocal) so both peers start at the same rate
    regardless of --speed. Without the lock, cam1's daemon-listen at 200 vs
    cam2's monocal at 160 would silently fail SYN decode. */
+/* Floor at 160ms (rung 4), not 200ms (rung 5). 160ms is the documented
+   reliable rate for on-camera BrightnessMonitor (~18fps → 2.9 samples/sym);
+   200ms produced enough Manchester edge timing variance for the DPLL to
+   miss the SYNC word reliably, leaving cal/handshake stuck because cal
+   itself is what unlocks probe-up. */
+#define RATE_FLOOR_RUNG (RATE_LADDER_LEN - 2)
 static void lock_rate_at_floor(const char *mode)
 {
-    int floor_ms = RATE_LADDER_MS[RATE_LADDER_LEN - 1];
+    int floor_ms = RATE_LADDER_MS[RATE_FLOOR_RUNG];
     if (symbol_ms != floor_ms) {
         fprintf(stderr,
             "RATE: %s startup — clamping %dms → %dms (floor) until first cal\n",
             mode, symbol_ms, floor_ms);
     }
-    apply_rate(floor_ms, RATE_LADDER_LEN - 1, "startup-floor");
+    apply_rate(floor_ms, RATE_FLOOR_RUNG, "startup-floor");
     rate_locked_at_floor = 1;
     log_event("RATE", "locked-at-floor ms=%d mode=%s", floor_ms, mode);
 }
@@ -434,9 +440,12 @@ static int status_cal_bidi = 0;
 static int status_cal_retries = 0;
 static int status_peak_x = -1, status_peak_y = -1;
 static int status_peak_brightness = 0, status_peak_delta = 0, status_peak_block = -1;
-static int status_tx_count = 0;
-static int status_rx_count = 0;
-static int status_decode_fail = 0;
+/* Removed status_tx_count / status_rx_count / status_decode_fail —
+   they were declared as separate aggregates but never incremented anywhere.
+   write_irlink_status now reads tx_count / rx_count / crc_fail_count
+   directly, which are the real counters maintained by send_message and
+   rx_thread. Without this, /api/{cam}/status reported decode_fail:0
+   forever even while rx_thread was actively failing decodes. */
 /* Mirrors of rx_thread locals — written by rx_thread, read by
    write_irlink_status. Lets the laptop see "is cam1's ROI seeing peer
    IR right now?" via /api/cam1/status without SSHing for stderr. */
@@ -510,7 +519,12 @@ static void write_irlink_status(void)
         cal_flow_active, status_cal_phase, status_cal_bidi, status_cal_retries,
         status_peak_x, status_peak_y,
         status_peak_brightness, status_peak_delta, status_peak_block,
-        status_tx_count, status_rx_count, status_decode_fail,
+        /* status_tx_count / status_rx_count / status_decode_fail were
+           declared as separate aggregates but never incremented anywhere —
+           the real counters live in rx_count / tx_count / crc_fail_count
+           (rx_thread + send_message). Read those directly so the webapi
+           stops reporting `decode_fail:0` when decodes are actually failing. */
+        tx_count, rx_count, crc_fail_count,
         status_rx_active ? "ACTIVE" : "IDLE",
         (int)status_rx_brightness, (int)status_rx_baseline,
         (int)status_rx_brightness - (int)status_rx_baseline,
@@ -2070,6 +2084,20 @@ static int do_search(int max_wait_ms,
 
         int best_block = -1, best_delta = 0;
         for (int i = 0; i < GRID_BLOCKS; i++) {
+            /* Skip OSD-tainted block rows (top + bottom). do_search has the
+               same vulnerability as do_grid_calibration: the per-second OSD
+               timestamp + name + uptime can sustain enough delta over
+               SEARCH_HOLD_MS to win. Observed 2026-05-10: bootstrap
+               do_search picked block 34 (row 1, x=448-479, y=30-59,
+               adjacent to OSD strip) and wrote tx_pixel=(477, 47) into
+               cam2's saved cal — clearly wrong vs the host RTSP cal that
+               put cam1 at (294, 173). Mirrors do_grid_calibration's mask
+               at line 1572 + cal_procedure.py:206-209. */
+            int by = i / 20;
+            if (by == 0 || by == 11) {
+                bright_since[i] = 0;
+                continue;
+            }
             int delta = (int)blocks[i] - (int)baseline[i];
             if (delta >= SEARCH_DELTA) {
                 if (bright_since[i] == 0) bright_since[i] = ts;
@@ -2495,6 +2523,29 @@ static void *grid_watchdog_thread(void *unused)
         if (read_grid(&ts, blocks, GRID_BLOCKS) <= 0) continue;
 
         if (!watchdog_baseline_init) {
+            /* Prefer to capture the baseline during a quiet grid window:
+               cam2's monocal short-handshake (35s budget) overlaps cam1's
+               30s startup grace — if grace expires mid-SYN-burst, baseline
+               bakes in the volatile LED-modulating state and the subsequent
+               bootstrap_hold's +20 elevation never crosses WATCHDOG_DELTA
+               vs the already-elevated baseline. So defer when carrier was
+               recent. BUT cap the deferral: if peer LEDs are stuck on
+               from a prior run, carrier is *always* recent and we'd never
+               capture, leaving the watchdog permanently dead. After
+               WATCHDOG_BASELINE_MAX_DEFER_MS we accept whatever the grid
+               currently is — the EMA on quiet blocks (loop below) will
+               catch up to true ambient if peer LEDs eventually drop. */
+            #define WATCHDOG_BASELINE_MAX_DEFER_MS 10000
+            static int64_t watchdog_first_defer_ms = 0;
+            if (last_carrier_ms > 0
+                && now_ms() - last_carrier_ms < 1500
+                && (watchdog_first_defer_ms == 0
+                    || now_ms() - watchdog_first_defer_ms < WATCHDOG_BASELINE_MAX_DEFER_MS)) {
+                if (watchdog_first_defer_ms == 0)
+                    watchdog_first_defer_ms = now_ms();
+                continue;
+            }
+            watchdog_first_defer_ms = 0;
             memcpy(watchdog_baseline, blocks, GRID_BLOCKS);
             for (int i = 0; i < GRID_BLOCKS; i++) watchdog_run_len[i] = 0;
             watchdog_baseline_init = 1;
@@ -4014,8 +4065,23 @@ int main(int argc, char *argv[])
         monocal_set_state("starting", NULL);
 
         lock_rate_at_floor("monocal");
+        /* Defensive: ensure our LEDs are OFF before AE settles. If a prior
+           monocal run left them stuck ON (observed after `do_search` timeout
+           paths), AE would settle to a saturated exposure and the rest of
+           the flow runs blind. gpio_set drives both 850 + 940 OFF directly. */
+        gpio_set(0);
+        /* Same AE-settle handshake as listen/connect/daemon-listen — without
+           it, monocal's rx_thread runs with whatever AE state was inherited
+           from the caller (typically 0 since /x/monocal-trigger.cgi spawns
+           cam2 fresh). With AE active, the ISP compensates for cam1's IR
+           pulses and the brightness deltas of incoming SYN_ACK / CAL_ACK /
+           CAL_DONE never cross MIN_BRIGHTNESS_DELTA → every decode fails.
+           Symptom (observed 2026-05-10): cam1 progresses through SYN→
+           SYN_ACK fine, cam2 sits at fail=9 / rx=0, handshake stalls. */
+        set_ae_freeze(0);
+        usleep(AE_PRE_FREEZE_SETTLE_MS * 1000);
         set_ae_freeze(1);
-        usleep(1000000); /* 1s AE settle for RX of CAL_ACK + CAL_DONE */
+        usleep(AE_FREEZE_APPLY_MS * 1000);
 
         pthread_t rx_tid;
         if (pthread_create(&rx_tid, NULL, rx_thread, NULL) != 0) {
@@ -4023,6 +4089,7 @@ int main(int argc, char *argv[])
             monocal_ended_ms = now_ms();
             monocal_ok = 0;
             monocal_set_state("monocal_failed", "rx_thread create failed");
+            gpio_set(0);
             set_ae_freeze(0);
             return 1;
         }
@@ -4037,6 +4104,7 @@ int main(int argc, char *argv[])
             int rc = do_monocal_request();
             running = 0;
             pthread_join(rx_tid, NULL);
+            gpio_set(0);  /* defensive — match the failure-path cleanup */
             set_ae_freeze(0);
             return rc == 0 ? 0 : 1;
         }
@@ -4088,6 +4156,12 @@ int main(int argc, char *argv[])
             monocal_ok = 0;
             monocal_set_state("monocal_failed",
                 "bootstrap fallback: did not see cam1's responding hold");
+            /* Defensive LED-off — without this, a hold_leds_on partial-run
+               or any other path that left GPIO HIGH at exit time leaves
+               cam2 blasting IR until next manual intervention. Observed
+               2026-05-10: webui showed `ir850=1 ir940=1` after a search-
+               timeout, requiring `/api/cam2/led value=0` to clear. */
+            gpio_set(0);
             set_ae_freeze(0);
             return 1;
         }
@@ -4114,6 +4188,7 @@ int main(int argc, char *argv[])
         monocal_ok = 1;
         monocal_set_state("monocal_done",
             "bootstrap fallback: both cams refreshed via light-only path");
+        gpio_set(0);  /* defensive — match the failure-path cleanup */
         set_ae_freeze(0);
         return 0;
     }

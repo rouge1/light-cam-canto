@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import urllib.parse
 from typing import Optional
 
 CAM_PASSWORD = "password"
@@ -351,6 +352,35 @@ class CamStatusClient:
         path = "/x/events-log.cgi"
         if tail is not None and tail > 0:
             path += f"?tail={int(tail)}"
+        body = self._fetch(path)
+        if body is None:
+            return None
+        return body
+
+    def get_syslog(self, tag: Optional[str] = None,
+                   tail: Optional[int] = None) -> Optional[str]:
+        """Return filtered busybox syslog ring buffer via /x/logread.cgi.
+
+        Distinct from `get_events_log()`: that one returns irlink's own
+        log_event() output (`/tmp/irlink-events.log`). This one returns
+        the system syslog (rc.local boot trail, prudynt debug, S94rc.local
+        markers, anything else written via `logger -t <tag>`).
+
+        Args:
+            tag: substring filter on the syslog record (e.g. "rc.local"
+                 to see only boot diagnostics). Tag is fixed-string
+                 substring match server-side; CGI rejects shell-meta.
+            tail: last N matching lines (default 50 server-side).
+
+        Returns plain text body or None on transport failure."""
+        path = "/x/logread.cgi"
+        params = []
+        if tag:
+            params.append(f"tag={urllib.parse.quote(tag, safe='')}")
+        if tail is not None and tail > 0:
+            params.append(f"tail={int(tail)}")
+        if params:
+            path += "?" + "&".join(params)
         body = self._fetch(path)
         if body is None:
             return None

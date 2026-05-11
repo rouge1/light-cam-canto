@@ -21,6 +21,9 @@
   --amber-dark: #4d3300;
   --red: #ff4136;
   --red-dim: #c0392b;
+  --cyan: #6cf2ff;
+  --cyan-dim: #3a98aa;
+  --violet: #c97cff;
   --gray: #303030;
   --gray-dark: #181818;
 }
@@ -65,7 +68,6 @@ body::after {
   pointer-events: none; z-index: 9998;
 }
 
-/* pixel grid */
 .pixel-bg {
   position: fixed; inset: 0;
   background-image:
@@ -76,14 +78,13 @@ body::after {
 }
 
 main {
-  max-width: 1100px;
+  max-width: 1200px;
   margin: 0 auto;
   padding: 16px 16px 64px;
   position: relative;
   z-index: 1;
 }
 
-/* ============== RIVETS (corner pixels) ============== */
 .rivet { position: absolute; width: 12px; height: 12px; background: var(--green); }
 .rivet.tl { top: -8px; left: -8px; }
 .rivet.tr { top: -8px; right: -8px; }
@@ -91,18 +92,29 @@ main {
 .rivet.br { bottom: -8px; right: -8px; }
 .amber-rivet { background: var(--amber); }
 
-/* ============== HERO RING (compact title integrated) ============== */
-.hero-ring {
+/* ============== PAGE-LOAD PHOSPHOR WARMUP ============== */
+/* One orchestrated reveal then quiet — sections fade-up like an old CRT
+   warming up, staggered so the page reads from top to bottom. `backwards`
+   keeps each section invisible until its delay elapses. */
+@keyframes phosphor-warmup {
+  0%   { opacity: 0; filter: brightness(0) blur(8px); transform: translateY(8px); }
+  60%  { opacity: 1; filter: brightness(1.4) blur(0); transform: translateY(0); }
+  100% { filter: brightness(1) blur(0); }
+}
+
+/* ============== HEADER (title + clock only — buttons moved under hero) ============== */
+.header {
   border: 4px solid var(--amber);
   background:
-    radial-gradient(ellipse at center, rgba(255,170,0,0.07) 0%, transparent 70%),
+    radial-gradient(ellipse at center, rgba(255,170,0,0.06) 0%, transparent 70%),
     var(--bg-panel);
-  padding: 36px 28px 28px;
+  padding: 22px 22px 16px;
   margin-bottom: 16px;
   position: relative;
   box-shadow: 0 0 0 2px var(--bg), 0 0 0 6px var(--amber-dark), 0 0 32px rgba(255,170,0,0.10);
+  animation: phosphor-warmup 700ms 0ms ease-out backwards;
 }
-.ring-title {
+.header-title {
   position: absolute;
   top: -12px;
   left: 50%;
@@ -120,7 +132,7 @@ main {
   0%, 100% { text-shadow: 0 0 6px var(--amber), 0 0 16px rgba(255,170,0,0.5); }
   50% { text-shadow: 0 0 8px var(--amber), 0 0 24px rgba(255,170,0,0.8); }
 }
-.ring-corner {
+.header-corner {
   position: absolute;
   font-size: 10px;
   color: var(--green-dim);
@@ -128,493 +140,131 @@ main {
   padding: 0 8px;
   letter-spacing: 1px;
 }
-.ring-corner.tl-label { top: -7px; left: 16px; color: var(--green); text-shadow: 0 0 4px var(--green); }
-.ring-corner.tr-label { top: -7px; right: 16px; }
-.ring-corner.br-label { bottom: -7px; right: 16px; }
-.ring-corner .clock {
+.header-corner.tl-label { top: -7px; left: 16px; color: var(--green); text-shadow: 0 0 4px var(--green); }
+.header-corner.tr-label { top: -7px; right: 16px; }
+.header-corner.br-label { bottom: -7px; right: 16px; }
+.header-corner .clock {
   font-family: 'VT323', monospace;
   font-size: 18px;
   color: var(--amber);
   text-shadow: 0 0 4px var(--amber);
   letter-spacing: 1px;
 }
-
-.hero-content {
-  display: grid;
-  grid-template-columns: 1fr auto 1fr;
-  align-items: center;
-  gap: 16px;
+.header-tagline {
+  text-align: center;
+  font-size: 9px;
+  color: var(--green-dim);
+  letter-spacing: 3px;
+  margin-top: 4px;
 }
 
-/* ============== ISO/SIDE-VIEW CAMERAS ============== */
-/* Wyze V3 in side profile, lens facing the peer (right for cam1, left for cam2) */
+/* ============== HERO PANEL — single picture: cam1 | dominant beam | cam2 ============== */
+.hero-panel {
+  border: 4px solid var(--green-dim);
+  background:
+    radial-gradient(ellipse at center, rgba(0,255,65,0.06) 0%, transparent 65%),
+    var(--bg-panel);
+  padding: 28px 24px 20px;
+  margin-bottom: 14px;
+  position: relative;
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 6px var(--green-darker), 0 0 28px rgba(0,255,65,0.06);
+  animation: phosphor-warmup 700ms 200ms ease-out backwards;
+}
+.hero-content {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 22px;
+}
 
-.cam-wrap {
+.cam-art-wrap {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
 }
-.cam-wrap.right { align-items: center; }
-
-.cam-name {
+.cam-art-name {
   font-size: 14px;
   color: var(--green);
   text-shadow: 0 0 4px var(--green);
-  letter-spacing: 3px;
+  letter-spacing: 4px;
 }
-.cam-id {
-  font-size: 9px;
+.cam-art-host {
+  font-size: 8px;
   color: var(--green-dim);
   letter-spacing: 1px;
 }
 
-/* === Wyze V3 isometric 3/4 view ===
-   Three visible faces — front (with the iconic black bezel + IR ring + lens),
-   top (parallelogram receding back), right side (parallelogram receding right).
-   Mirrored for cam2 so the iso angle suggests the cams are "looking" at each other. */
-.cam-side {
-  position: relative;
-  width: 220px;
-  height: 200px;
-  --body-w: 110px;
-  --body-h: 110px;
-  --depth: 22px;
-  --bevel: #1a1a1a;
-}
-
-/* Subtle ground glow / reflection under the camera */
-.cam-side .cam-shadow {
-  position: absolute;
-  bottom: 8px;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 130px;
-  height: 12px;
-  background:
-    radial-gradient(ellipse at center,
-      rgba(0,255,65,0.18) 0%,
-      rgba(0,255,65,0.04) 50%,
-      transparent 80%);
-  filter: blur(2px);
-  z-index: 0;
-}
-.cam-side.ir-on .cam-shadow {
-  background:
-    radial-gradient(ellipse at center,
-      rgba(255,65,54,0.28) 0%,
-      rgba(255,65,54,0.08) 50%,
-      transparent 80%);
-}
-
-/* Top face — parallelogram receding back-up-right */
-.cam-side .cam-top {
-  position: absolute;
-  width: var(--body-w);
-  height: var(--depth);
-  top: 26px;
-  background:
-    linear-gradient(180deg, #f8f8f8 0%, #c8c8c8 100%);
-  transform: skewX(-32deg);
-  transform-origin: bottom left;
-  box-shadow:
-    inset 0 4px 0 #ffffff,
-    inset 0 -2px 0 #a0a0a0,
-    0 0 0 4px var(--bevel);
-  z-index: 2;
-}
-/* dim "groove" line across the top — Wyze V3 has a subtle seam */
-.cam-side .cam-top::after {
-  content: '';
-  position: absolute;
-  top: 50%;
-  left: 8%;
-  right: 8%;
-  height: 2px;
-  background: rgba(0,0,0,0.1);
-}
-
-/* Right (or left for cam2) side face — parallelogram receding back */
-.cam-side .cam-side-face {
-  position: absolute;
-  width: var(--depth);
-  height: var(--body-h);
-  top: 48px;
-  background:
-    linear-gradient(180deg, #c8c8c8 0%, #909090 100%);
-  transform: skewY(-32deg);
-  transform-origin: top left;
-  box-shadow:
-    inset 4px 0 0 #d8d8d8,
-    inset -4px 0 0 #707070,
-    0 0 0 4px var(--bevel);
-  z-index: 1;
-}
-
-/* Front face — the iconic Wyze V3 face with bezel + lens + IR ring */
-.cam-side .cam-front {
-  position: absolute;
-  width: var(--body-w);
-  height: var(--body-h);
-  top: 48px;
-  background:
-    linear-gradient(180deg, #ffffff 0%, #e8e8e8 50%, #c0c0c0 100%);
-  box-shadow:
-    inset 0 4px 0 #ffffff,
-    inset 0 -4px 0 #909090,
-    inset 4px 0 0 #f0f0f0,
-    inset -4px 0 0 #b0b0b0,
-    0 0 0 4px var(--bevel);
-  z-index: 3;
-}
-
-/* Status LED — small green dot at top-right of front face */
-.cam-side .cam-status-led {
-  position: absolute;
-  width: 6px;
-  height: 6px;
-  top: 14px;
-  background: var(--green);
-  border-radius: 50%;
-  box-shadow: 0 0 6px var(--green), 0 0 0 1px #050505;
-  animation: status-blink 1.4s ease-in-out infinite;
-}
-@keyframes status-blink {
-  0%, 55% { opacity: 1; }
-  65%, 100% { opacity: 0.25; }
-}
-
-/* Microphone hole — small dark dot below the bezel */
-.cam-side .cam-mic {
-  position: absolute;
-  width: 4px;
-  height: 4px;
-  bottom: 8px;
-  left: 50%;
-  transform: translateX(-50%);
-  background: #1a1a1a;
-  border-radius: 50%;
-  box-shadow: inset 0 0 0 1px #404040;
-}
-
-/* === Black bezel === Centered on front face. The iconic round black face. */
-.cam-side .cam-bezel {
-  position: absolute;
-  width: 80px;
-  height: 80px;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  background:
-    radial-gradient(circle at 35% 30%, #1a1a1a 0%, #050505 65%);
-  border-radius: 50%;
-  box-shadow:
-    inset 0 0 0 3px #2a2a2a,
-    inset 0 4px 6px rgba(255,255,255,0.06),
-    inset 0 -4px 6px rgba(0,0,0,0.7),
-    0 0 0 4px #050505,
-    0 0 12px rgba(0,0,0,0.8);
-  transition: box-shadow 200ms;
-}
-/* Outer rim "screws" — 4 tiny pixel dots at the corners of the bezel circle */
-.cam-side .cam-bezel::before {
-  content: '';
-  position: absolute;
-  inset: -10px;
-  border: 2px dotted #404040;
-  border-radius: 50%;
-  opacity: 0.4;
-}
-
-/* === IR LED ring === 8 dots evenly placed around the lens.
-   Uses CSS variable --i (0..7) and trig-via-rotate to position. */
-.ir-led {
-  position: absolute;
-  width: 6px;
-  height: 6px;
-  top: 50%;
-  left: 50%;
-  border-radius: 50%;
-  background: #5a1f1f;
-  box-shadow: 0 0 0 1px #050505, inset 0 0 0 1px rgba(0,0,0,0.4);
-  /* place at angle (i * 45deg), radius 30px */
-  transform:
-    translate(-50%, -50%)
-    rotate(calc(45deg * var(--i)))
-    translate(0, -30px);
-  transition: background 100ms, box-shadow 100ms;
-  z-index: 5;
-}
-
-/* IR LED ON — bright red, glowing, flicker animation */
-.cam-side.ir-on .ir-led {
-  background: var(--red);
-  box-shadow:
-    0 0 8px var(--red),
-    0 0 16px rgba(255,65,54,0.6),
-    0 0 0 1px #050505;
-  animation: ir-flicker 0.32s ease-in-out infinite;
-}
-.cam-side.ir-on .ir-led:nth-child(2n) { animation-delay: 0.08s; }
-.cam-side.ir-on .ir-led:nth-child(3n) { animation-delay: 0.16s; }
-@keyframes ir-flicker {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
-}
-
-/* === Lens === Center of bezel, recessed glass with a green pupil */
-.cam-side .cam-lens {
-  position: absolute;
-  width: 32px;
-  height: 32px;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  border-radius: 50%;
-  background:
-    radial-gradient(circle at 30% 30%,
-      rgba(0,255,65,0.5) 0%,
-      rgba(0,255,65,0.15) 35%,
-      #000 75%);
-  box-shadow:
-    inset 0 0 0 3px #000,
-    inset 0 0 10px rgba(0,255,65,0.6),
-    0 0 8px rgba(0,255,65,0.25);
-  z-index: 6;
-  transition: background 200ms, box-shadow 200ms;
-}
-/* The pupil — pulsing dot in lens center */
-.cam-side .cam-lens::after {
-  content: '';
-  position: absolute;
-  top: 50%; left: 50%;
-  width: 7px; height: 7px;
-  transform: translate(-50%, -50%);
-  background: var(--green);
-  border-radius: 50%;
-  box-shadow: 0 0 8px var(--green), 0 0 16px rgba(0,255,65,0.5);
-  animation: lens-pulse 2.6s ease-in-out infinite;
-}
-@keyframes lens-pulse {
-  0%, 100% { transform: translate(-50%, -50%) scale(0.85); opacity: 0.7; }
-  50%      { transform: translate(-50%, -50%) scale(1.4);  opacity: 1; }
-}
-/* Glint highlight on the lens — small white pixel "specular" */
-.cam-side .cam-lens-glint {
-  position: absolute;
-  width: 5px;
-  height: 5px;
-  top: 6px;
-  left: 7px;
-  background: #fff;
-  border-radius: 50%;
-  opacity: 0.85;
-  box-shadow: 0 0 4px rgba(255,255,255,0.6);
-  z-index: 7;
-}
-
-/* === LED-ON STATE: bezel + lens turn red === */
-.cam-side.ir-on .cam-bezel {
-  box-shadow:
-    inset 0 0 0 3px #4a0000,
-    inset 0 4px 6px rgba(255,80,60,0.15),
-    inset 0 -4px 6px rgba(0,0,0,0.7),
-    0 0 0 4px #050505,
-    0 0 18px rgba(255,65,54,0.45);
-}
-.cam-side.ir-on .cam-lens {
-  background:
-    radial-gradient(circle at 30% 30%,
-      rgba(255,90,70,0.65) 0%,
-      rgba(255,65,54,0.2) 35%,
-      #1a0000 75%);
-  box-shadow:
-    inset 0 0 0 3px #2a0000,
-    inset 0 0 12px rgba(255,65,54,0.7),
-    0 0 12px rgba(255,65,54,0.5);
-}
-.cam-side.ir-on .cam-lens::after {
-  background: var(--red);
-  box-shadow: 0 0 10px var(--red), 0 0 24px rgba(255,65,54,0.7);
-}
-
-/* radiating pulse rings emanating from bezel center when IR-on */
-.cam-side .ir-pulse {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 80px;
-  height: 80px;
-  border-radius: 50%;
-  border: 3px solid var(--red);
-  transform: translate(-50%, -50%);
-  opacity: 0;
-  pointer-events: none;
-  z-index: 4;
-}
-.cam-side.ir-on .ir-pulse {
-  animation: ir-bloom 1.6s ease-out infinite;
-}
-.cam-side.ir-on .ir-pulse.p2 { animation-delay: 0.55s; }
-.cam-side.ir-on .ir-pulse.p3 { animation-delay: 1.1s; }
-@keyframes ir-bloom {
-  0%   { width: 80px;  height: 80px;  opacity: 0.85; border-width: 3px; }
-  100% { width: 220px; height: 220px; opacity: 0;    border-width: 1px; }
-}
-
-/* === CAM1 layout: faces RIGHT toward CAM2 ===
-   Front face (with lens) is on the INNER (right) edge of the cam-side bbox.
-   Side-face & top recede UP-AND-LEFT (away from peer), so the body extends
-   backward from an inward-facing lens. */
-.cam-side.cam1 .cam-front      { right: 20px; }
-.cam-side.cam1 .cam-side-face  {
-  right: 130px;
-  transform: skewY(32deg);
-  transform-origin: top right;
-  box-shadow:
-    inset 4px 0 0 #707070,
-    inset -4px 0 0 #d8d8d8,
-    0 0 0 4px var(--bevel);
-}
-.cam-side.cam1 .cam-top {
-  right: 20px;
-  transform: skewX(32deg);
-  transform-origin: bottom right;
-}
-.cam-side.cam1 .cam-status-led { left: 96px; }
-.cam-side.cam1 .cam-lens-glint { left: auto; right: 7px; }
-.cam-side.cam1 .cam-shadow,
-.cam-side.cam1 .cam-base       { left: 134px; }
-
-/* === CAM2 layout: faces LEFT toward CAM1 ===
-   Mirror — front-face on the INNER (left) edge, side-face/top recede
-   UP-AND-RIGHT (away from peer). */
-.cam-side.cam2 .cam-front      { left: 20px; }
-.cam-side.cam2 .cam-side-face  {
-  left: 130px;
-  transform: skewY(-32deg);
-  transform-origin: top left;
-  box-shadow:
-    inset 4px 0 0 #d8d8d8,
-    inset -4px 0 0 #707070,
-    0 0 0 4px var(--bevel);
-}
-.cam-side.cam2 .cam-top {
-  left: 20px;
-  transform: skewX(-32deg);
-  transform-origin: bottom left;
-}
-.cam-side.cam2 .cam-status-led { left: 8px; }
-/* cam2 lens-glint stays at default top-left = inner-facing toward cam1 */
-.cam-side.cam2 .cam-shadow,
-.cam-side.cam2 .cam-base       { left: 86px; }
-
-/* === Magnetic base === Disc + neck under the body (replaces tripod). */
-.cam-side .cam-base {
-  position: absolute;
-  bottom: 4px;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 64px;
-  height: 18px;
-  z-index: 0;
-}
-.cam-side .cam-base::before {
-  /* neck — short cylinder below body */
-  content: '';
-  position: absolute;
-  top: 0;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 18px;
-  height: 8px;
-  background: linear-gradient(180deg, #909090 0%, #606060 100%);
-  box-shadow: 0 0 0 3px #1a1a1a;
-}
-.cam-side .cam-base::after {
-  /* base disc */
-  content: '';
-  position: absolute;
-  bottom: 0;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 60px;
-  height: 8px;
-  background: linear-gradient(180deg, #707070 0%, #303030 100%);
-  border-radius: 4px;
-  box-shadow:
-    0 0 0 3px #1a1a1a,
-    inset 0 2px 0 #909090,
-    inset 0 -2px 0 #1a1a1a;
-}
-
-/* === IR BEAM CHANNEL between cams === */
+/* ============== DOMINANT BEAM CHANNEL ============== */
+/* Lives between the two cam-art elements in the hero panel. Three parallel
+   tracks (two directional + one carrier-mid) make the channel feel
+   substantial; the labels are bigger and use display font letter-spacing
+   so the channel reads as "the medium" not just decoration. */
 .beam-channel {
-  position: relative;
-  min-width: 200px;
-  width: 100%;
-  height: 100px;
   display: flex;
   flex-direction: column;
   justify-content: center;
   gap: 6px;
+  padding: 10px 0;
+  width: 100%;
 }
-/* Idle = gray (no implied data flow). When the direction's IR is actually on,
-   both labels pulse the SAME cyan→white — color is purely "this channel is
-   live", not a per-direction tag. */
 .beam-label {
   font-size: 11px;
-  letter-spacing: 2px;
+  letter-spacing: 4px;
   text-align: center;
   color: #5a5a5a;
   text-shadow: none;
   transition: color 200ms, text-shadow 200ms;
 }
-.beam-label.active,
-.beam-label.reverse.active {
+.beam-label.active {
   animation: beam-label-cyan-pulse 1.4s ease-in-out infinite;
 }
 @keyframes beam-label-cyan-pulse {
-  0%, 100% {
-    color: #6cf2ff;
-    text-shadow: 0 0 4px rgba(108,242,255,0.7);
-  }
-  50% {
-    color: #ffffff;
-    text-shadow: 0 0 6px #ffffff, 0 0 14px #6cf2ff;
-  }
+  0%, 100% { color: var(--cyan); text-shadow: 0 0 4px rgba(108,242,255,0.7); }
+  50%      { color: #ffffff; text-shadow: 0 0 6px #ffffff, 0 0 14px var(--cyan); }
 }
-
-/* IDLE beam: neutral-gray dotted line, no traveling photon. The channel only
-   takes on color when its direction is actually firing IR. */
 .beam {
-  height: 6px;
+  height: 10px;
   position: relative;
   overflow: hidden;
   background:
     repeating-linear-gradient(90deg,
-      #3a3a3a 0, #3a3a3a 6px,
-      transparent 6px, transparent 14px);
-  opacity: 0.55;
+      #3a3a3a 0, #3a3a3a 8px,
+      transparent 8px, transparent 18px);
+  opacity: 0.5;
   transition: opacity 200ms, background 200ms, box-shadow 200ms;
+}
+.beam.carrier {
+  height: 4px;
+  opacity: 0.25;
+  background:
+    repeating-linear-gradient(90deg,
+      #2a2a2a 0, #2a2a2a 4px,
+      transparent 4px, transparent 10px);
 }
 .beam.active {
   opacity: 1;
   background:
     repeating-linear-gradient(90deg,
-      var(--red) 0, var(--red) 6px,
-      transparent 6px, transparent 14px);
-  box-shadow: 0 0 8px rgba(255,65,54,0.4);
+      var(--red) 0, var(--red) 8px,
+      transparent 8px, transparent 18px);
+  box-shadow: 0 0 12px rgba(255,65,54,0.55), 0 0 28px rgba(255,65,54,0.25);
 }
 .beam.reverse.active {
   background:
     repeating-linear-gradient(90deg,
-      var(--amber) 0, var(--amber) 6px,
-      transparent 6px, transparent 14px);
-  box-shadow: 0 0 8px rgba(255,170,0,0.4);
+      var(--amber) 0, var(--amber) 8px,
+      transparent 8px, transparent 18px);
+  box-shadow: 0 0 12px rgba(255,170,0,0.55), 0 0 28px rgba(255,170,0,0.25);
 }
-
-/* Travelling photon highlight — hidden by default, only animates when active */
+.beam.carrier.live {
+  opacity: 0.6;
+  background:
+    repeating-linear-gradient(90deg,
+      var(--cyan) 0, var(--cyan) 4px,
+      transparent 4px, transparent 10px);
+  box-shadow: 0 0 8px rgba(108,242,255,0.4);
+}
 .beam::before {
   content: '';
   position: absolute;
@@ -628,91 +278,29 @@ main {
   opacity: 0;
   pointer-events: none;
 }
-.beam.active::before {
-  opacity: 1;
-  animation: beam-fwd 1.6s linear infinite;
-}
+.beam.active::before { opacity: 1; animation: beam-fwd 1.6s linear infinite; }
 .beam.reverse.active::before { animation: beam-rev 2.4s linear infinite; }
 @keyframes beam-fwd { 0% { left: -45%; } 100% { left: 100%; } }
 @keyframes beam-rev { 0% { left: 100%; } 100% { left: -45%; } }
 
-/* ============== ORANGE BOX with TABS ============== */
-.seq {
-  border: 4px solid var(--amber);
-  background: var(--bg-panel);
-  position: relative;
-  box-shadow: 0 0 0 2px var(--bg), 0 0 0 6px var(--amber-dark), 0 0 28px rgba(255,170,0,0.07);
-  margin-bottom: 32px;
-}
-
-.tabs {
-  display: flex;
-  border-bottom: 4px dashed var(--amber-dim);
-}
-.tab {
-  flex: 1;
-  font-family: 'Press Start 2P', monospace;
-  font-size: 11px;
-  padding: 14px 18px;
-  background: var(--bg-panel-alt);
-  color: var(--amber-dim);
-  border: 0;
-  border-right: 4px solid var(--amber-dim);
-  cursor: pointer;
-  letter-spacing: 2px;
-  transition: background 100ms, color 100ms;
-}
-.tab:last-child { border-right: 0; }
-.tab:hover { background: var(--bg-panel); color: var(--amber); }
-.tab.active {
-  background: var(--amber-dark);
-  color: var(--amber);
-  text-shadow: 0 0 6px var(--amber);
-  border-bottom: 4px solid var(--amber);
-  margin-bottom: -4px;
-}
-
-.tab-panel { padding: 20px 18px; }
-.tab-panel.hidden { display: none; }
-
-/* === Sequence panel content === */
-.seq-head {
+/* ============== ACTION BAR — buttons UNDER the hero ============== */
+/* Asymmetric: RUN CAL is the primary action (full bidi cal_procedure
+   driven by the laptop). MONOCAL is the autonomous-cam1 secondary path.
+   1.6 : 1 column ratio reflects that visually. */
+.action-bar {
   display: grid;
-  grid-template-columns: 1fr 1fr auto;
+  grid-template-columns: 1.6fr 1fr;
   gap: 14px;
-  align-items: stretch;
-  margin-bottom: 18px;
+  margin-bottom: 16px;
+  animation: phosphor-warmup 700ms 350ms ease-out backwards;
 }
-/* Monocal button = cyan-tinted variant to signal "over the light channel" — same
-   shape and pulse as RUN CAL SEQUENCE, different hue. Matches the cyan/white
-   beam-label pulse so the visual association is consistent. */
-.big-cal-btn.monocal {
-  background: linear-gradient(180deg, rgba(108,242,255,0.14) 0%, rgba(108,242,255,0.04) 100%);
-  border: 4px solid #6cf2ff;
-  color: #6cf2ff;
-  box-shadow: 0 4px 0 #003a45;
-}
-.big-cal-btn.monocal:hover {
-  box-shadow: 0 6px 0 #003a45, 0 0 24px rgba(108,242,255,0.4);
-  background: linear-gradient(180deg, rgba(108,242,255,0.26) 0%, rgba(108,242,255,0.06) 100%);
-}
-.big-cal-btn.monocal:active { box-shadow: 0 2px 0 #003a45; }
-.big-cal-btn.monocal.running {
-  box-shadow: 0 4px 0 #003a45, 0 0 24px rgba(108,242,255,0.3);
-  animation: monocal-running-pulse 1.6s ease-in-out infinite;
-}
-@keyframes monocal-running-pulse {
-  0%, 100% { box-shadow: 0 4px 0 #003a45, 0 0 24px rgba(108,242,255,0.3); }
-  50%      { box-shadow: 0 4px 0 #003a45, 0 0 36px rgba(108,242,255,0.6); }
-}
-.big-cal-btn.monocal.done-ok  { border-color: #6cf2ff; color: #6cf2ff; }
-.big-cal-btn.monocal.done-err { border-color: var(--red); color: var(--red); box-shadow: 0 4px 0 #2a0000; }
+
 .big-cal-btn {
   display: flex;
   flex-direction: row;
   align-items: center;
   gap: 16px;
-  padding: 18px 24px;
+  padding: 16px 22px;
   background: linear-gradient(180deg, rgba(0,255,65,0.16) 0%, rgba(0,255,65,0.04) 100%);
   border: 4px solid var(--green);
   cursor: pointer;
@@ -741,267 +329,749 @@ main {
 }
 .big-cal-btn.done-ok  { border-color: var(--green); color: var(--green); }
 .big-cal-btn.done-err { border-color: var(--red);   color: var(--red); box-shadow: 0 4px 0 #2a0000; }
-.big-cal-icon  { font-size: 26px; text-shadow: 0 0 8px currentColor; flex-shrink: 0; }
-.big-cal-text  { display: flex; flex-direction: column; gap: 6px; }
+.big-cal-btn.monocal {
+  background: linear-gradient(180deg, rgba(108,242,255,0.14) 0%, rgba(108,242,255,0.04) 100%);
+  border: 4px solid var(--cyan);
+  color: var(--cyan);
+  box-shadow: 0 4px 0 #003a45;
+  padding: 14px 18px;       /* a touch smaller than primary */
+}
+.big-cal-btn.monocal:hover {
+  box-shadow: 0 6px 0 #003a45, 0 0 24px rgba(108,242,255,0.4);
+  background: linear-gradient(180deg, rgba(108,242,255,0.26) 0%, rgba(108,242,255,0.06) 100%);
+}
+.big-cal-btn.monocal:active { box-shadow: 0 2px 0 #003a45; }
+.big-cal-btn.monocal.running {
+  box-shadow: 0 4px 0 #003a45, 0 0 24px rgba(108,242,255,0.3);
+  animation: monocal-running-pulse 1.6s ease-in-out infinite;
+}
+@keyframes monocal-running-pulse {
+  0%, 100% { box-shadow: 0 4px 0 #003a45, 0 0 24px rgba(108,242,255,0.3); }
+  50%      { box-shadow: 0 4px 0 #003a45, 0 0 36px rgba(108,242,255,0.6); }
+}
+.big-cal-btn.monocal.done-ok  { border-color: var(--cyan); color: var(--cyan); }
+.big-cal-btn.monocal.done-err { border-color: var(--red); color: var(--red); box-shadow: 0 4px 0 #2a0000; }
+.big-cal-icon  { font-size: 28px; text-shadow: 0 0 8px currentColor; flex-shrink: 0; }
+.big-cal-text  { display: flex; flex-direction: column; gap: 4px; }
 .big-cal-label { font-size: 13px; text-shadow: 0 0 6px currentColor; line-height: 1.4; }
 .big-cal-sub   { font-size: 8px; opacity: 0.7; letter-spacing: 1px; line-height: 1.4; }
+.big-cal-btn.monocal .big-cal-icon { font-size: 24px; }
+.big-cal-btn.monocal .big-cal-label { font-size: 12px; }
+.big-cal-btn.monocal .big-cal-sub { font-size: 7px; }
 
-.cal-state-pill {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 12px 24px;
+/* ============== TWO-COLUMN PER-CAM DATA (no pixel-art duplication) ============== */
+.cams-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 24px;
+  animation: phosphor-warmup 700ms 500ms ease-out backwards;
+}
+.cam-col {
   border: 3px solid var(--green-dim);
-  background: var(--bg);
-  font-size: 9px;
-  color: var(--green-dim);
-  letter-spacing: 2px;
-  min-width: 130px;
-}
-.cal-state-pill.running { border-color: var(--green); color: var(--green); text-shadow: 0 0 4px var(--green); }
-.cal-state-pill.done-ok { border-color: var(--green); color: var(--green); text-shadow: 0 0 4px var(--green); }
-.cal-state-pill.done-err { border-color: var(--red); color: var(--red); text-shadow: 0 0 4px var(--red); }
-.cal-state-dot {
-  width: 12px; height: 12px;
-  background: var(--gray);
-  border-radius: 50%;
-  margin-bottom: 6px;
-  box-shadow: inset 0 0 0 2px #000;
-}
-.cal-state-pill.running .cal-state-dot { background: var(--green); box-shadow: 0 0 8px var(--green); animation: heartbeat 1s ease-in-out infinite; }
-.cal-state-pill.done-ok .cal-state-dot { background: var(--green); box-shadow: 0 0 8px var(--green); }
-.cal-state-pill.done-err .cal-state-dot { background: var(--red); box-shadow: 0 0 8px var(--red); }
-@keyframes heartbeat {
-  0%, 60%, 100% { transform: scale(1); }
-  30% { transform: scale(1.4); }
-}
-
-/* === STEP STACK (active phase on top, completed pushed down) === */
-.step-stack {
+  background: var(--bg-panel);
+  padding: 16px 14px 14px;
+  position: relative;
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 5px var(--green-darker), 0 0 18px rgba(0,255,65,0.05);
   display: flex;
   flex-direction: column;
   gap: 10px;
-  position: relative;
 }
-.step {
-  display: grid;
-  /* Cap the info column so .step-sub wraps under the heading instead of
-     stretching the row out and crowding .step-result. The auto state column
-     between info and result puts "time elapsed" in the visual middle of the
-     row; result takes 1fr and fills everything to the right edge. */
-  grid-template-columns: auto minmax(0, 320px) auto minmax(220px, 1fr);
-  align-items: center;
-  gap: 14px;
-  padding: 12px 14px;
-  background: var(--gray-dark);
-  border: 3px solid var(--gray);
-  position: relative;
-  transition: border-color 220ms, background 220ms, transform 280ms cubic-bezier(0.2,0.8,0.2,1);
+.cam-col.offline { border-color: var(--gray); box-shadow: 0 0 0 2px var(--bg), 0 0 0 5px #0a0a0a; }
+.cam-col-title {
+  position: absolute;
+  top: -10px;
+  left: 14px;
+  background: var(--bg);
+  padding: 0 10px;
+  font-size: 11px;
+  color: var(--green);
+  text-shadow: 0 0 4px var(--green);
+  letter-spacing: 3px;
 }
-.step.hidden { display: none; }
-
-/* slide-in animation when a step becomes visible */
-@keyframes step-slide-in {
-  0%   { transform: translateY(-30px); opacity: 0; }
-  100% { transform: translateY(0); opacity: 1; }
-}
-.step.appearing { animation: step-slide-in 320ms cubic-bezier(0.2,0.8,0.2,1); }
-
-.step-num {
-  font-size: 14px;
-  font-family: 'Press Start 2P', monospace;
-  padding: 8px 10px;
-  background: var(--gray);
+.cam-col.offline .cam-col-title { color: var(--gray); text-shadow: none; }
+.cam-col-host {
+  position: absolute;
+  top: -7px;
+  right: 14px;
+  background: var(--bg);
+  padding: 0 8px;
+  font-size: 9px;
   color: var(--green-dim);
   letter-spacing: 1px;
-  min-width: 44px;
-  text-align: center;
-  flex-shrink: 0;
+  font-family: 'VT323', monospace;
 }
-.step-info {
+
+/* === CHIPS — STATE is the headline (2fr), MODE/RATE are tertiary === */
+.cam-chips {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr;
+  gap: 8px;
+}
+.chip {
+  border: 2px solid var(--green-dim);
+  background: var(--bg);
+  padding: 6px 9px;
   display: flex;
   flex-direction: column;
   gap: 4px;
   min-width: 0;
-  overflow-wrap: break-word;
-  position: relative;     /* anchors the .step-sub tooltip */
-  cursor: help;
+  align-items: center;     /* horizontally center label + value */
+  text-align: center;      /* center text inside each child */
+  justify-content: center; /* vertically center within the chip */
 }
-.step-title {
-  font-size: 11px;
-  color: var(--green);
-  text-shadow: 0 0 4px var(--green);
-  letter-spacing: 1px;
-  line-height: 1.2;
-  /* dotted underline = "more info available" affordance, retro-correct */
-  border-bottom: 1px dotted var(--green-dim);
-  padding-bottom: 1px;
-  align-self: flex-start;
+.chip-label {
+  font-size: 7px;
+  letter-spacing: 2px;
+  color: var(--amber-dim);
 }
-/* .step-sub is now a hover tooltip rather than always-visible inline copy.
-   Reasoning: the explanation is reference text — useful when you forget what
-   M1 does, but visual noise on every row otherwise. Hover anywhere on the
-   .step-info column (title or its area) to reveal. The dotted underline on
-   .step-title cues the affordance. */
-.step-sub {
-  position: absolute;
-  top: calc(100% + 8px);
-  left: 0;
-  z-index: 100;
-  width: max-content;
-  max-width: 380px;
-  font-size: 10px;          /* readable size now that it's not always shown */
-  color: var(--green);
-  letter-spacing: 0.5px;
-  line-height: 1.55;
-  background: var(--bg);
-  border: 2px solid var(--green-dim);
-  padding: 10px 14px;
-  box-shadow:
-    0 0 14px rgba(0,255,65,0.35),
-    0 6px 20px rgba(0,0,0,0.75),
-    inset 0 0 0 1px rgba(0,0,0,0.4);
-  opacity: 0;
-  visibility: hidden;
-  transform: translateY(-6px);
-  transition: opacity 180ms, visibility 180ms, transform 180ms cubic-bezier(0.2,0.8,0.2,1);
-  pointer-events: none;     /* hover passes through to underlying elements */
-}
-
-/* Phosphor-green arrow pointing up from the bubble to the title */
-.step-sub::before {
-  content: '';
-  position: absolute;
-  top: -8px;
-  left: 18px;
-  width: 0; height: 0;
-  border-left: 7px solid transparent;
-  border-right: 7px solid transparent;
-  border-bottom: 7px solid var(--green-dim);
-}
-.step-sub::after {
-  content: '';
-  position: absolute;
-  top: -5px;
-  left: 20px;
-  width: 0; height: 0;
-  border-left: 5px solid transparent;
-  border-right: 5px solid transparent;
-  border-bottom: 5px solid var(--bg);
-}
-
-.step-info:hover .step-sub,
-.step-info:focus-within .step-sub {
-  opacity: 1;
-  visibility: visible;
-  transform: translateY(0);
-}
-
-.step-state {
+.chip-value {
   font-family: 'VT323', monospace;
-  font-size: 22px;       /* time elapsed — sized to read at a glance, slightly
-                            smaller than .step-result to keep it secondary */
+  color: var(--green);
+  text-shadow: 0 0 3px var(--green);
+  letter-spacing: 1px;
+  line-height: 1;
+  /* Single line — long state names like "auto-cal: holding for peer" used
+     to wrap and grow the chip vertically (uneven row heights between cams).
+     Now they shrink to fit via JS in fitChipValue() instead. */
+  white-space: nowrap;
+  overflow: hidden;
+  display: block;
+  width: 100%;
+  text-align: center;
+}
+.chip-hero { background: linear-gradient(180deg, rgba(0,255,65,0.08) 0%, var(--bg) 100%); }
+.chip-hero .chip-value { font-size: 26px; }
+.chip:not(.chip-hero) .chip-value { font-size: 19px; opacity: 0.9; }
+.chip-value.dim { color: var(--gray); text-shadow: none; }
+.chip-value.busy { color: var(--amber); text-shadow: 0 0 4px var(--amber); }
+.chip-value.cal { color: var(--violet); text-shadow: 0 0 4px var(--violet); }
+
+.cam-last-event {
+  font-family: 'VT323', monospace;
+  font-size: 14px;
   color: var(--green-dim);
   letter-spacing: 1px;
-  text-align: center;    /* sits centered in its grid cell, visually mid-row */
-  white-space: nowrap;
-  line-height: 1.1;
+  padding: 4px 4px 0;
+  border-top: 2px dashed var(--green-darker);
+  min-height: 14px;
+  word-break: break-word;
+  line-height: 1.2;
 }
-.step-result {
+.cam-last-event.dim { color: var(--gray); }
+
+/* === EVENT STACK — phosphor decay on older rows === */
+/* Each row carries a --age custom property (0 = freshest, ages on each
+   subsequent push). opacity calc fades older entries 7% per push, capped
+   at 8 pushes (~56% max fade). Ties the stack to the CRT metaphor and
+   gives the page a sense of forward motion. */
+.event-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 360px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.event-stack::-webkit-scrollbar { width: 6px; }
+.event-stack::-webkit-scrollbar-track { background: #050; }
+.event-stack::-webkit-scrollbar-thumb { background: var(--green-dim); }
+
+.event {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  padding: 7px 10px;
+  background: var(--gray-dark);
+  border-left: 4px solid var(--gray);
+  align-items: center;
   font-family: 'VT323', monospace;
-  font-size: 26px;       /* primary focus — bumped so short strings fill more cell */
+  line-height: 1.2;
+  opacity: calc(1 - var(--age, 0) * 0.07);
+  transition: opacity 320ms ease-out;
+}
+.event.appearing { animation: event-slide-in 280ms cubic-bezier(0.2,0.8,0.2,1); }
+@keyframes event-slide-in {
+  0%   { transform: translateY(-12px); opacity: 0; }
+  100% { transform: translateY(0); opacity: calc(1 - var(--age, 0) * 0.07); }
+}
+.event-time {
+  font-size: 13px;
+  color: var(--amber-dim);
+  letter-spacing: 1px;
+}
+.event-body {
+  font-size: 16px;
+  color: var(--green);
+  letter-spacing: 1px;
+  word-break: break-word;
+}
+.event.idle      { border-left-color: var(--green-dim); }
+.event.idle      .event-body { color: var(--green); text-shadow: 0 0 3px var(--green); }
+.event.listening { border-left-color: var(--green-dim); }
+.event.listening .event-body { color: var(--green); text-shadow: 0 0 4px var(--green); }
+.event.busy      { border-left-color: var(--amber);   }
+.event.busy      .event-body { color: var(--amber); text-shadow: 0 0 4px var(--amber); }
+.event.cal       { border-left-color: var(--violet);  }
+.event.cal       .event-body { color: var(--violet); text-shadow: 0 0 4px var(--violet); }
+.event.done      { border-left-color: var(--green);   }
+.event.done      .event-body { color: var(--green); text-shadow: 0 0 4px var(--green); }
+.event.failed    { border-left-color: var(--red);     }
+.event.failed    .event-body { color: var(--red); text-shadow: 0 0 4px var(--red); }
+.event-empty {
+  font-family: 'Press Start 2P', monospace;
+  font-size: 9px;
+  color: var(--gray);
+  text-align: center;
+  padding: 18px 8px;
+  letter-spacing: 1px;
+}
+
+/* ============== ISO/SIDE-VIEW CAMERAS (UNCHANGED, REUSED IN HERO) ============== */
+.cam-side {
+  position: relative;
+  width: 220px;
+  height: 200px;
+  --body-w: 110px;
+  --body-h: 110px;
+  --depth: 22px;
+  --bevel: #1a1a1a;
+}
+.cam-side .cam-shadow {
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 130px;
+  height: 12px;
+  background:
+    radial-gradient(ellipse at center,
+      rgba(0,255,65,0.18) 0%,
+      rgba(0,255,65,0.04) 50%,
+      transparent 80%);
+  filter: blur(2px);
+  z-index: 0;
+}
+.cam-side.ir-on .cam-shadow {
+  background:
+    radial-gradient(ellipse at center,
+      rgba(255,65,54,0.28) 0%,
+      rgba(255,65,54,0.08) 50%,
+      transparent 80%);
+}
+.cam-side .cam-top {
+  position: absolute;
+  width: var(--body-w);
+  height: var(--depth);
+  top: 26px;
+  background: linear-gradient(180deg, #f8f8f8 0%, #c8c8c8 100%);
+  transform: skewX(-32deg);
+  transform-origin: bottom left;
+  box-shadow:
+    inset 0 4px 0 #ffffff,
+    inset 0 -2px 0 #a0a0a0,
+    0 0 0 4px var(--bevel);
+  z-index: 2;
+}
+.cam-side .cam-top::after {
+  content: '';
+  position: absolute;
+  top: 50%; left: 8%; right: 8%;
+  height: 2px;
+  background: rgba(0,0,0,0.1);
+}
+.cam-side .cam-side-face {
+  position: absolute;
+  width: var(--depth);
+  height: var(--body-h);
+  top: 48px;
+  background: linear-gradient(180deg, #c8c8c8 0%, #909090 100%);
+  transform: skewY(-32deg);
+  transform-origin: top left;
+  box-shadow:
+    inset 4px 0 0 #d8d8d8,
+    inset -4px 0 0 #707070,
+    0 0 0 4px var(--bevel);
+  z-index: 1;
+}
+.cam-side .cam-front {
+  position: absolute;
+  width: var(--body-w);
+  height: var(--body-h);
+  top: 48px;
+  background: linear-gradient(180deg, #ffffff 0%, #e8e8e8 50%, #c0c0c0 100%);
+  box-shadow:
+    inset 0 4px 0 #ffffff,
+    inset 0 -4px 0 #909090,
+    inset 4px 0 0 #f0f0f0,
+    inset -4px 0 0 #b0b0b0,
+    0 0 0 4px var(--bevel);
+  z-index: 3;
+}
+.cam-side .cam-status-led {
+  position: absolute;
+  width: 6px;
+  height: 6px;
+  top: 14px;
+  background: var(--green);
+  border-radius: 50%;
+  box-shadow: 0 0 6px var(--green), 0 0 0 1px #050505;
+  animation: status-blink 1.4s ease-in-out infinite;
+}
+@keyframes status-blink {
+  0%, 55% { opacity: 1; }
+  65%, 100% { opacity: 0.25; }
+}
+.cam-side .cam-mic {
+  position: absolute;
+  width: 4px; height: 4px;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1a1a1a;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1px #404040;
+}
+.cam-side .cam-bezel {
+  position: absolute;
+  width: 80px; height: 80px;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(circle at 35% 30%, #1a1a1a 0%, #050505 65%);
+  border-radius: 50%;
+  box-shadow:
+    inset 0 0 0 3px #2a2a2a,
+    inset 0 4px 6px rgba(255,255,255,0.06),
+    inset 0 -4px 6px rgba(0,0,0,0.7),
+    0 0 0 4px #050505,
+    0 0 12px rgba(0,0,0,0.8);
+  transition: box-shadow 200ms;
+}
+.cam-side .cam-bezel::before {
+  content: '';
+  position: absolute;
+  inset: -10px;
+  border: 2px dotted #404040;
+  border-radius: 50%;
+  opacity: 0.4;
+}
+.ir-led {
+  position: absolute;
+  width: 6px; height: 6px;
+  top: 50%; left: 50%;
+  border-radius: 50%;
+  background: #5a1f1f;
+  box-shadow: 0 0 0 1px #050505, inset 0 0 0 1px rgba(0,0,0,0.4);
+  transform: translate(-50%, -50%) rotate(calc(45deg * var(--i))) translate(0, -30px);
+  transition: background 100ms, box-shadow 100ms;
+  z-index: 5;
+}
+.cam-side.ir-on .ir-led {
+  background: var(--red);
+  box-shadow:
+    0 0 8px var(--red),
+    0 0 16px rgba(255,65,54,0.6),
+    0 0 0 1px #050505;
+  animation: ir-flicker 0.32s ease-in-out infinite;
+}
+.cam-side.ir-on .ir-led:nth-child(2n) { animation-delay: 0.08s; }
+.cam-side.ir-on .ir-led:nth-child(3n) { animation-delay: 0.16s; }
+@keyframes ir-flicker {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.cam-side .cam-lens {
+  position: absolute;
+  width: 32px; height: 32px;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: radial-gradient(circle at 30% 30%,
+    rgba(0,255,65,0.5) 0%, rgba(0,255,65,0.15) 35%, #000 75%);
+  box-shadow:
+    inset 0 0 0 3px #000,
+    inset 0 0 10px rgba(0,255,65,0.6),
+    0 0 8px rgba(0,255,65,0.25);
+  z-index: 6;
+  transition: background 200ms, box-shadow 200ms, filter 200ms;
+}
+.cam-side .cam-lens::after {
+  content: '';
+  position: absolute;
+  top: 50%; left: 50%;
+  width: 7px; height: 7px;
+  transform: translate(-50%, -50%);
+  background: var(--green);
+  border-radius: 50%;
+  box-shadow: 0 0 8px var(--green), 0 0 16px rgba(0,255,65,0.5);
+  animation: lens-pulse 2.6s ease-in-out infinite;
+}
+@keyframes lens-pulse {
+  0%, 100% { transform: translate(-50%, -50%) scale(0.85); opacity: 0.7; }
+  50%      { transform: translate(-50%, -50%) scale(1.4);  opacity: 1; }
+}
+.cam-side .cam-lens-glint {
+  position: absolute;
+  width: 5px; height: 5px;
+  top: 6px; left: 7px;
+  background: #fff;
+  border-radius: 50%;
+  opacity: 0.85;
+  box-shadow: 0 0 4px rgba(255,255,255,0.6);
+  z-index: 7;
+}
+.cam-side.ir-on .cam-bezel {
+  box-shadow:
+    inset 0 0 0 3px #4a0000,
+    inset 0 4px 6px rgba(255,80,60,0.15),
+    inset 0 -4px 6px rgba(0,0,0,0.7),
+    0 0 0 4px #050505,
+    0 0 18px rgba(255,65,54,0.45);
+}
+.cam-side.ir-on .cam-lens {
+  background: radial-gradient(circle at 30% 30%,
+    rgba(255,90,70,0.65) 0%, rgba(255,65,54,0.2) 35%, #1a0000 75%);
+  box-shadow:
+    inset 0 0 0 3px #2a0000,
+    inset 0 0 12px rgba(255,65,54,0.7),
+    0 0 12px rgba(255,65,54,0.5);
+}
+.cam-side.ir-on .cam-lens::after {
+  background: var(--red);
+  box-shadow: 0 0 10px var(--red), 0 0 24px rgba(255,65,54,0.7);
+}
+.cam-side .ir-pulse {
+  position: absolute;
+  top: 50%; left: 50%;
+  width: 80px; height: 80px;
+  border-radius: 50%;
+  border: 3px solid var(--red);
+  transform: translate(-50%, -50%);
+  opacity: 0;
+  pointer-events: none;
+  z-index: 4;
+}
+.cam-side.ir-on .ir-pulse { animation: ir-bloom 1.6s ease-out infinite; }
+.cam-side.ir-on .ir-pulse.p2 { animation-delay: 0.55s; }
+.cam-side.ir-on .ir-pulse.p3 { animation-delay: 1.1s; }
+@keyframes ir-bloom {
+  0%   { width: 80px;  height: 80px;  opacity: 0.85; border-width: 3px; }
+  100% { width: 220px; height: 220px; opacity: 0;    border-width: 1px; }
+}
+.cam-side.cam1 .cam-front      { right: 20px; }
+.cam-side.cam1 .cam-side-face  {
+  right: 130px;
+  transform: skewY(32deg);
+  transform-origin: top right;
+  box-shadow: inset 4px 0 0 #707070, inset -4px 0 0 #d8d8d8, 0 0 0 4px var(--bevel);
+}
+.cam-side.cam1 .cam-top {
+  right: 20px;
+  transform: skewX(32deg);
+  transform-origin: bottom right;
+}
+.cam-side.cam1 .cam-status-led { left: 96px; }
+.cam-side.cam1 .cam-lens-glint { left: auto; right: 7px; }
+.cam-side.cam1 .cam-shadow,
+.cam-side.cam1 .cam-base       { left: 134px; }
+.cam-side.cam2 .cam-front      { left: 20px; }
+.cam-side.cam2 .cam-side-face  {
+  left: 130px;
+  transform: skewY(-32deg);
+  transform-origin: top left;
+  box-shadow: inset 4px 0 0 #d8d8d8, inset -4px 0 0 #707070, 0 0 0 4px var(--bevel);
+}
+.cam-side.cam2 .cam-top {
+  left: 20px;
+  transform: skewX(-32deg);
+  transform-origin: bottom left;
+}
+.cam-side.cam2 .cam-status-led { left: 8px; }
+.cam-side.cam2 .cam-shadow,
+.cam-side.cam2 .cam-base       { left: 86px; }
+.cam-side .cam-base {
+  position: absolute;
+  bottom: 4px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 64px; height: 18px;
+  z-index: 0;
+}
+.cam-side .cam-base::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 18px; height: 8px;
+  background: linear-gradient(180deg, #909090 0%, #606060 100%);
+  box-shadow: 0 0 0 3px #1a1a1a;
+}
+.cam-side .cam-base::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 60px; height: 8px;
+  background: linear-gradient(180deg, #707070 0%, #303030 100%);
+  border-radius: 4px;
+  box-shadow: 0 0 0 3px #1a1a1a, inset 0 2px 0 #909090, inset 0 -2px 0 #1a1a1a;
+}
+/* AE-frozen iris dim */
+.cam-side.ae-frozen .cam-lens { filter: brightness(0.55) saturate(0.7); }
+/* Busy amber bezel pulse — only when not actively firing IR */
+.cam-side.busy:not(.ir-on) .cam-bezel {
+  box-shadow:
+    inset 0 0 0 3px #4a3300,
+    inset 0 4px 6px rgba(255,170,0,0.15),
+    inset 0 -4px 6px rgba(0,0,0,0.7),
+    0 0 0 4px #050505,
+    0 0 16px rgba(255,170,0,0.45);
+  animation: busy-pulse 1.6s ease-in-out infinite;
+}
+@keyframes busy-pulse {
+  0%, 100% { box-shadow:
+    inset 0 0 0 3px #4a3300,
+    inset 0 4px 6px rgba(255,170,0,0.15),
+    inset 0 -4px 6px rgba(0,0,0,0.7),
+    0 0 0 4px #050505,
+    0 0 14px rgba(255,170,0,0.35); }
+  50%      { box-shadow:
+    inset 0 0 0 3px #4a3300,
+    inset 0 4px 6px rgba(255,170,0,0.18),
+    inset 0 -4px 6px rgba(0,0,0,0.7),
+    0 0 0 4px #050505,
+    0 0 22px rgba(255,170,0,0.65); }
+}
+
+/* ============== TABBED CAL VIEW (LIVE CAL | CAL RESULTS) ============== */
+/* The two cal-related panels share one frame — tabs select between them.
+   Visually the inactive tab is "tucked behind" the active panel via z-index
+   layering (file-folder metaphor). Saves vertical space and cues that
+   they're alternate views of the same artifact: cam-side calibration
+   state. The tab strip attaches to the TOP of the panel, with the active
+   tab's bottom border merging into the panel's top border so it reads as
+   one continuous shape. */
+.cal-tabs-section {
+  position: relative;
+  margin-top: 24px;
+  animation: phosphor-warmup 700ms 700ms ease-out backwards;
+}
+.cal-tabs {
+  display: flex;
+  gap: 0;
+  position: relative;
+  z-index: 2;          /* tab strip floats above the panel border seam */
+  margin-bottom: -4px; /* overlap onto the panel's top border */
+  padding-left: 16px;
+}
+.cal-tab {
+  font-family: 'Press Start 2P', monospace;
+  font-size: 11px;
+  letter-spacing: 3px;
+  padding: 10px 22px 10px 22px;
+  background: var(--bg-panel-alt);
+  color: var(--amber-dim);
+  border: 4px solid var(--amber-dim);
+  border-bottom: 4px solid transparent; /* will merge with panel top */
+  cursor: pointer;
+  margin-right: -4px;  /* collapse touching tab borders */
+  transition: background 100ms, color 100ms, transform 80ms;
+  position: relative;
+  top: 0;
+  z-index: 1;
+}
+.cal-tab:hover {
+  background: var(--bg-panel);
+  color: var(--amber);
+}
+.cal-tab.active {
+  background: var(--bg-panel);
   color: var(--amber);
   text-shadow: 0 0 6px var(--amber);
-  text-align: left;      /* anchors at the cell's left edge (right after the
-                            time-elapsed center column) so text grows into the
-                            empty area instead of hugging the far right edge */
-  padding-left: 18px;    /* breathing room from the time-elapsed column */
-  letter-spacing: 1px;
-  line-height: 1.1;
+  border-color: var(--amber-dim);
+  border-bottom: 4px solid var(--bg-panel); /* erases seam with panel */
+  z-index: 3;
+  transform: translateY(-2px);
 }
+.cal-tab-inactive { /* file-folder behind effect — inactive sits lower */
+  transform: translateY(2px);
+  opacity: 0.75;
+}
+.cal-tab-inactive:hover { opacity: 1; }
+.cal-panel-frame {
+  border: 4px solid var(--amber-dim);
+  background: var(--bg-panel);
+  position: relative;
+  padding: 18px 16px 16px;
+  z-index: 2;
+}
+.cal-panel.hidden { display: none; }
 
-.step.pending { border-color: var(--gray); }
-
-.step.running {
-  border-color: var(--green);
-  background: linear-gradient(90deg, rgba(0,255,65,0.12) 0%, var(--gray-dark) 100%);
-  box-shadow: 0 0 20px rgba(0,255,65,0.18);
+/* ============== LIVE CAL — annotated snapshots with scope chrome ============== */
+.live-cal-section {
+  border: 4px solid var(--amber-dim);
+  background: var(--bg-panel);
+  position: relative;
+  margin-top: 16px;
+  padding: 18px 16px 16px;
+  animation: phosphor-warmup 700ms 700ms ease-out backwards;
 }
-.step.running .step-num {
-  background: var(--green);
-  color: var(--bg);
-  text-shadow: none;
-  box-shadow: 0 0 12px var(--green);
-  animation: num-pulse 1s ease-in-out infinite;
-}
-@keyframes num-pulse {
-  0%, 100% { box-shadow: 0 0 12px var(--green); }
-  50% { box-shadow: 0 0 24px var(--green); }
-}
-.step.running .step-state { color: var(--green); text-shadow: 0 0 4px var(--green); animation: running-blink 0.8s ease-in-out infinite; }
-@keyframes running-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-
-.step.done-ok { border-color: var(--green-dim); }
-.step.done-ok .step-num { background: var(--green-dark); color: var(--green); border: 2px solid var(--green-dim); text-shadow: 0 0 4px var(--green); }
-.step.done-ok .step-state { color: var(--green); text-shadow: 0 0 4px var(--green); }
-.step.done-ok .step-result { color: var(--green); text-shadow: 0 0 4px var(--green); opacity: 1; }
-
-.step.done-err { border-color: var(--red); }
-.step.done-err .step-num { background: var(--red-dim); color: var(--red); text-shadow: 0 0 4px var(--red); }
-.step.done-err .step-state { color: var(--red); text-shadow: 0 0 4px var(--red); }
-.step.done-err .step-result { color: var(--red); text-shadow: 0 0 4px var(--red); opacity: 1; }
-
-/* Step 5 inline log — only visible when step 5 is active or done */
-.step-log-wrap {
-  grid-column: 1 / -1;
-  margin-top: 12px;
-  max-height: 0;
-  overflow: hidden;
-  transition: max-height 320ms ease-in-out;
-}
-#step-5.running .step-log-wrap,
-#step-5.done-ok .step-log-wrap,
-#step-5.done-err .step-log-wrap {
-  max-height: 380px;
-}
-
-.cal-log-frame {
-  background: #000;
-  border: 3px solid var(--green-dim);
-  box-shadow: inset 0 0 24px rgba(0,255,65,0.06);
-}
-.cal-log-header {
-  font-size: 12px;
+.live-cal-title {
+  position: absolute;
+  top: -10px;
+  left: 16px;
+  background: var(--bg);
+  padding: 0 12px;
+  font-size: 11px;
   color: var(--amber);
   text-shadow: 0 0 4px var(--amber);
-  padding: 10px 14px;
-  border-bottom: 2px dashed var(--green-dim);
-  background: linear-gradient(90deg, rgba(0,255,65,0.05) 0%, transparent 100%);
-  letter-spacing: 2px;
+  letter-spacing: 3px;
 }
-.cal-log {
-  font-family: 'VT323', monospace;
-  font-size: 20px;
-  color: var(--green);
-  text-shadow: 0 0 4px var(--green);
-  padding: 12px 16px;
-  height: 320px;
-  overflow-y: auto;
-  white-space: pre-wrap;
-  word-break: break-all;
-  line-height: 1.35;
+.live-cal {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
 }
-.cal-log-empty { color: var(--green-dim); font-size: 12px; font-family: 'Press Start 2P', monospace; opacity: 0.6; }
-.cal-log .line { display: block; }
-.cal-log .line.marker { color: var(--amber); text-shadow: 0 0 6px var(--amber); font-weight: bold; }
-.cal-log .line.error { color: var(--red); text-shadow: 0 0 4px var(--red); }
-.cal-log .line.success { color: var(--green); text-shadow: 0 0 6px var(--green); font-weight: bold; }
-.cal-log::-webkit-scrollbar { width: 8px; }
-.cal-log::-webkit-scrollbar-track { background: #050; }
-.cal-log::-webkit-scrollbar-thumb { background: var(--green-dim); border: 1px solid #000; }
+.live-cal-card {
+  border: 3px solid var(--green-dim);
+  background: #000;
+  padding: 0;
+  position: relative;
+  overflow: hidden;
+}
+.live-cal-img {
+  display: block;
+  width: 100%;
+  height: auto;
+  image-rendering: auto;
+}
+/* Lo-res mode: chunky pixels for the upscaled PNG so the intentional
+   blockiness reads as design, not blur. Applies per-card now (each card
+   carries its own .lores class independently). */
+.live-cal-card.lores .live-cal-img {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
 
-/* === CAL RESULTS panel === */
+/* === FLIP ICON (hi-res ⇄ lo-res toggle) ===
+   One toggle per card, pinned to the bottom-right corner of each
+   .live-cal-card. Click flips just that card's image so cam1 and cam2
+   can be in different modes independently (e.g. hi-res on the one
+   you're working on, lo-res on the other for transmission preview). */
+.flip-toggle {
+  position: absolute;
+  bottom: 6px;
+  right: 6px;
+  z-index: 10;
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  background: var(--bg-panel);
+  border: 3px solid var(--green-dim);
+  font-family: 'Press Start 2P', monospace;
+  cursor: pointer;
+  user-select: none;
+  transition: transform 80ms, box-shadow 120ms;
+  box-shadow: 0 2px 0 var(--green-darker), 0 0 0 1px var(--bg);
+}
+.flip-toggle:hover {
+  transform: translate(-1px, -2px);
+  box-shadow: 0 4px 0 var(--green-darker), 0 0 14px rgba(0,255,65,0.35);
+}
+.flip-toggle:active { transform: translate(0, 0); box-shadow: 0 1px 0 var(--green-darker); }
+.flip-toggle-side {
+  padding: 8px 11px;
+  font-size: 9px;
+  letter-spacing: 2px;
+  color: var(--gray);
+  background: var(--bg);
+  border-right: 2px dashed var(--green-darker);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: color 120ms, background 120ms, text-shadow 120ms;
+}
+.flip-toggle-side:last-child { border-right: 0; }
+.flip-toggle-side.active {
+  color: var(--green);
+  background: var(--green-dark);
+  text-shadow: 0 0 4px var(--green);
+}
+.flip-toggle-arrow {
+  /* a tiny pixel ⇄ between the two labels — purely decorative */
+  font-size: 10px;
+  color: var(--green-dim);
+  padding: 0 2px;
+  align-self: center;
+  text-shadow: 0 0 2px var(--green-dim);
+}
+/* Scope corners — registration ticks at each corner of the card */
+.scope-corners span {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border: 0;
+  pointer-events: none;
+  z-index: 5;
+}
+.scope-corners span:nth-child(1) { top: 0; left: 0;
+  border-top: 2px solid var(--cyan); border-left: 2px solid var(--cyan); }
+.scope-corners span:nth-child(2) { top: 0; right: 0;
+  border-top: 2px solid var(--cyan); border-right: 2px solid var(--cyan); }
+.scope-corners span:nth-child(3) { bottom: 0; left: 0;
+  border-bottom: 2px solid var(--cyan); border-left: 2px solid var(--cyan); }
+.scope-corners span:nth-child(4) { bottom: 0; right: 0;
+  border-bottom: 2px solid var(--cyan); border-right: 2px solid var(--cyan); }
+/* Channel + LIVE badge on the upper-right of each card */
+.scope-badge {
+  position: absolute;
+  top: 6px; right: 8px;
+  font-size: 8px;
+  letter-spacing: 2px;
+  color: var(--green);
+  padding: 3px 7px;
+  background: rgba(0,0,0,0.78);
+  border: 1px solid var(--green-dim);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  z-index: 6;
+  text-shadow: 0 0 3px var(--green);
+}
+.scope-badge .rec-dot {
+  width: 7px; height: 7px;
+  background: var(--red);
+  border-radius: 50%;
+  animation: rec-blink 1.6s ease-in-out infinite;
+  box-shadow: 0 0 6px var(--red);
+}
+@keyframes rec-blink {
+  0%, 50% { opacity: 1; }
+  60%, 100% { opacity: 0.2; }
+}
+
+/* ============== CAL RESULTS iframe ============== */
+.cal-results-section {
+  border: 4px solid var(--amber-dim);
+  background: var(--bg-panel);
+  position: relative;
+  margin-top: 16px;
+  padding: 18px 16px 16px;
+  animation: phosphor-warmup 700ms 850ms ease-out backwards;
+}
+.cal-results-title {
+  position: absolute;
+  top: -10px;
+  left: 16px;
+  background: var(--bg);
+  padding: 0 12px;
+  font-size: 11px;
+  color: var(--amber);
+  text-shadow: 0 0 4px var(--amber);
+  letter-spacing: 3px;
+}
 .cal-frame {
   border: 4px solid var(--amber-dim);
   background: var(--bg-panel);
@@ -1010,7 +1080,7 @@ main {
 }
 .cal-frame iframe {
   width: 100%;
-  height: 720px;
+  height: 600px;
   border: 0;
   display: block;
   background: #fff;
@@ -1021,7 +1091,7 @@ main {
   margin: 14px auto 0;
   font-family: 'Press Start 2P', monospace;
   font-size: 9px;
-  padding: 12px 22px;
+  padding: 10px 18px;
   background: var(--amber-dark);
   color: var(--amber);
   border: 4px solid var(--amber);
@@ -1033,67 +1103,43 @@ main {
 .refresh-btn:hover { background: var(--amber-dim); color: #000; text-shadow: none; }
 .refresh-btn:active { transform: translateY(2px); box-shadow: 0 2px 0 #2d1f00; }
 
-/* === LIVE CAL panel (fresh on-camera snapshots + cal pixel markers) === */
-.live-cal {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 14px;
-  margin-bottom: 18px;
-}
-.live-cal-card {
-  border: 3px solid var(--green-dim);
-  background: #001a00;
-  padding: 8px;
-  position: relative;
-}
-.live-cal-card h3 {
-  margin: 0 0 6px;
-  font-size: 10px;
-  color: var(--green);
-  letter-spacing: 2px;
-  text-shadow: 0 0 4px var(--green);
-}
-.live-cal-canvas-wrap {
-  position: relative;
-  width: 100%;
-  background: #000;
-  aspect-ratio: 16 / 9;
-  overflow: hidden;
-}
-.live-cal-canvas-wrap img,
-.live-cal-canvas-wrap canvas {
-  position: absolute; top: 0; left: 0;
-  width: 100%; height: 100%;
-  display: block;
-}
-.live-cal-info {
-  margin-top: 6px;
-  font-size: 8px;
+/* ============== STATUS-BAR FOOTER ============== */
+/* Real telemetry — uptime, cal subprocess PID, total events seen, cam IPs.
+   VT323 monospace, like a unix tty status line. Replaces the old generic
+   "no production guarantees" tagline. */
+.status-bar {
+  margin-top: 24px;
+  border: 2px solid var(--green-dim);
+  background: var(--bg-panel);
+  padding: 8px 14px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  font-family: 'VT323', monospace;
+  font-size: 15px;
   color: var(--green-dim);
-  line-height: 1.6;
+  letter-spacing: 1px;
+  animation: phosphor-warmup 700ms 1000ms ease-out backwards;
 }
-.live-cal-info .key { color: var(--amber-dim); }
-.live-cal-info .val { color: #fff; }
-.live-cal-info .stale { color: var(--red); }
+.status-bar .key { color: var(--amber-dim); margin-right: 6px; }
+.status-bar .val { color: var(--green); text-shadow: 0 0 3px var(--green); }
+.status-bar .val.dim { color: var(--gray); text-shadow: none; }
+.status-bar .val.live { color: var(--cyan); text-shadow: 0 0 4px var(--cyan); }
+/* Clock pinned to the right edge of the status bar (was top-right of the
+   header before; consolidated here so the header carries only the title).
+   Inherits .status-bar .val (green) styling so it matches the rest of the
+   bar — only the size + right-pin are local overrides. */
+.status-bar .sb-clock-wrap { margin-left: auto; }
+.status-bar #sb-clock { font-size: 17px; }
 
-footer {
-  margin-top: 32px;
-  text-align: center;
-  font-size: 7px;
-  color: var(--green-dim);
-  border-top: 2px dashed var(--green-dim);
-  padding-top: 14px;
-  line-height: 2;
-}
-footer span { color: var(--amber); }
-
-@media (max-width: 880px) {
-  .hero-content { grid-template-columns: 1fr; }
-  .beam-channel { transform: rotate(90deg); margin: 16px 0; }
-  .step { grid-template-columns: auto 1fr; grid-auto-flow: row; gap: 8px; }
-  .step-state, .step-result { grid-column: 1 / -1; text-align: left; min-width: 0; }
-  .seq-head { grid-template-columns: 1fr; }
+@media (max-width: 900px) {
+  .hero-content { grid-template-columns: 1fr; gap: 18px; }
+  .beam-channel { transform: rotate(0); }
+  .action-bar { grid-template-columns: 1fr; }
+  .cams-grid { grid-template-columns: 1fr; }
+  .live-cal { grid-template-columns: 1fr; }
   .cam-side { transform: scale(0.85); }
+  .status-bar { font-size: 13px; gap: 12px; }
 }
 </style>
 </head>
@@ -1101,17 +1147,17 @@ footer span { color: var(--amber); }
 <div class="pixel-bg"></div>
 <main>
 
-<!-- ============== HERO RING (with integrated title) ============== -->
-<section class="hero-ring">
-  <div class="ring-title">▌ HALF-DUPLEX LIGHT LINK ▐</div>
-  <div class="ring-corner tl-label">▸ LIWIFI</div>
-  <div class="ring-corner tr-label"><span class="clock" id="sysclock">--:--:--</span></div>
-  <div class="ring-corner br-label">PHASES 1-5 · WEB · HTTP</div>
+<!-- ============== HEADER ============== -->
+<section class="header">
+  <div class="header-title">▌ HALF-DUPLEX LIGHT LINK ▐</div>
+</section>
 
+<!-- ============== HERO PANEL — single picture: cam1 art | beam | cam2 art ============== -->
+<section class="hero-panel">
   <div class="hero-content">
-    <div class="cam-wrap left">
-      <div class="cam-name">CAM1</div>
-      <div class="cam-id">dacam1 · 192.168.50.113</div>
+    <div class="cam-art-wrap left">
+      <div class="cam-art-name">CAM1</div>
+      <div class="cam-art-host">dacam1 · 192.168.50.113</div>
       <div class="cam-side cam1" id="cam1-art">
         <div class="cam-shadow"></div>
         <div class="cam-top"></div>
@@ -1119,20 +1165,12 @@ footer span { color: var(--amber); }
         <div class="cam-front">
           <div class="cam-status-led"></div>
           <div class="cam-bezel">
-            <div class="ir-led" style="--i: 0"></div>
-            <div class="ir-led" style="--i: 1"></div>
-            <div class="ir-led" style="--i: 2"></div>
-            <div class="ir-led" style="--i: 3"></div>
-            <div class="ir-led" style="--i: 4"></div>
-            <div class="ir-led" style="--i: 5"></div>
-            <div class="ir-led" style="--i: 6"></div>
-            <div class="ir-led" style="--i: 7"></div>
-            <div class="cam-lens">
-              <div class="cam-lens-glint"></div>
-            </div>
-            <div class="ir-pulse p1"></div>
-            <div class="ir-pulse p2"></div>
-            <div class="ir-pulse p3"></div>
+            <div class="ir-led" style="--i: 0"></div><div class="ir-led" style="--i: 1"></div>
+            <div class="ir-led" style="--i: 2"></div><div class="ir-led" style="--i: 3"></div>
+            <div class="ir-led" style="--i: 4"></div><div class="ir-led" style="--i: 5"></div>
+            <div class="ir-led" style="--i: 6"></div><div class="ir-led" style="--i: 7"></div>
+            <div class="cam-lens"><div class="cam-lens-glint"></div></div>
+            <div class="ir-pulse p1"></div><div class="ir-pulse p2"></div><div class="ir-pulse p3"></div>
           </div>
           <div class="cam-mic"></div>
         </div>
@@ -1143,13 +1181,14 @@ footer span { color: var(--amber); }
     <div class="beam-channel">
       <div class="beam-label" id="beam-fwd-label">CAM1 ▶▶▶ CAM2 · 850 / 940 NM</div>
       <div class="beam" id="beam-fwd"></div>
+      <div class="beam carrier" id="beam-carrier"></div>
       <div class="beam reverse" id="beam-rev"></div>
       <div class="beam-label reverse" id="beam-rev-label">CAM1 ◀◀◀ CAM2 · 850 / 940 NM</div>
     </div>
 
-    <div class="cam-wrap right">
-      <div class="cam-name">CAM2</div>
-      <div class="cam-id">dacam2 · 192.168.50.143</div>
+    <div class="cam-art-wrap right">
+      <div class="cam-art-name">CAM2</div>
+      <div class="cam-art-host">dacam2 · 192.168.50.143</div>
       <div class="cam-side cam2" id="cam2-art">
         <div class="cam-shadow"></div>
         <div class="cam-top"></div>
@@ -1157,20 +1196,12 @@ footer span { color: var(--amber); }
         <div class="cam-front">
           <div class="cam-status-led"></div>
           <div class="cam-bezel">
-            <div class="ir-led" style="--i: 0"></div>
-            <div class="ir-led" style="--i: 1"></div>
-            <div class="ir-led" style="--i: 2"></div>
-            <div class="ir-led" style="--i: 3"></div>
-            <div class="ir-led" style="--i: 4"></div>
-            <div class="ir-led" style="--i: 5"></div>
-            <div class="ir-led" style="--i: 6"></div>
-            <div class="ir-led" style="--i: 7"></div>
-            <div class="cam-lens">
-              <div class="cam-lens-glint"></div>
-            </div>
-            <div class="ir-pulse p1"></div>
-            <div class="ir-pulse p2"></div>
-            <div class="ir-pulse p3"></div>
+            <div class="ir-led" style="--i: 0"></div><div class="ir-led" style="--i: 1"></div>
+            <div class="ir-led" style="--i: 2"></div><div class="ir-led" style="--i: 3"></div>
+            <div class="ir-led" style="--i: 4"></div><div class="ir-led" style="--i: 5"></div>
+            <div class="ir-led" style="--i: 6"></div><div class="ir-led" style="--i: 7"></div>
+            <div class="cam-lens"><div class="cam-lens-glint"></div></div>
+            <div class="ir-pulse p1"></div><div class="ir-pulse p2"></div><div class="ir-pulse p3"></div>
           </div>
           <div class="cam-mic"></div>
         </div>
@@ -1180,196 +1211,132 @@ footer span { color: var(--amber); }
   </div>
 </section>
 
-<!-- ============== ORANGE BOX (tabs: SEQUENCE | CAL RESULTS) ============== -->
-<section class="seq">
-  <div class="rivet amber-rivet tl"></div><div class="rivet amber-rivet tr"></div>
-  <div class="rivet amber-rivet bl"></div><div class="rivet amber-rivet br"></div>
+<!-- ============== ACTION BAR — buttons UNDER the hero ============== -->
+<section class="action-bar">
+  <button class="big-cal-btn" id="run-btn">
+    <span class="big-cal-icon">▶</span>
+    <span class="big-cal-text">
+      <span class="big-cal-label">RUN CAL SEQUENCE</span>
+      <span class="big-cal-sub">cal_procedure detached · watch each cam's column</span>
+    </span>
+  </button>
+  <button class="big-cal-btn monocal" id="monocal-btn">
+    <span class="big-cal-icon">▶</span>
+    <span class="big-cal-text">
+      <span class="big-cal-label">MONOCAL CAM1</span>
+      <span class="big-cal-sub">cam2 holds · cam1 scans · over the light channel</span>
+    </span>
+  </button>
+</section>
 
-  <div class="tabs">
-    <button class="tab active" data-tab="sequence">▌ SEQUENCE ▐</button>
-    <button class="tab" data-tab="cal">▌ CAL RESULTS ▐</button>
-  </div>
-
-  <!-- SEQUENCE PANEL -->
-  <div class="tab-panel" data-panel="sequence">
-    <div class="seq-head">
-      <button class="big-cal-btn" id="run-btn">
-        <span class="big-cal-icon">▶</span>
-        <span class="big-cal-text">
-          <span class="big-cal-label">RUN CAL SEQUENCE</span>
-          <span class="big-cal-sub">laptop drives both cams · step thru phases 1-5</span>
-        </span>
-      </button>
-      <button class="big-cal-btn monocal" id="monocal-btn">
-        <span class="big-cal-icon">▶</span>
-        <span class="big-cal-text">
-          <span class="big-cal-label">MONOCAL CAM1</span>
-          <span class="big-cal-sub">cam1 learns its view of cam2 · over the light channel</span>
-        </span>
-      </button>
-      <div class="cal-state-pill" id="cal-state-pill">
-        <span class="cal-state-dot"></span>
-        <span id="cal-state-text">IDLE</span>
+<!-- ============== TWO PER-CAM DATA COLUMNS ============== -->
+<section class="cams-grid">
+  <!-- CAM1 -->
+  <div class="cam-col" id="cam1-col">
+    <div class="cam-col-title">▌ CAM1 ▐</div>
+    <div class="cam-col-host">dacam1</div>
+    <div class="cam-chips">
+      <div class="chip chip-hero">
+        <span class="chip-label">STATE</span>
+        <span class="chip-value dim" data-cam="cam1" data-field="state">—</span>
+      </div>
+      <div class="chip">
+        <span class="chip-label">MODE</span>
+        <span class="chip-value dim" data-cam="cam1" data-field="mode">—</span>
+      </div>
+      <div class="chip">
+        <span class="chip-label">RATE</span>
+        <span class="chip-value dim" data-cam="cam1" data-field="rate">—</span>
       </div>
     </div>
-
-    <div class="step-stack" id="step-stack">
-
-      <div class="step pending hidden" id="step-1" data-step="1">
-        <div class="step-num">01</div>
-        <div class="step-info">
-          <div class="step-title">CHECK CAM-2 VIDEO FEED</div>
-          <div class="step-sub">Sample the live frame in 240 cells · sanity-check the camera is producing usable video before we touch the LEDs</div>
-        </div>
-        <div class="step-state">PENDING</div>
-        <div class="step-result">—</div>
-      </div>
-
-      <div class="step pending hidden" id="step-2" data-step="2">
-        <div class="step-num">02</div>
-        <div class="step-info">
-          <div class="step-title">READ AUTO-EXPOSURE LOCK</div>
-          <div class="step-sub">Is the ISP currently freezing exposure? · cal needs it unlocked at start so the camera can adapt to LED-off baseline</div>
-        </div>
-        <div class="step-state">PENDING</div>
-        <div class="step-result">—</div>
-      </div>
-
-      <div class="step pending hidden" id="step-3" data-step="3">
-        <div class="step-num">03</div>
-        <div class="step-info">
-          <div class="step-title">TOGGLE AUTO-EXPOSURE LOCK</div>
-          <div class="step-sub">Lock then unlock · proves we can drive AE freeze on demand · without it the IR-link's half-duplex AE management is broken</div>
-        </div>
-        <div class="step-state">PENDING</div>
-        <div class="step-result">—</div>
-      </div>
-
-      <div class="step pending hidden" id="step-4" data-step="4">
-        <div class="step-num">04</div>
-        <div class="step-info">
-          <div class="step-title">CHECK CAM-2 PROCESSES</div>
-          <div class="step-sub">Count irlink / daynightd / prudynt · daynightd must be off (it slams the IR-cut shut) · prudynt must be on (RTSP) · irlink as needed</div>
-        </div>
-        <div class="step-state">PENDING</div>
-        <div class="step-result">—</div>
-      </div>
-
-      <div class="step pending hidden" id="step-5" data-step="5">
-        <div class="step-num">05</div>
-        <div class="step-info">
-          <div class="step-title">RUN CALIBRATION</div>
-          <div class="step-sub">Drive IR LEDs · capture frames · find the brightest pixel (TX coords) · save calibration to both cameras</div>
-        </div>
-        <div class="step-state">PENDING</div>
-        <div class="step-result">—</div>
-        <div class="step-log-wrap">
-          <div class="cal-log-frame">
-            <div class="cal-log-header">▸ /var/log/cal-stdout · live tail</div>
-            <div class="cal-log" id="cal-log">
-              <div class="cal-log-empty">▸ press RUN to begin · cal_procedure stdout streams here</div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-    </div>
-
-    <!-- MONOCAL STEP STACK (hidden until MONOCAL CAM1 is clicked) -->
-    <div class="step-stack" id="monocal-stack" style="display:none;">
-
-      <div class="step pending hidden" id="mstep-1" data-step="m1">
-        <div class="step-num">M1</div>
-        <div class="step-info">
-          <div class="step-title">SEND CAL_REQ TO CAM1</div>
-          <div class="step-sub">cam2 sends a calibration request over light · peer_scans=1 flag tells cam1 to be the scanner this time · waits for CAL_ACK</div>
-        </div>
-        <div class="step-state">PENDING</div>
-        <div class="step-result">—</div>
-      </div>
-
-      <div class="step pending hidden" id="mstep-2" data-step="m2">
-        <div class="step-num">M2</div>
-        <div class="step-info">
-          <div class="step-title">CAM2 HOLD LEDS</div>
-          <div class="step-sub">1.5s OFF (cam1 captures baseline) · then 12s ON steady (cam1 grid scan + ROI sweep) · this is what cam1 actually scans</div>
-        </div>
-        <div class="step-state">PENDING</div>
-        <div class="step-result">—</div>
-      </div>
-
-      <div class="step pending hidden" id="mstep-3" data-step="m3">
-        <div class="step-num">M3</div>
-        <div class="step-info">
-          <div class="step-title">CAM1 SCAN + WRITE CALIBRATION</div>
-          <div class="step-sub">cam1 finds the peak pixel where it sees cam2 · writes /opt/etc/calibration.json · waits for cam2's hold to fully end before TXing back</div>
-        </div>
-        <div class="step-state">PENDING</div>
-        <div class="step-result">—</div>
-      </div>
-
-      <div class="step pending hidden" id="mstep-4" data-step="m4">
-        <div class="step-num">M4</div>
-        <div class="step-info">
-          <div class="step-title">RECEIVE CAL_DONE OVER LIGHT</div>
-          <div class="step-sub">cam1 ships its 6-byte coord payload back · ~30s at 160ms/sym · cam2 decodes and logs PEER-CAL</div>
-        </div>
-        <div class="step-state">PENDING</div>
-        <div class="step-result">—</div>
-      </div>
-
-      <div class="step pending hidden" id="mstep-5" data-step="m5">
-        <div class="step-num">M5</div>
-        <div class="step-info">
-          <div class="step-title">RESULT</div>
-          <div class="step-sub">cam1's view of cam2 — pixel coords, peak brightness, and grid delta from the scan</div>
-        </div>
-        <div class="step-state">PENDING</div>
-        <div class="step-result">—</div>
-      </div>
-
+    <div class="cam-last-event dim" data-cam="cam1" data-field="last-event">—</div>
+    <div class="event-stack" id="cam1-stack">
+      <div class="event-empty">▸ awaiting first poll…</div>
     </div>
   </div>
 
-  <!-- CAL RESULTS PANEL -->
-  <div class="tab-panel hidden" data-panel="cal">
-
-    <!-- LIVE CAL — fresh on-camera snapshots + cal pixel markers.
-         For monocal/disco cals (over-light, no laptop frame-diff), this
-         is the only way to see the result visually since photos/calibration.html
-         is only updated by RUN CAL SEQUENCE. -->
-    <div class="live-cal">
-      <div class="live-cal-card">
-        <h3>▌ CAM1 SEES CAM2</h3>
-        <div class="live-cal-canvas-wrap">
-          <img id="live-cam1-img" alt="cam1 snapshot">
-          <canvas id="live-cam1-mark" width="640" height="360"></canvas>
-        </div>
-        <div class="live-cal-info" id="live-cam1-info">—</div>
+  <!-- CAM2 -->
+  <div class="cam-col" id="cam2-col">
+    <div class="cam-col-title">▌ CAM2 ▐</div>
+    <div class="cam-col-host">dacam2</div>
+    <div class="cam-chips">
+      <div class="chip chip-hero">
+        <span class="chip-label">STATE</span>
+        <span class="chip-value dim" data-cam="cam2" data-field="state">—</span>
       </div>
-      <div class="live-cal-card">
-        <h3>▌ CAM2 SEES CAM1</h3>
-        <div class="live-cal-canvas-wrap">
-          <img id="live-cam2-img" alt="cam2 snapshot">
-          <canvas id="live-cam2-mark" width="640" height="360"></canvas>
-        </div>
-        <div class="live-cal-info" id="live-cam2-info">—</div>
+      <div class="chip">
+        <span class="chip-label">MODE</span>
+        <span class="chip-value dim" data-cam="cam2" data-field="mode">—</span>
+      </div>
+      <div class="chip">
+        <span class="chip-label">RATE</span>
+        <span class="chip-value dim" data-cam="cam2" data-field="rate">—</span>
       </div>
     </div>
-    <button class="refresh-btn" id="live-cal-refresh">▸ REFRESH LIVE SNAPSHOTS</button>
+    <div class="cam-last-event dim" data-cam="cam2" data-field="last-event">—</div>
+    <div class="event-stack" id="cam2-stack">
+      <div class="event-empty">▸ awaiting first poll…</div>
+    </div>
+  </div>
+</section>
 
-    <div style="margin-top: 24px;">
+<!-- ============== TABBED CAL VIEW: LIVE CAL | CAL RESULTS ============== -->
+<section class="cal-tabs-section">
+  <!-- Tabs sit on top, partially "behind" the active panel via z-index
+       layering. Click to switch which panel is shown. -->
+  <div class="cal-tabs">
+    <button class="cal-tab active" data-tab="results">▌ RUN CAL RESULTS ▐</button>
+    <button class="cal-tab cal-tab-inactive" data-tab="live">▌ MONOCAL RESULTS ▐</button>
+  </div>
+  <div class="cal-panel-frame">
+    <!-- RUN CAL RESULTS panel — laptop-side cal_procedure html report -->
+    <div class="cal-panel" id="cal-panel-results">
       <div class="cal-frame">
         <iframe src="http://localhost:8889/calibration.html" id="cal-iframe"></iframe>
       </div>
       <button class="refresh-btn" id="cal-refresh">▸ RELOAD CAL VIEWER</button>
     </div>
+
+    <!-- MONOCAL RESULTS panel — annotated cal snapshots from each cam.
+         Each card has its own HI/LO flip toggle so cam1 and cam2 can be
+         in different modes independently. -->
+    <div class="cal-panel hidden" id="cal-panel-live">
+      <div class="live-cal">
+        <div class="live-cal-card" id="live-cam1-card">
+          <div class="scope-corners"><span></span><span></span><span></span><span></span></div>
+          <img class="live-cal-img" id="live-cam1-img" alt="cam1 sees cam2"
+               src="/api/cam1/snapshot-annotated">
+          <div class="flip-toggle" data-cam="cam1"
+               title="cam1: hi-res annotated JPEG ↔ tiny wireframe (~292 B)">
+            <span class="flip-toggle-side active" data-mode="hires">HI</span>
+            <span class="flip-toggle-arrow">⇄</span>
+            <span class="flip-toggle-side" data-mode="lores">LO</span>
+          </div>
+        </div>
+        <div class="live-cal-card" id="live-cam2-card">
+          <div class="scope-corners"><span></span><span></span><span></span><span></span></div>
+          <img class="live-cal-img" id="live-cam2-img" alt="cam2 sees cam1"
+               src="/api/cam2/snapshot-annotated">
+          <div class="flip-toggle" data-cam="cam2"
+               title="cam2: hi-res annotated JPEG ↔ tiny wireframe (~292 B)">
+            <span class="flip-toggle-side active" data-mode="hires">HI</span>
+            <span class="flip-toggle-arrow">⇄</span>
+            <span class="flip-toggle-side" data-mode="lores">LO</span>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </section>
 
-<footer>
-  ▸ LIWIFI · 8-BIT LIVE STATUS · PHOSPHOR GREEN CRT · PHASES 1-5 INSTRUMENTED ◀<br>
-  <span>BUILT FOR DEV VISIBILITY · NO PRODUCTION GUARANTEES · USE GENTLY</span>
+<!-- ============== STATUS-BAR FOOTER ============== -->
+<footer class="status-bar">
+  <span><span class="key">UP</span><span class="val" id="sb-uptime">00:00:00</span></span>
+  <span><span class="key">CAL PID</span><span class="val dim" id="sb-cal-pid">—</span></span>
+  <span><span class="key">EVENTS</span><span class="val" id="sb-event-count">0</span></span>
+  <span><span class="key">cam1</span><span class="val dim" id="sb-cam1-ip">—</span></span>
+  <span><span class="key">cam2</span><span class="val dim" id="sb-cam2-ip">—</span></span>
+  <span class="sb-clock-wrap"><span class="key">CLOCK</span><span class="val" id="sb-clock">--:--:--</span></span>
 </footer>
 
 </main>
@@ -1378,12 +1345,6 @@ footer span { color: var(--amber); }
 // ============================================================
 // UTILITIES
 // ============================================================
-/* All fetches go through here. Default 3s AbortController prevents a stuck
-   localhost request (cam down → server-side curl timing out) from holding a
-   Chrome connection slot. With Chrome's 6-slot per-origin cap, 5 cam2
-   endpoints in flight × 8s = page seizes; with abort, slots churn in 3s and
-   the LEDs poll keeps firing. opts.timeoutMs overrides per-call (snapshot
-   sets 5000). */
 async function fetchJSON(url, opts = {}) {
   const { timeoutMs = 3000, ...rest } = opts;
   const ctrl = new AbortController();
@@ -1393,696 +1354,560 @@ async function fetchJSON(url, opts = {}) {
     if (!r.ok) return null;
     return await r.json();
   } catch (e) {
-    return null;          // AbortError, network error — both treated as null
+    return null;
   } finally {
     clearTimeout(t);
   }
 }
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+function pad2(n) { return String(n).padStart(2, '0'); }
+function nowHMS() {
+  const d = new Date();
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+
+const PAGE_LOADED_AT = Date.now();
+let totalEventCount = 0;
+
 // ============================================================
-// SYSCLOCK
+// SYSCLOCK (header) + STATUS BAR (footer)
 // ============================================================
 function tickClock() {
-  const d = new Date();
-  document.getElementById('sysclock').textContent =
-    `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+  document.getElementById('sb-clock').textContent = nowHMS();
+  const upS = Math.floor((Date.now() - PAGE_LOADED_AT) / 1000);
+  const h = Math.floor(upS / 3600);
+  const m = Math.floor((upS % 3600) / 60);
+  const s = upS % 60;
+  document.getElementById('sb-uptime').textContent =
+    `${pad2(h)}:${pad2(m)}:${pad2(s)}`;
 }
 tickClock();
 setInterval(tickClock, 1000);
 
-// ============================================================
-// LED STATE → camera animation (real GPIO via /api/{cam}/leds)
-// ============================================================
-async function pollLedsOnce() {
-  // Fetch both cams in parallel — halves wall time, and importantly any
-  // cache lock contention on the server happens once per cam not in series.
-  const [d1, d2] = await Promise.all([
-    fetchJSON('/api/cam1/leds'),
-    fetchJSON('/api/cam2/leds'),
-  ]);
-  const ir = { cam1: false, cam2: false };
-  for (const [cam, data] of [['cam1', d1], ['cam2', d2]]) {
-    const art = document.getElementById(cam + '-art');
-    if (!art) continue;
-    if (!data || data.ir850 == null) { art.classList.remove('ir-on'); continue; }
-    const anyOn = data.ir850 === 1 || data.ir940 === 1;
-    art.classList.toggle('ir-on', anyOn);
-    ir[cam] = anyOn;
+// One-shot fetch: cam IPs for the status-bar footer.
+fetchJSON('/api/info').then(info => {
+  if (!info) return;
+  if (info.cam1_ip) {
+    const e = document.getElementById('sb-cam1-ip');
+    e.textContent = info.cam1_ip; e.classList.remove('dim');
   }
-  document.getElementById('beam-fwd').classList.toggle('active', ir.cam1);
-  document.getElementById('beam-fwd-label').classList.toggle('active', ir.cam1);
-  document.getElementById('beam-rev').classList.toggle('active', ir.cam2);
-  document.getElementById('beam-rev-label').classList.toggle('active', ir.cam2);
-}
-
-// Recursive setTimeout instead of setInterval(asyncFn) — guarantees the next
-// poll is scheduled only AFTER the current one resolves. setInterval here
-// piles up unresolved promises when the cam is slow (each /api/leds blocks
-// 1-2s on slow uhttpd if cache is cold), exhausting the browser's HTTP
-// connection pool to localhost. After 10-20 min the page hangs.
-async function pollLedsLoop() {
-  try { await pollLedsOnce(); } catch (e) { /* swallow — keep looping */ }
-  setTimeout(pollLedsLoop, 800);
-}
-pollLedsLoop();
-
-// ============================================================
-// TABS
-// ============================================================
-document.querySelectorAll('.tab').forEach(tab => {
-  tab.addEventListener('click', () => {
-    const target = tab.dataset.tab;
-    document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t === tab));
-    document.querySelectorAll('.tab-panel').forEach(p => {
-      p.classList.toggle('hidden', p.dataset.panel !== target);
-    });
-  });
+  if (info.cam2_ip) {
+    const e = document.getElementById('sb-cam2-ip');
+    e.textContent = info.cam2_ip; e.classList.remove('dim');
+  }
 });
 
 // ============================================================
-// STEP STACK — push behavior
-// Active step is at the top. Completed steps stack BELOW (newest first).
-// Pending steps are hidden until they activate.
+// PER-CAM POLL LOOPS — independent, diff-driven event push
 // ============================================================
-const stack = document.getElementById('step-stack');
+const STACK_MAX = 30;
+const POLL_INTERVAL_MS = 1000;
+const PHOSPHOR_AGE_MAX = 8;        // 8 pushes × 7% = ~56% max fade
 
-function showStep(n) {
-  /* Reveal step N at the TOP of the stack with an entry animation,
-     pushing previously-active steps DOWN by reordering. */
-  const me = document.getElementById('step-' + n);
-  // Move me to be the FIRST child (visually top)
-  stack.prepend(me);
-  me.classList.remove('hidden');
-  me.classList.add('appearing');
-  // Strip the animation class after it plays so re-runs animate again
-  setTimeout(() => me.classList.remove('appearing'), 400);
+const CAM_STATE = {
+  cam1: { prevState: null, irOn: false, stackHasEmpty: true },
+  cam2: { prevState: null, irOn: false, stackHasEmpty: true },
+};
+
+function stateClass(state) {
+  if (!state) return 'idle';
+  if (state === 'idle' || state === 'never_run') return 'idle';
+  if (state === 'listening') return 'listening';
+  if (state.endsWith('_done') || state === 'monocal_done') return 'done';
+  if (state.endsWith('_failed') || state === 'monocal_failed') return 'failed';
+  if (state.startsWith('cal_') || state.startsWith('monocal_')
+      || state.startsWith('bootstrap_') || state.startsWith('watchdog_')) return 'cal';
+  if (state === 'handshaking' || state.startsWith('handshake')
+      || state === 'connecting' || state === 'syn_wait'
+      || state === 'ack_wait') return 'busy';
+  return 'busy';
 }
 
-function setStepState(n, state, label, result) {
-  const row = document.getElementById('step-' + n);
-  row.classList.remove('pending', 'running', 'done-ok', 'done-err');
-  row.classList.add(state);
-  row.querySelector('.step-state').textContent = label;
-  if (result !== undefined) row.querySelector('.step-result').textContent = result;
+/* Map the raw irlink state names (from /run/irlink-status.json) to short
+   human-readable phrases. The raw name is preserved in the element's
+   title attribute so it's still discoverable on hover — useful for
+   debugging since the C code logs the raw name. Unmapped states fall
+   through to the raw string. */
+const STATE_LABELS = {
+  // generic
+  'starting':                'starting up',
+  'listening':               'listening',
+  'idle':                    'idle',
+  'never_run':               'never run',
+  'transient':               '…',
+  // handshake (responder side — cam1 receiving)
+  'connecting':              'got SYN',
+  'connected':               'handshake done',
+  // handshake (initiator side — cam2 sending)
+  'handshaking':             'handshaking',
+  'syn_wait':                'waiting for SYN-ACK',
+  'ack_wait':                'waiting for ACK',
+  // regular cal (cam1 holds, cam2 scans)
+  'cal_holding_off':         'LEDs off (baseline)',
+  'cal_holding_on':          'LEDs on for peer',
+  'cal_awaiting_done':       'waiting for result',
+  'cal_sending_done':        'sending result',
+  'cal_done':                'cal complete',
+  'cal_failed':              'cal failed',
+  // monocal RESPONDER (cam1 = scanner)
+  'monocal_resp_ack':        'got cal request',
+  'monocal_resp_scan':       'scanning peer LEDs',
+  'monocal_resp_done':       'sending result',
+  'monocal_resp_failed':     'scan failed',
+  // monocal REQUESTOR (cam2 = holder)
+  'monocal_req':             'sending cal request',
+  'monocal_ack_wait':        'waiting for cal-ack',
+  'monocal_holding_off':     'LEDs off (baseline)',
+  'monocal_holding_on':      'LEDs on (peer scanning)',
+  'monocal_awaiting_done':   'waiting for result',
+  'monocal_done':            'cal complete',
+  'monocal_failed':          'cal failed',
+  // watchdog (autonomous re-cal)
+  'watchdog_refining':       'auto-cal: scanning',
+  'watchdog_wait_falling':   'auto-cal: peer LEDs draining',
+  'watchdog_hold':           'auto-cal: holding for peer',
+  // bootstrap fallback (when protocol path can't decode)
+  'bootstrap_fallback':      'switching to fallback',
+  'bootstrap_hold':          'fallback: holding LEDs',
+  'bootstrap_search':        'fallback: searching for peer',
+  // search (cam2 do_search during bootstrap)
+  'search_refining':         'fallback: refining pixel',
+  'search_done':             'fallback: search complete',
+  'search_timeout':          'fallback: timed out',
+};
+
+function humanState(s) {
+  if (!s || s === '—') return '—';
+  return STATE_LABELS[s] || s;
 }
 
-function resetSteps() {
-  for (let i = 1; i <= 5; i++) {
-    const row = document.getElementById('step-' + i);
-    row.className = 'step pending hidden';
-    row.querySelector('.step-state').textContent = 'PENDING';
-    row.querySelector('.step-result').textContent = '—';
+function pushEvent(cam, fromState, toState) {
+  const stack = document.getElementById(cam + '-stack');
+  if (CAM_STATE[cam].stackHasEmpty) {
+    stack.innerHTML = '';
+    CAM_STATE[cam].stackHasEmpty = false;
+  }
+  // Phosphor decay: age all existing rows by 1 (capped). Older rows fade.
+  for (const child of stack.children) {
+    if (child.classList && child.classList.contains('event')) {
+      const a = parseInt(child.style.getPropertyValue('--age') || '0', 10);
+      child.style.setProperty('--age', Math.min(a + 1, PHOSPHOR_AGE_MAX));
+    }
+  }
+  const row = document.createElement('div');
+  row.className = 'event ' + stateClass(toState) + ' appearing';
+  row.style.setProperty('--age', '0');
+  // Raw state names live in the title for tooltip disclosure — useful when
+  // cross-referencing against irlink C-code logs without losing the
+  // human-readable display.
+  row.title = fromState
+    ? `raw: ${fromState} → ${toState}`
+    : `raw: ${toState}`;
+  const time = document.createElement('div');
+  time.className = 'event-time';
+  time.textContent = nowHMS();
+  const body = document.createElement('div');
+  body.className = 'event-body';
+  body.textContent = fromState
+    ? `${humanState(fromState)} → ${humanState(toState)}`
+    : humanState(toState);
+  row.appendChild(time);
+  row.appendChild(body);
+  stack.prepend(row);
+  setTimeout(() => row.classList.remove('appearing'), 320);
+  while (stack.children.length > STACK_MAX) {
+    stack.removeChild(stack.lastChild);
+  }
+  totalEventCount++;
+  document.getElementById('sb-event-count').textContent = totalEventCount;
+}
+
+/* Shrink the chip value's font-size until the text fits on one line
+   inside the chip. Caps at 10px; values smaller than that are unreadable.
+   Resets to the CSS-driven base size on each call (so when a long state
+   gives way to a short one, the font grows back). */
+function fitChipValue(el) {
+  if (!el) return;
+  el.style.fontSize = '';   /* fall back to the stylesheet rule */
+  const base = parseFloat(getComputedStyle(el).fontSize);
+  let size = base;
+  /* scrollWidth is the intrinsic width of nowrap text; clientWidth is
+     what the chip allows. Shrink 1px at a time — VT323's hinting steps
+     are coarse, so smooth shrinkage isn't visually distinguishable from
+     1px steps and the loop converges in a handful of iterations. */
+  while (el.scrollWidth > el.clientWidth && size > 10) {
+    size -= 1;
+    el.style.fontSize = size + 'px';
+  }
+}
+
+function setChip(cam, field, value, klass, rawTooltip) {
+  const el = document.querySelector(`[data-cam="${cam}"][data-field="${field}"]`);
+  if (!el) return;
+  el.textContent = value;
+  el.className = 'chip-value' + (klass ? ' ' + klass : '');
+  if (rawTooltip !== undefined) {
+    const chip = el.closest('.chip');
+    if (chip) chip.title = rawTooltip;
+  }
+  /* Auto-fit AFTER text + class assignment — class affects font-size via
+     .chip-hero rules. */
+  fitChipValue(el);
+}
+
+/* Re-fit all chip values on viewport resize. Layout breakpoints (e.g.
+   < 880px going from 2-col to 1-col) change available chip width; without
+   re-fit, a value that fit at desktop width stays small at mobile width.
+   debounced via rAF — fires once per layout settle, not per resize event. */
+let _resizeRAF = 0;
+window.addEventListener('resize', () => {
+  if (_resizeRAF) return;
+  _resizeRAF = requestAnimationFrame(() => {
+    _resizeRAF = 0;
+    document.querySelectorAll('.chip-value').forEach(fitChipValue);
+  });
+});
+
+function setLastEvent(cam, text) {
+  const el = document.querySelector(`[data-cam="${cam}"][data-field="last-event"]`);
+  if (!el) return;
+  if (!text) {
+    el.textContent = '—';
+    el.classList.add('dim');
+  } else {
+    el.textContent = '▸ ' + text;
+    el.classList.remove('dim');
+  }
+}
+
+async function pollOnce(cam) {
+  // proc endpoint distinguishes "cam unreachable" (irlink:null) from
+  // "cam up but irlink not running" (irlink:0). Without this we conflate
+  // both into "—" and the user can't tell whether cam2 is offline or
+  // just idle waiting for a trigger.
+  const [status, leds, ae, proc] = await Promise.all([
+    fetchJSON(`/api/${cam}/status`),
+    fetchJSON(`/api/${cam}/leds`),
+    fetchJSON(`/api/${cam}/ae`),
+    fetchJSON(`/api/${cam}/proc`),
+  ]);
+
+  const col = document.getElementById(cam + '-col');
+  const art = document.getElementById(cam + '-art');
+  const cs = CAM_STATE[cam];
+
+  const camReachable = proc && proc.irlink !== null && proc.irlink !== undefined;
+  const irlinkRunning = camReachable && proc.irlink >= 1;
+  const hasStatus = status && Object.keys(status).length > 0;
+
+  if (!camReachable) {
+    col.classList.add('offline');
+    setChip(cam, 'mode', 'OFFLINE', 'dim', 'cam unreachable (TCP probe failed)');
+    setChip(cam, 'state', 'OFFLINE', 'dim', 'cam unreachable (TCP probe failed)');
+    setChip(cam, 'rate', '—', 'dim', '');
+    setLastEvent(cam, null);
+  } else if (!irlinkRunning) {
+    // Cam reachable but no irlink process. cam2 lives here normally —
+    // launches on demand for monocal/send. Show "idle" so STATE isn't a
+    // dash that looks like "offline".
+    col.classList.remove('offline');
+    setChip(cam, 'mode', 'idle', 'dim', 'raw: idle');
+    setChip(cam, 'state', humanState('idle'), '', 'raw: idle');
+    setChip(cam, 'rate', '—', 'dim', '');
+    setLastEvent(cam, 'irlink not running — ready for trigger');
+    art.classList.remove('busy', 'ir-on', 'ae-frozen');
+    if (cs.prevState !== 'idle') {
+      pushEvent(cam, cs.prevState, 'idle');
+      cs.prevState = 'idle';
+    }
+  } else if (!hasStatus) {
+    // irlink IS running but status JSON not yet written — transient gap.
+    col.classList.remove('offline');
+    setChip(cam, 'state', humanState('starting'), 'busy', 'raw: starting');
+  } else {
+    col.classList.remove('offline');
+
+    const mode = status.mode || '—';
+    const state = status.state || '—';
+    const rateMs = status.rate_ms;
+    const rate = rateMs != null ? rateMs + 'ms' : '—';
+
+    setChip(cam, 'mode', mode, mode === '—' ? 'dim' : '', `raw mode: ${mode}`);
+    const stClass = stateClass(state);
+    let stChipClass = '';
+    if (stClass === 'cal' || stClass === 'busy') stChipClass = 'busy';
+    else if (state === '—') stChipClass = 'dim';
+    setChip(cam, 'state', humanState(state), stChipClass, `raw: ${state}`);
+    setChip(cam, 'rate', rate, rate === '—' ? 'dim' : '', '');
+    setLastEvent(cam, status.last_event);
+
+    if (cs.prevState !== state) {
+      pushEvent(cam, cs.prevState, state);
+      cs.prevState = state;
+    }
+
+    const busy = state !== 'listening' && state !== 'idle' && state !== '—';
+    art.classList.toggle('busy', busy);
+  }
+
+  // Pixel-art LED ring + ae-frozen class
+  if (leds) {
+    const anyOn = leds.ir850 === 1 || leds.ir940 === 1;
+    art.classList.toggle('ir-on', anyOn);
+    cs.irOn = anyOn;
+  } else {
+    art.classList.remove('ir-on');
+    cs.irOn = false;
+  }
+  if (ae) {
+    art.classList.toggle('ae-frozen', ae.value === 1);
+  }
+}
+
+async function pollLoop(cam) {
+  while (true) {
+    try { await pollOnce(cam); } catch (e) { /* swallow */ }
+    await sleep(POLL_INTERVAL_MS);
   }
 }
 
 // ============================================================
-// CAL LOG (step 5 inline)
+// BEAM WIRING — derives from the per-cam LED state recorded above.
+// Carrier track lights cyan when EITHER side has IR active (the channel
+// has carrier), giving the page a "the medium is live" cue distinct from
+// directional fwd/rev animations.
 // ============================================================
-const calLog = document.getElementById('cal-log');
-let calLogLineCount = 0;
-
-function classifyLine(t) {
-  if (t.startsWith('▸')) {
-    if (/COMPLETE/i.test(t)) return 'success';
-    if (/FAIL|ERROR|timed out|exit code:\s*[1-9]/i.test(t)) return 'error';
-    return 'marker';
+async function beamLoop() {
+  while (true) {
+    const cam1On = CAM_STATE.cam1.irOn;
+    const cam2On = CAM_STATE.cam2.irOn;
+    document.getElementById('beam-fwd').classList.toggle('active', cam1On);
+    document.getElementById('beam-fwd-label').classList.toggle('active', cam1On);
+    document.getElementById('beam-rev').classList.toggle('active', cam2On);
+    document.getElementById('beam-rev-label').classList.toggle('active', cam2On);
+    document.getElementById('beam-carrier').classList.toggle('live', cam1On || cam2On);
+    await sleep(400);
   }
-  if (/error|fail/i.test(t)) return 'error';
-  return '';
-}
-function renderCalLog(lines) {
-  if (!lines || lines.length === 0) {
-    calLog.innerHTML = '<div class="cal-log-empty">▸ press RUN to begin · cal_procedure stdout streams here</div>';
-    calLogLineCount = 0; return;
-  }
-  if (lines.length < calLogLineCount) { calLog.innerHTML = ''; calLogLineCount = 0; }
-  for (let i = calLogLineCount; i < lines.length; i++) {
-    const div = document.createElement('div');
-    const cls = classifyLine(lines[i]);
-    div.className = 'line' + (cls ? ' ' + cls : '');
-    div.textContent = lines[i] || ' ';
-    calLog.appendChild(div);
-  }
-  calLogLineCount = lines.length;
-  calLog.scrollTop = calLog.scrollHeight;
 }
 
+pollLoop('cam1');
+pollLoop('cam2');
+beamLoop();
+
 // ============================================================
-// SEQUENCE
+// RUN CAL SEQUENCE — fire-and-forget POST + lightweight status poll
 // ============================================================
 const runBtn = document.getElementById('run-btn');
-const statePill = document.getElementById('cal-state-pill');
-const stateText = document.getElementById('cal-state-text');
-let sequenceRunning = false;
+const monocalBtn = document.getElementById('monocal-btn');
 
-function setOverall(state, text) {
-  statePill.className = 'cal-state-pill ' + state;
-  stateText.textContent = text;
-}
-
-async function timeIt(fn) {
-  const t0 = performance.now();
-  const v = await fn();
-  return [v, Math.round(performance.now() - t0)];
-}
-
-async function step1_grid() {
-  showStep(1);
-  setStepState(1, 'running', 'GET…', 'fetching grid…');
-  const [data, ms] = await timeIt(() => fetchJSON('/api/cam2/grid'));
-  if (!data || !Array.isArray(data.blocks) || data.blocks.length < 240) {
-    setStepState(1, 'done-err', 'FAIL', 'no blocks returned'); return false;
-  }
-  const max = Math.max(...data.blocks);
-  const sat = data.blocks.filter(b => b >= 230).length;
-  setStepState(1, 'done-ok', `${ms} ms`,
-    `brightest cell ${max}/255 · ${sat} of 240 saturated`);
-  return true;
-}
-
-async function step2_aeGet() {
-  showStep(2);
-  setStepState(2, 'running', 'GET…', 'reading ae_freeze…');
-  const [data, ms] = await timeIt(() => fetchJSON('/api/cam2/ae'));
-  if (!data || data.value == null) {
-    setStepState(2, 'done-err', 'FAIL', 'no value returned'); return false;
-  }
-  const lbl = data.value === 1 ? 'LOCKED' : 'UNLOCKED';
-  setStepState(2, 'done-ok', `${ms} ms`, `exposure currently ${lbl}`);
-  return true;
-}
-
-async function step3_aePost() {
-  showStep(3);
-  setStepState(3, 'running', 'POST 1…', 'writing 1…');
-  const t0 = performance.now();
-  const r1 = await fetchJSON('/api/cam2/ae', {method:'POST',
-    headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'value=1'});
-  if (!r1 || !r1.ok) { setStepState(3, 'done-err', 'FAIL', 'POST value=1 rejected'); return false; }
-  const v1 = await fetchJSON('/api/cam2/ae');
-  setStepState(3, 'running', 'POST 0…', 'writing 0…');
-  const r2 = await fetchJSON('/api/cam2/ae', {method:'POST',
-    headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'value=0'});
-  if (!r2 || !r2.ok) { setStepState(3, 'done-err', 'FAIL', 'POST value=0 rejected'); return false; }
-  const v0 = await fetchJSON('/api/cam2/ae');
-  const ms = Math.round(performance.now() - t0);
-  if (v1?.value !== 1 || v0?.value !== 0) {
-    setStepState(3, 'done-err', 'FAIL', `mismatch (1→${v1?.value} 0→${v0?.value})`); return false;
-  }
-  setStepState(3, 'done-ok', `${ms} ms`, `round-trip OK · 0→1→0`);
-  return true;
-}
-
-async function step4_proc() {
-  showStep(4);
-  setStepState(4, 'running', 'GET…', 'pgrep + pidof…');
-  const [data, ms] = await timeIt(() => fetchJSON('/api/cam2/proc'));
-  if (!data || data.irlink == null) {
-    setStepState(4, 'done-err', 'FAIL', 'no proc data'); return false;
-  }
-  setStepState(4, 'done-ok', `${ms} ms`,
-    `irlink×${data.irlink} · daynightd×${data.daynightd} · prudynt×${data.prudynt}`);
-  return true;
-}
-
-async function step5_cal() {
-  showStep(5);
-  setStepState(5, 'running', 'STARTING…', 'spawning cal_procedure…');
-  renderCalLog([]);
-  const r = await fetchJSON('/api/cal/start', {method: 'POST'});
-  if (!r || !r.ok) {
-    setStepState(5, 'done-err', 'FAIL', (r && r.error) || 'start rejected'); return false;
-  }
-  setStepState(5, 'running', 'RUNNING…', 'cal_procedure live…');
-  const t0 = performance.now();
+async function pollCalStatus() {
   while (true) {
-    await sleep(700);
-    const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
     const s = await fetchJSON('/api/cal/status');
-    if (s && s.log) renderCalLog(s.log);
-    if (s && !s.running) {
-      const dur = `${elapsed}s`;
-      if (s.ok) {
-        setStepState(5, 'done-ok', `${dur}`, extractCalSummary(s.log) || 'cal complete');
-        return true;
-      }
-      setStepState(5, 'done-err', `${dur}`, 'cal_procedure failed (see log)');
-      return false;
+    if (s && s.running) {
+      runBtn.classList.add('running');
+      runBtn.classList.remove('done-ok', 'done-err');
+      runBtn.querySelector('.big-cal-icon').textContent = '⟳';
+      runBtn.querySelector('.big-cal-label').textContent = 'CAL RUNNING…';
+      const pidEl = document.getElementById('sb-cal-pid');
+      pidEl.textContent = s.pid; pidEl.classList.remove('dim');
+      pidEl.classList.add('live');
+    } else if (runBtn.classList.contains('running')) {
+      runBtn.classList.remove('running');
+      runBtn.classList.add('done-ok');
+      runBtn.querySelector('.big-cal-icon').textContent = '▶';
+      runBtn.querySelector('.big-cal-label').textContent = 'RUN CAL SEQUENCE';
+      const pidEl = document.getElementById('sb-cal-pid');
+      pidEl.textContent = '—'; pidEl.classList.add('dim');
+      pidEl.classList.remove('live');
+      refreshCalViewer();
     }
-    setStepState(5, 'running', `${elapsed}s`, 'cal_procedure live…');
+    await sleep(2000);
   }
 }
+pollCalStatus();
 
-function extractCalSummary(lines) {
-  const tx = lines.filter(l => /TX position:/.test(l));
-  if (tx.length >= 1) {
-    const m = tx[0].match(/TX position:\s*\(([^)]+)\),\s*delta:\s*(\d+)/);
-    if (m) {
-      const last = tx.length > 1
-        ? tx[tx.length - 1].match(/TX position:\s*\(([^)]+)\),\s*delta:\s*(\d+)/) : null;
-      if (last) return `cam1↔cam2 · Δ ${m[2]}/${last[2]}`;
-      return `Δ ${m[2]}`;
-    }
-  }
-  return 'cal complete';
-}
-
-async function runSequence() {
-  if (sequenceRunning || (typeof monocalRunning !== 'undefined' && monocalRunning)) return;
-  sequenceRunning = true;
-  resetSteps();
-  if (typeof showMonocalMode === 'function') showMonocalMode(false);
-  setOverall('running', 'RUNNING');
+runBtn.addEventListener('click', async () => {
+  if (runBtn.classList.contains('running')) return;
   runBtn.classList.remove('done-ok', 'done-err');
-  runBtn.classList.add('running');
-  runBtn.querySelector('.big-cal-icon').textContent = '⟳';
-  runBtn.querySelector('.big-cal-label').textContent = 'SEQUENCE RUNNING…';
-
-  const results = [];
-  results.push(await step1_grid()); await sleep(220);
-  results.push(await step2_aeGet()); await sleep(220);
-  results.push(await step3_aePost()); await sleep(220);
-  results.push(await step4_proc()); await sleep(220);
-  results.push(await step5_cal());
-
-  runBtn.classList.remove('running');
-  runBtn.querySelector('.big-cal-icon').textContent = '▶';
-  runBtn.querySelector('.big-cal-label').textContent = 'RUN CAL SEQUENCE';
-
-  /* The actual calibration is step 5 (cal_procedure). Steps 1-4 are Phase 1-5
-     HTTP-layer instrumentation — useful dev visibility but not the cal itself.
-     Drive the cal-results refresh off step 5's outcome so a transient blip in
-     step 3 (e.g. an auth retry mid-flight) doesn't hide a successful cal. */
-  const calOk = results[4] === true;
-  const checksOk = results.slice(0, 4).every(Boolean);
-  if (calOk) {
-    setOverall('done-ok', checksOk ? 'DONE · OK' : 'CAL OK · CHECKS WARN');
-    runBtn.classList.add('done-ok');
-    refreshCalViewer();
-    activateTab('cal');
-  } else {
-    setOverall('done-err', 'DONE · FAILED');
+  runBtn.querySelector('.big-cal-label').textContent = 'STARTING…';
+  const r = await fetchJSON('/api/cal/start', { method: 'POST' });
+  if (!r || !r.ok) {
     runBtn.classList.add('done-err');
+    runBtn.querySelector('.big-cal-label').textContent =
+      'FAIL · ' + ((r && r.error) || 'start refused');
+    setTimeout(() => {
+      runBtn.classList.remove('done-err');
+      runBtn.querySelector('.big-cal-label').textContent = 'RUN CAL SEQUENCE';
+    }, 4000);
   }
-  sequenceRunning = false;
+});
+
+// ============================================================
+// MONOCAL — single POST to cam2; cam2's column polling reflects progress
+// ============================================================
+async function pollMonocalStatus() {
+  while (true) {
+    const s = await fetchJSON('/api/cal/monocal-status');
+    const cam2 = (s && s.cam2) || {};
+    const state = cam2.state;
+    const inflight = state && !['transient', 'never_run', 'monocal_done',
+                                 'monocal_failed', 'idle', 'listening'].includes(state);
+    if (inflight) {
+      monocalBtn.classList.add('running');
+      monocalBtn.classList.remove('done-ok', 'done-err');
+      monocalBtn.querySelector('.big-cal-icon').textContent = '⟳';
+      monocalBtn.querySelector('.big-cal-label').textContent = 'MONOCAL RUNNING…';
+    } else if (monocalBtn.classList.contains('running')) {
+      monocalBtn.classList.remove('running');
+      monocalBtn.querySelector('.big-cal-icon').textContent = '▶';
+      monocalBtn.querySelector('.big-cal-label').textContent = 'MONOCAL CAM1';
+      if (state === 'monocal_done') monocalBtn.classList.add('done-ok');
+      else if (state === 'monocal_failed') monocalBtn.classList.add('done-err');
+    }
+    await sleep(1500);
+  }
+}
+pollMonocalStatus();
+
+monocalBtn.addEventListener('click', async () => {
+  if (monocalBtn.classList.contains('running')) return;
+  monocalBtn.classList.remove('done-ok', 'done-err');
+  monocalBtn.querySelector('.big-cal-label').textContent = 'TRIGGERING…';
+  const r = await fetchJSON('/api/cal/monocal', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: '',
+  });
+  if (!r || !r.ok) {
+    monocalBtn.classList.add('done-err');
+    monocalBtn.querySelector('.big-cal-label').textContent =
+      'FAIL · ' + ((r && r.error) || 'trigger refused');
+    setTimeout(() => {
+      monocalBtn.classList.remove('done-err');
+      monocalBtn.querySelector('.big-cal-label').textContent = 'MONOCAL CAM1';
+    }, 4000);
+  }
+});
+
+// ============================================================
+// CAL TAB switcher (RUN CAL RESULTS ↔ MONOCAL RESULTS)
+// Last selected tab is persisted to localStorage so a reload restores
+// whichever panel the user was looking at.
+// ============================================================
+const CAL_TAB_KEY = 'liwifi.cal-tab';
+
+function selectCalTab(target, opts = {}) {
+  document.querySelectorAll('.cal-tab').forEach(t => {
+    const isActive = t.dataset.tab === target;
+    t.classList.toggle('active',          isActive);
+    t.classList.toggle('cal-tab-inactive', !isActive);
+  });
+  document.querySelectorAll('.cal-panel').forEach(p => {
+    p.classList.toggle('hidden', p.id !== `cal-panel-${target}`);
+  });
+  if (target === 'results' && opts.refreshIframe) refreshCalViewer();
+  try { localStorage.setItem(CAL_TAB_KEY, target); } catch (e) { /* private mode */ }
 }
 
-/* Force a real reload of the cal-results iframe. calibration.html is rewritten
-   with new timestamped image filenames each cal run, but the iframe URL stays
-   the same — so we go through about:blank to defeat any browser caching. */
+document.querySelectorAll('.cal-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    selectCalTab(tab.dataset.tab, { refreshIframe: true });
+  });
+});
+
+// Restore the last-selected tab on load. Default: whatever has .active
+// in the markup (currently RUN CAL RESULTS). No iframe-refresh on restore
+// — the iframe loads its src directly from the markup, and refreshCalViewer
+// would do a wasteful about:blank → reload cycle on every page open.
+(() => {
+  let saved = null;
+  try { saved = localStorage.getItem(CAL_TAB_KEY); } catch (e) { /* private mode */ }
+  if (saved && document.querySelector(`.cal-tab[data-tab="${saved}"]`)) {
+    selectCalTab(saved, { refreshIframe: false });
+  }
+})();
+
+// ============================================================
+// LIVE CAL — auto-refresh annotated snapshots every 4s
+// ============================================================
+// Image mode is PER-CAM: each card carries its own HI/LO toggle so
+// cam1 and cam2 can be in different modes independently (e.g. hi-res
+// on the cam you're aiming, lo-res on the other to preview what would
+// transmit over IR). State stored as {cam1, cam2} object in
+// localStorage under the cal-image-mode key.
+//   'hires' = annotated JPEG  (~30 KB, default)
+//   'lores' = tiny wireframe PNG  (~1.6 KB rendered from a 292 B raster)
+const CAL_IMAGE_MODE_KEY = 'liwifi.cal-image-mode';
+const calImageMode = { cam1: 'hires', cam2: 'hires' };
+try {
+  const saved = JSON.parse(localStorage.getItem(CAL_IMAGE_MODE_KEY) || '{}');
+  if (saved.cam1 === 'lores' || saved.cam1 === 'hires') calImageMode.cam1 = saved.cam1;
+  if (saved.cam2 === 'lores' || saved.cam2 === 'hires') calImageMode.cam2 = saved.cam2;
+} catch (e) { /* malformed or private mode */ }
+
+function calImageUrlFor(cam) {
+  return calImageMode[cam] === 'lores'
+    ? `/api/${cam}/snapshot-tiny.png`
+    : `/api/${cam}/snapshot-annotated`;
+}
+
+function refreshLiveCal() {
+  const t = Date.now();
+  document.getElementById('live-cam1-img').src = `${calImageUrlFor('cam1')}?t=${t}`;
+  document.getElementById('live-cam2-img').src = `${calImageUrlFor('cam2')}?t=${t}`;
+}
+setInterval(refreshLiveCal, 4000);
+
+// Reflect the per-cam mode in the DOM: card gets a .lores class for
+// the pixelated rendering hint, and the matching toggle side glows.
+function applyCalImageMode() {
+  for (const cam of ['cam1', 'cam2']) {
+    const card = document.getElementById(`live-${cam}-card`);
+    if (card) card.classList.toggle('lores', calImageMode[cam] === 'lores');
+    const toggle = document.querySelector(`.flip-toggle[data-cam="${cam}"]`);
+    if (!toggle) continue;
+    toggle.querySelectorAll('.flip-toggle-side').forEach(el => {
+      el.classList.toggle('active', el.dataset.mode === calImageMode[cam]);
+    });
+  }
+}
+
+function flipCalImage(cam, mode) {
+  if (!(cam in calImageMode)) return;
+  calImageMode[cam] = (mode === 'lores' || mode === 'hires')
+    ? mode
+    : (calImageMode[cam] === 'hires' ? 'lores' : 'hires');
+  try { localStorage.setItem(CAL_IMAGE_MODE_KEY, JSON.stringify(calImageMode)); }
+  catch (e) { /* private mode */ }
+  applyCalImageMode();
+  refreshLiveCal();  // swap srcs immediately, don't wait 4s
+}
+
+document.querySelectorAll('.flip-toggle').forEach(toggle => {
+  toggle.addEventListener('click', (ev) => {
+    const cam = toggle.dataset.cam;
+    // Click on a side label snaps to that mode; click on the arrow or
+    // toggle bg just toggles the current mode.
+    const side = ev.target.closest('.flip-toggle-side');
+    flipCalImage(cam, side ? side.dataset.mode : undefined);
+  });
+});
+
+// Restore on load
+applyCalImageMode();
+refreshLiveCal();
+
+// ============================================================
+// CAL RESULTS iframe refresh
+// ============================================================
 function refreshCalViewer() {
   const f = document.getElementById('cal-iframe');
   const baseUrl = f.src.split('?')[0] || 'http://localhost:8889/calibration.html';
   f.src = 'about:blank';
   setTimeout(() => { f.src = baseUrl + '?_t=' + Date.now(); }, 60);
 }
-
-function activateTab(name) {
-  document.querySelectorAll('.tab').forEach(t =>
-    t.classList.toggle('active', t.dataset.tab === name));
-  document.querySelectorAll('.tab-panel').forEach(p =>
-    p.classList.toggle('hidden', p.dataset.panel !== name));
-}
-
-runBtn.addEventListener('click', runSequence);
-
-// ============================================================
-// MONOCAL — cam1 learns its view of cam2 over light.
-// Driven entirely by /api/cal/monocal-status (cam2's monocal-status.json
-// merged with cam1's irlink-status.json). State machine on cam2:
-//   spawning → starting → handshaking → monocal_req → monocal_ack_wait
-//   → monocal_holding_off → monocal_holding_on → monocal_awaiting_done
-//   → monocal_done | monocal_failed
-// We map those onto M1..M5 in the step stack.
-// ============================================================
-const monocalBtn = document.getElementById('monocal-btn');
-const monocalStack = document.getElementById('monocal-stack');
-const calStack = document.getElementById('step-stack');
-
-function showMStep(n) {
-  const me = document.getElementById('mstep-' + n);
-  monocalStack.prepend(me);
-  me.classList.remove('hidden');
-  me.classList.add('appearing');
-  setTimeout(() => me.classList.remove('appearing'), 400);
-}
-
-function setMStepState(n, state, label, result) {
-  const row = document.getElementById('mstep-' + n);
-  row.classList.remove('pending', 'running', 'done-ok', 'done-err');
-  row.classList.add(state);
-  row.querySelector('.step-state').textContent = label;
-  if (result !== undefined) row.querySelector('.step-result').textContent = result;
-}
-
-function resetMSteps() {
-  for (let i = 1; i <= 5; i++) {
-    const row = document.getElementById('mstep-' + i);
-    row.className = 'step pending hidden';
-    row.querySelector('.step-state').textContent = 'PENDING';
-    row.querySelector('.step-result').textContent = '—';
-  }
-}
-
-function showMonocalMode(on) {
-  /* Toggle which step stack is visible. We don't destroy the cal stack —
-     the user might run cal_procedure first, then monocal — so just hide it. */
-  monocalStack.style.display = on ? '' : 'none';
-  calStack.style.display     = on ? 'none' : '';
-}
-
-/* Map cam2's monocal state name → which M-step is active and the label/result.
-   We track which steps have been "completed" so we don't bounce backwards on
-   transient state reads. The state machine always moves forward, so once a
-   step is done-ok we leave it. */
-function applyMonocalState(merged, t0_ms) {
-  const cam2 = merged.cam2 || {};
-  const cam1 = merged.cam1 || {};
-  const state = cam2.state || 'transient';
-  const elapsed = ((performance.now() - t0_ms) / 1000).toFixed(1);
-
-  // M1 — handshake + CAL_REQ + CAL_ACK
-  if (['spawning','starting','handshaking','monocal_req','monocal_ack_wait'].includes(state)) {
-    showMStep(1);
-    let sub = 'spawning irlink…';
-    if (state === 'handshaking')       sub = 'SYN/SYN_ACK/ACK over light…';
-    if (state === 'monocal_req')       sub = 'sending CAL_REQ (peer_scans=1)…';
-    if (state === 'monocal_ack_wait')  sub = 'waiting for CAL_ACK from cam1…';
-    setMStepState(1, 'running', `${elapsed}s`, sub);
-    return;
-  }
-
-  // BOOTSTRAP FALLBACK — cam1's saved pixel didn't decode our SYN. cam2
-  // pivots to a light-only sequence: hold LEDs solid 25s (cam1's grid-
-  // watchdog detects + refines + holds back), then cam2 do_search to find
-  // cam1's responding hold. Total ~60s. Reuses M2/M3/M5; M4 is skipped
-  // since there's no protocol CAL_DONE round trip.
-  if (['bootstrap_fallback','bootstrap_hold','bootstrap_search'].includes(state)) {
-    setMStepState(1, 'done-err', 'fallback',
-      'short SYN unanswered · cam1 pixel may be stale');
-    showMStep(2);
-    if (state === 'bootstrap_fallback') {
-      setMStepState(2, 'running', `${elapsed}s`,
-        'engaging light-only bootstrap (cam1 watchdog should wake)…');
-    } else if (state === 'bootstrap_hold') {
-      setMStepState(2, 'running', `${elapsed}s`,
-        '25s LED hold · cam1 grid-watchdog detects + refines + holds back');
-    } else if (state === 'bootstrap_search') {
-      setMStepState(2, 'done-ok', '—', 'hold complete · cam1 should be holding now');
-      showMStep(3);
-      setMStepState(3, 'running', `${elapsed}s`,
-        'cam2 do_search scanning grid for cam1\'s responding hold…');
-    }
-    return;
-  }
-
-  // First time we see anything past M1, mark M1 done-ok and the ACK timestamp.
-  if (cam2.ack_received_ms && cam2.ack_received_ms > 0) {
-    const took = cam2.ack_received_ms - cam2.started_ms;
-    if (took > 0) setMStepState(1, 'done-ok', `${(took/1000).toFixed(1)}s`,
-      'CAL_ACK received from cam1');
-  }
-
-  // M2 — LED hold on cam2
-  if (state === 'monocal_holding_off') {
-    showMStep(2);
-    setMStepState(2, 'running', `${elapsed}s`, 'LEDs OFF (1.5s baseline window)…');
-    return;
-  }
-  if (state === 'monocal_holding_on') {
-    showMStep(2);
-    setMStepState(2, 'running', `${elapsed}s`, 'LEDs ON 12s steady · cam1 scanning…');
-    return;
-  }
-
-  // Past M2 — close it out with the actual hold duration.
-  if (cam2.led_hold_ended_ms && cam2.led_hold_ended_ms > 0
-      && cam2.led_hold_started_ms > 0) {
-    const took = (cam2.led_hold_ended_ms - cam2.led_hold_started_ms) / 1000;
-    setMStepState(2, 'done-ok', `${took.toFixed(1)}s`, 'hold complete · LEDs off');
-  }
-
-  // M3 — cam1 scanning. Reflect cam1's irlink-status.cgi state if reachable
-  // (during ground-truth phase). After deploy, cam1 is not IP-reachable; we
-  // infer M3 from cam2's "awaiting_done" state.
-  if (state === 'monocal_awaiting_done') {
-    showMStep(3);
-    const cam1State = cam1.state || '';
-    if (cam1State.startsWith('monocal_resp_scan')) {
-      setMStepState(3, 'running', `${elapsed}s`, 'cam1 scanning peer LEDs…');
-    } else if (cam1State.startsWith('monocal_resp_done')) {
-      setMStepState(3, 'done-ok', `${elapsed}s`, 'cam1 scan complete · CAL_DONE in flight');
-      showMStep(4);
-      setMStepState(4, 'running', `${elapsed}s`, 'awaiting CAL_DONE over light (~30s)…');
-    } else {
-      setMStepState(3, 'running', `${elapsed}s`,
-        cam1State ? `cam1: ${cam1State}` : 'awaiting cam1 scan + CAL_DONE…');
-    }
-    return;
-  }
-
-  // M5 — terminal states
-  if (state === 'monocal_done') {
-    /* In the bootstrap-fallback path M3/M4 may be in different states
-       from the protocol path; defensively close them both with —. */
-    setMStepState(3, 'done-ok', '—', 'cam1 scan complete');
-    setMStepState(4, 'done-ok', '—', 'cal_done received');
-    showMStep(5);
-    const p = cam2.peer_pixel;
-    /* Distinguish bootstrap vs protocol path by checking whether cam2
-       saw a CAL_ACK (only the protocol path sets ack_received_ms > 0). */
-    const wasBootstrap = !cam2.ack_received_ms || cam2.ack_received_ms === 0;
-    const tag = wasBootstrap ? 'bootstrap OK' : 'OK';
-    if (p) {
-      setMStepState(5, 'done-ok', tag,
-        `cam1 sees cam2 at (${p.x}, ${p.y}) · b=${p.peak_b}/255 · Δ=${p.grid_delta}`);
-    } else {
-      setMStepState(5, 'done-ok', tag, 'monocal complete');
-    }
-    return;
-  }
-
-  if (state === 'monocal_failed' || state === 'monocal_resp_failed') {
-    showMStep(5);
-    const err = cam2.error || 'monocal failed';
-    setMStepState(5, 'done-err', 'FAIL', err);
-    return;
-  }
-}
-
-let monocalRunning = false;
-
-async function runMonocal() {
-  if (monocalRunning || sequenceRunning) return;
-  monocalRunning = true;
-
-  resetMSteps();
-  showMonocalMode(true);
-  setOverall('running', 'MONOCAL');
-  monocalBtn.classList.remove('done-ok', 'done-err');
-  monocalBtn.classList.add('running');
-  monocalBtn.querySelector('.big-cal-icon').textContent = '⟳';
-  monocalBtn.querySelector('.big-cal-label').textContent = 'MONOCAL RUNNING…';
-
-  showMStep(1);
-  setMStepState(1, 'running', 'POST…', 'triggering /x/monocal-trigger.cgi…');
-
-  const r = await fetchJSON('/api/cal/monocal', {method:'POST',
-    headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:''});
-  if (!r || !r.ok) {
-    setMStepState(1, 'done-err', 'FAIL', (r && r.error) || 'trigger refused');
-    monocalBtn.classList.remove('running');
-    monocalBtn.classList.add('done-err');
-    monocalBtn.querySelector('.big-cal-icon').textContent = '▶';
-    monocalBtn.querySelector('.big-cal-label').textContent = 'MONOCAL CAM1';
-    setOverall('done-err', 'DONE · FAILED');
-    monocalRunning = false;
-    return;
-  }
-
-  // Hand off to the polling loop.
-  const t0 = performance.now();
-  while (true) {
-    await sleep(800);
-    const merged = await fetchJSON('/api/cal/monocal-status');
-    if (!merged) continue;
-    applyMonocalState(merged, t0);
-    const state = (merged.cam2 && merged.cam2.state) || '';
-    if (state === 'monocal_done' || state === 'monocal_failed') {
-      const ok = state === 'monocal_done';
-      monocalBtn.classList.remove('running');
-      monocalBtn.classList.add(ok ? 'done-ok' : 'done-err');
-      monocalBtn.querySelector('.big-cal-icon').textContent = '▶';
-      monocalBtn.querySelector('.big-cal-label').textContent = 'MONOCAL CAM1';
-      setOverall(ok ? 'done-ok' : 'done-err', ok ? 'DONE · OK' : 'DONE · FAILED');
-      monocalRunning = false;
-      break;
-    }
-  }
-}
-
-monocalBtn.addEventListener('click', runMonocal);
-
-// On load: attach to in-flight cal if reload happened mid-run
-(async () => {
-  const s = await fetchJSON('/api/cal/status');
-  if (s && s.running) {
-    sequenceRunning = true;
-    showStep(5);
-    setStepState(5, 'running', 'RUNNING…', 'attaching to live cal…');
-    setOverall('running', 'RUNNING');
-    runBtn.classList.add('running');
-    runBtn.querySelector('.big-cal-icon').textContent = '⟳';
-    runBtn.querySelector('.big-cal-label').textContent = 'CAL ALREADY RUNNING…';
-    while (true) {
-      await sleep(800);
-      const ss = await fetchJSON('/api/cal/status');
-      if (ss && ss.log) renderCalLog(ss.log);
-      if (ss && !ss.running) {
-        if (ss.ok) {
-          setStepState(5, 'done-ok', 'DONE', 'cal complete (attached)');
-          setOverall('done-ok', 'DONE · OK');
-          refreshCalViewer();
-          activateTab('cal');
-        } else {
-          setStepState(5, 'done-err', 'DONE', 'cal failed (attached)');
-          setOverall('done-err', 'DONE · FAILED');
-        }
-        runBtn.classList.remove('running');
-        runBtn.querySelector('.big-cal-icon').textContent = '▶';
-        runBtn.querySelector('.big-cal-label').textContent = 'RUN CAL SEQUENCE';
-        sequenceRunning = false;
-        break;
-      }
-    }
-  }
-})();
-
-// CAL VIEWER REFRESH (manual button)
 document.getElementById('cal-refresh').addEventListener('click', refreshCalViewer);
-
-// ============================================================
-// LIVE CAL — fetch fresh snapshots from each cam + draw the calibrated
-// pixel as a crosshair on top. Pulls /api/{cam}/cal-info for the JSON
-// and /api/{cam}/snapshot for the JPEG. Useful for monocal/disco runs
-// where photos/calibration.html (the iframe target) is NOT regenerated.
-// ============================================================
-
-function drawCalMark(canvas, info) {
-  const ctx = canvas.getContext('2d');
-  // canvas internal size matches the 640x360 substream — that's also
-  // calibration.json's frame_size, so cal pixel coords map 1:1.
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  if (!info) return;
-  // Prefer saved_cal.tx_pixel — it's the authoritative "where I see my
-  // peer" answer, populated whenever this cam was the scanner in any cal
-  // flow. Fall back to runtime info.pixel (the daemon's tracking ROI),
-  // which equals tx_pixel after a successful cal anyway.
-  let px, py;
-  if (info.saved_cal && Array.isArray(info.saved_cal.tx_pixel)) {
-    [px, py] = info.saved_cal.tx_pixel;
-  } else if (Array.isArray(info.pixel)) {
-    [px, py] = info.pixel;
-  } else {
-    return;
-  }
-  if (px < 0 || py < 0) return;
-
-  // Outer crosshair (high contrast)
-  ctx.strokeStyle = '#ff3030';
-  ctx.lineWidth = 2;
-  const arm = 24;
-  ctx.beginPath();
-  ctx.moveTo(px - arm, py); ctx.lineTo(px - 4, py);
-  ctx.moveTo(px + 4, py);   ctx.lineTo(px + arm, py);
-  ctx.moveTo(px, py - arm); ctx.lineTo(px, py - 4);
-  ctx.moveTo(px, py + 4);   ctx.lineTo(px, py + arm);
-  ctx.stroke();
-
-  // Inner ring
-  ctx.strokeStyle = '#ffd24a';
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.arc(px, py, 8, 0, Math.PI * 2);
-  ctx.stroke();
-
-  // Center dot
-  ctx.fillStyle = '#ffd24a';
-  ctx.beginPath();
-  ctx.arc(px, py, 1.6, 0, Math.PI * 2);
-  ctx.fill();
-
-  // Label
-  ctx.font = 'bold 11px monospace';
-  ctx.fillStyle = '#000';
-  ctx.fillRect(px + 12, py - 22, 70, 14);
-  ctx.fillStyle = '#ffd24a';
-  ctx.fillText(`(${px}, ${py})`, px + 14, py - 11);
-}
-
-function fmtCalInfo(info) {
-  if (!info || Object.keys(info).length === 0) return '<span class="stale">(no data)</span>';
-  /* Prefer saved_cal — populated by every successful cal flow regardless
-     of which side scanned. The runtime cal.peak only has data when this
-     cam was the scanner in the most recent flow, so for protocol-path
-     monocal it's empty on the holder side. */
-  const saved = info.saved_cal || {};
-  const cal = info.cal || {};
-  const pixel = saved.tx_pixel || info.pixel || [-1, -1];
-  const peak = saved.tx_pixel || (cal.peak && cal.peak[0] >= 0 ? cal.peak : null);
-  const peakBright = saved.peak_brightness || cal.peak_brightness || 0;
-  const peakDelta = saved.grid_delta != null ? saved.grid_delta : (cal.peak_delta || 0);
-  const ageMs = info.ts_ms && info.last_event_ms
-                 ? (info.ts_ms - info.last_event_ms) : 0;
-  const ageStr = ageMs > 60000 ? `<span class="stale">${(ageMs/1000).toFixed(0)}s ago</span>`
-                                : `<span class="val">${(ageMs/1000).toFixed(0)}s ago</span>`;
-  return `
-    <div><span class="key">pixel:</span> <span class="val">[${pixel[0]}, ${pixel[1]}]</span></div>
-    <div><span class="key">peak:</span> <span class="val">${peak ? `[${peak[0]}, ${peak[1]}]` : '—'}</span>
-         <span class="key">delta:</span> <span class="val">${peakDelta}</span>
-         <span class="key">b:</span> <span class="val">${peakBright}</span></div>
-    <div><span class="key">state:</span> <span class="val">${info.state}</span>
-         <span class="key">rate:</span> <span class="val">${info.rate_ms}ms</span>
-         <span class="key">ae:</span> <span class="val">${info.ae_frozen ? 'frozen' : 'active'}</span></div>
-    <div><span class="key">last event:</span> <span class="val">${ageStr}</span></div>
-  `;
-}
-
-async function refreshLiveCal(cam) {
-  const img = document.getElementById(`live-${cam}-img`);
-  const mark = document.getElementById(`live-${cam}-mark`);
-  const info = document.getElementById(`live-${cam}-info`);
-
-  // Cache-bust the snapshot URL so each click reloads a fresh frame.
-  img.src = `/api/${cam}/snapshot?t=${Date.now()}`;
-
-  const data = await fetchJSON(`/api/${cam}/cal-info`);
-  if (data) {
-    info.innerHTML = fmtCalInfo(data);
-    drawCalMark(mark, data);
-  } else {
-    info.innerHTML = '<span class="stale">(fetch failed)</span>';
-    drawCalMark(mark, null);
-  }
-}
-
-async function refreshAllLiveCal() {
-  await Promise.all([refreshLiveCal('cam1'), refreshLiveCal('cam2')]);
-}
-
-document.getElementById('live-cal-refresh').addEventListener('click', refreshAllLiveCal);
-
-// Auto-refresh once when CAL RESULTS tab becomes active, and after monocal
-// completes (so the user sees fresh state without manually clicking).
-const calTabBtn = document.querySelector('.tab[data-tab="cal"]');
-if (calTabBtn) calTabBtn.addEventListener('click', () => setTimeout(refreshAllLiveCal, 200));
-
-// Hook into the existing post-cal switch (RUN CAL SEQUENCE auto-switches to
-// the CAL RESULTS tab on done-ok). Trigger live refresh there too. The hook
-// is best-effort — if the user closed/reloaded the page mid-run, the cal
-// tab's own click handler still fires the refresh.
-window.addEventListener('load', () => setTimeout(refreshAllLiveCal, 600));
 </script>
 </body>
 </html>

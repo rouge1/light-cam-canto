@@ -354,11 +354,16 @@ static void log_event(const char *tag, const char *fmt, ...)
    daemon-listen/daemon-connect/monocal) so both peers start at the same rate
    regardless of --speed. Without the lock, cam1's daemon-listen at 200 vs
    cam2's monocal at 160 would silently fail SYN decode. */
-/* Floor at 160ms (rung 4), not 200ms (rung 5). 160ms is the documented
-   reliable rate for on-camera BrightnessMonitor (~18fps → 2.9 samples/sym);
-   200ms produced enough Manchester edge timing variance for the DPLL to
-   miss the SYNC word reliably, leaving cal/handshake stuck because cal
-   itself is what unlocks probe-up. */
+/* Floor at 160ms (rung 4). 160ms is where SYN/SYN_ACK round-trips actually
+   decode reliably — testing 2026-05-10 confirmed 200ms still fails the
+   round-trip even with ROI 7 (cam1 sends SYN_ACK, cam2 can't decode it).
+   So the floor stays at 160ms for actual messaging.
+
+   Split-brain divergence (the previous failure mode where cam1 dropped
+   to 200ms while cam2 stayed at 160ms) is eliminated by making
+   split-brain recovery ALSO drop to the floor (160ms) instead of the
+   slowest rung — see the split-brain block in the watchdog/recovery
+   thread. Both cams converge at the same rate on recovery. */
 #define RATE_FLOOR_RUNG (RATE_LADDER_LEN - 2)
 static void lock_rate_at_floor(const char *mode)
 {
@@ -1616,13 +1621,16 @@ static int do_grid_calibration(grid_cal_t *out)
     /* OSD masking — channel 1 carries a per-second timestamp + name +
        uptime in the top 30 px and a "thingino" watermark in the bottom
        30 px. Their per-frame character changes inject false delta into
-       block rows 0 (by=0) and 11 (by=11). Without masking, argmax can
-       pick an OSD-edge block (e.g. block 21 at y=30-59) over the true
-       TX block. Mirrors cal_procedure.py:206-209 so on-camera and
-       laptop scans converge on the same TX pixel. */
+       block rows 0 (by=0) and 11 (by=11). The watermark also bleeds
+       upward into row 10 (observed 2026-05-10: watchdog wrote saved cal
+       (17,302) — row 10 — when only rows 0/11 were masked). Without
+       masking, argmax can pick an OSD-edge block (e.g. block 21 at
+       y=30-59) over the true TX block. Mirrors cal_procedure.py:206-209
+       (extended down one row) so on-camera and laptop scans converge. */
     for (int bx = 0; bx < 20; bx++) {
-        deltas[0 * 20 + bx]  = 0;   /* by=0,  y∈[0,29]    — OSD strip  */
-        deltas[11 * 20 + bx] = 0;   /* by=11, y∈[330,359] — watermark  */
+        deltas[0  * 20 + bx] = 0;   /* by=0,  y∈[0,29]    — OSD strip       */
+        deltas[10 * 20 + bx] = 0;   /* by=10, y∈[300,329] — watermark bleed */
+        deltas[11 * 20 + bx] = 0;   /* by=11, y∈[330,359] — watermark       */
     }
 
     int best = -1, best_delta = 0;
@@ -2103,10 +2111,11 @@ static int do_search(int max_wait_ms,
                do_search picked block 34 (row 1, x=448-479, y=30-59,
                adjacent to OSD strip) and wrote tx_pixel=(477, 47) into
                cam2's saved cal — clearly wrong vs the host RTSP cal that
-               put cam1 at (294, 173). Mirrors do_grid_calibration's mask
-               at line 1572 + cal_procedure.py:206-209. */
+               put cam1 at (294, 173). Row 10 added same day (watermark
+               bleed observed via watchdog hit on block 200). Mirrors
+               do_grid_calibration's mask + cal_procedure.py:206-209. */
             int by = i / 20;
-            if (by == 0 || by == 11) {
+            if (by == 0 || by == 10 || by == 11) {
                 bright_since[i] = 0;
                 continue;
             }
@@ -2567,6 +2576,23 @@ static void *grid_watchdog_thread(void *unused)
         int triggered = -1;
         int best_delta = 0;
         for (int i = 0; i < GRID_BLOCKS; i++) {
+            /* Skip OSD-tainted block rows (top + bottom). Channel 1's
+               substream carries the per-second timestamp/name/uptime in
+               by=0, the `thingino` watermark in by=11, and visible
+               watermark-bleed into by=10. Sustained character-shape changes
+               in those rows produce real per-block delta that easily clears
+               WATCHDOG_DELTA over 5s, so the watchdog can fire on OSD
+               jitter and write an OSD-pixel into the saved cal. Mirrors
+               the same mask in do_grid_calibration and do_search.
+               Surfaced 2026-05-10: first iteration (rows 0+11) saw the
+               watchdog fire block=220 → wrote (2,347); second iteration
+               (this rev, adds row 10) covers a follow-up where watchdog
+               wrote (17,302) — block 200, row 10 — clobbering the cal. */
+            int by = i / 20;
+            if (by == 0 || by == 10 || by == 11) {
+                watchdog_run_len[i] = 0;
+                continue;
+            }
             int delta = (int)blocks[i] - (int)watchdog_baseline[i];
             if (delta >= WATCHDOG_DELTA) {
                 watchdog_run_len[i]++;
@@ -2641,13 +2667,21 @@ static void *rx_thread(void *arg)
         if (split_brain_window_ms < SPLIT_BRAIN_TIMEOUT_MS)
             split_brain_window_ms = SPLIT_BRAIN_TIMEOUT_MS;
         if (!tx_active && !cal_flow_active && last_valid_frame_ms > 0
-            && current_rung < RATE_LADDER_LEN - 1
+            && current_rung != RATE_FLOOR_RUNG
             && last_substantial_decode_fail_ms > 0
             && now_ms() - last_substantial_decode_fail_ms < split_brain_window_ms
             && now_ms() - last_valid_frame_ms > split_brain_window_ms
             && now_ms() - last_split_brain_fire_ms > split_brain_window_ms) {
-            apply_rate(RATE_LADDER_MS[RATE_LADDER_LEN - 1],
-                       RATE_LADDER_LEN - 1, "split-brain-recovery");
+            /* Drop to FLOOR rate, not slowest. Floor is the configured
+               reliable rate (160ms); slowest (200ms) is empirically less
+               reliable for SYN/SYN_ACK round-trips. Going to floor keeps
+               both cams convergent (peer hits this same recovery and lands
+               at floor too) without sacrificing decode quality. Previous
+               behavior (force slowest) caused split-brain divergence: cam1
+               (recovered) at 200ms vs cam2 (fresh monocal) at 160ms could
+               never decode each other. */
+            apply_rate(RATE_LADDER_MS[RATE_FLOOR_RUNG],
+                       RATE_FLOOR_RUNG, "split-brain-recovery");
             /* Debounce via separate timer — DO NOT touch last_valid_frame_ms
                (the grid-watchdog reads that to determine "long-idle" and
                we'd block its re-arm for another IDLE_THRESHOLD_MS). */

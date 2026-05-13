@@ -48,3 +48,12 @@ thingino-firmware/
 
 # photos
 photos/
+
+# Runtime / per-environment artifacts that change on every cal run
+host/calibration.json
+
+# Personal scratchpad
+notes.md
+
+# Local diagrams / sketches (not part of the source of truth)
+diagrams/

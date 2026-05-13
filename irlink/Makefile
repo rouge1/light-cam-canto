@@ -37,14 +37,16 @@ deploy: irlink
 	scp -O cgi/grid-deltas.cgi root@dacam2:/var/www/x/grid-deltas.cgi
 	scp -O cgi/logread.cgi    root@dacam1:/var/www/x/logread.cgi
 	scp -O cgi/logread.cgi    root@dacam2:/var/www/x/logread.cgi
+	scp -O cgi/all-status.cgi root@dacam1:/var/www/x/all-status.cgi
+	scp -O cgi/all-status.cgi root@dacam2:/var/www/x/all-status.cgi
 	@# Monocal CGIs ship to cam2 ONLY — cam2 is the requestor (laptop-tethered).
 	@# cam1 is responder; its monocal handling is in the irlink binary itself.
 	scp -O cgi/monocal-trigger.cgi root@dacam2:/var/www/x/monocal-trigger.cgi
 	scp -O cgi/monocal-status.cgi  root@dacam2:/var/www/x/monocal-status.cgi
 	@# Webserver runs as www-data — needs world-readable + executable.
 	@# Mode MUST be 755, not just +x — uhttpd serves mode 700 as 403.
-	-ssh -o ConnectTimeout=5 root@dacam1 "chmod 755 /var/www/x/cal-status.cgi /var/www/x/events-log.cgi /var/www/x/saved-cal.cgi /var/www/x/setup.cgi /var/www/x/time-sync.cgi /var/www/x/grid-deltas.cgi /var/www/x/logread.cgi"
-	-ssh -o ConnectTimeout=5 root@dacam2 "chmod 755 /var/www/x/cal-status.cgi /var/www/x/events-log.cgi /var/www/x/saved-cal.cgi /var/www/x/setup.cgi /var/www/x/time-sync.cgi /var/www/x/grid-deltas.cgi /var/www/x/logread.cgi /var/www/x/monocal-trigger.cgi /var/www/x/monocal-status.cgi"
+	-ssh -o ConnectTimeout=5 root@dacam1 "chmod 755 /var/www/x/cal-status.cgi /var/www/x/events-log.cgi /var/www/x/saved-cal.cgi /var/www/x/setup.cgi /var/www/x/time-sync.cgi /var/www/x/grid-deltas.cgi /var/www/x/logread.cgi /var/www/x/all-status.cgi"
+	-ssh -o ConnectTimeout=5 root@dacam2 "chmod 755 /var/www/x/cal-status.cgi /var/www/x/events-log.cgi /var/www/x/saved-cal.cgi /var/www/x/setup.cgi /var/www/x/time-sync.cgi /var/www/x/grid-deltas.cgi /var/www/x/logread.cgi /var/www/x/all-status.cgi /var/www/x/monocal-trigger.cgi /var/www/x/monocal-status.cgi"
 
 deploy-cam1: irlink
 	-ssh -o ConnectTimeout=5 root@dacam1 "killall irlink 2>/dev/null; sleep 1" 2>/dev/null

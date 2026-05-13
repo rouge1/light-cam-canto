@@ -75,15 +75,19 @@ CAL_PID_FILE = "/tmp/liwifi-cal.pid"
 # ---------------------------------------------------------------------------
 
 _CACHE_TTL = {              # seconds — tuned per-endpoint freshness needs
-    "status":   1.0,        # state transitions drive stack pushes — keep tight
+    "status":   2.0,        # was 1.0; bumped to halve cam1's CGI hit rate.
+                            # State transitions still get caught on next poll;
+                            # the human-perceptible latency is fine at 2s.
     "ae":       2.0,
     "proc":     5.0,
-    "leds":     1.0,
+    "leds":     2.0,        # was 1.0; same rationale — LED state changes
+                            # are observed on next tick which is fine.
     "grid":     0.4,
     "snapshot": 1.0,
     "cal-info": 2.0,
     "events":   2.0,
     "monocal-status": 1.0,
+    "all":      2.0,        # single consolidated read; same freshness as status
 }
 
 _cache: dict = {}
@@ -123,10 +127,13 @@ def _cache_invalidate(*keys: str):
 # ---------------------------------------------------------------------------
 
 _PROBE_TTL = 3.0
-_PROBE_CONNECT_S = 1.0   # 0.5 was too tight on slow days — cam2 occasionally
-                          # takes ~1s for TCP handshake when uhttpd is busy,
-                          # and getting cached as "dead" makes every /api/cam2/*
-                          # fall through to placeholder for the next 3s.
+_PROBE_CONNECT_S = 2.0   # bumped 1.0 → 2.0 after observing cam1 TCP handshake
+                          # spikes to ~1.6s when its uhttpd is mid-CGI-fork.
+                          # Without it, the probe false-negative caches cam1
+                          # as "dead" for 3s, the chips flip to OFFLINE, and
+                          # the user sees a 3s-on/3s-off flicker on the page.
+                          # 2.0s catches the spikes while still fast-failing
+                          # a genuinely-unplugged cam.
 _probe_cache: dict = {}
 _probe_lock = threading.Lock()
 
@@ -260,9 +267,14 @@ def _get_font(size: int):
 
 TINY_W = 64                # 16:9-ish; recognizable as a room shape
 TINY_H = 36                #
-TINY_HEADER = bytes([0xFA, 0x01, TINY_W, TINY_H])  # magic, version, w, h
+# Wire format is now bare raster — the dimensions (TINY_W × TINY_H) and
+# format (1-bit, MSB-first, row-major) are agreed out-of-band by both
+# sides, so we don't burn 4 bytes per packet on magic+ver+w+h. The
+# decoder synthesizes the header from constants. If dimensions ever
+# change, bump both sides in lockstep (or move the version into the
+# enclosing protocol envelope, not the payload).
 TINY_RASTER_BYTES = (TINY_W * TINY_H + 7) // 8     # = 288 for 64×36
-TINY_TOTAL_BYTES = len(TINY_HEADER) + TINY_RASTER_BYTES   # = 292
+TINY_TOTAL_BYTES = TINY_RASTER_BYTES   # = 288 (was 292 with header)
 
 
 def _tiny_wireframe(jpeg_bytes: bytes,
@@ -298,15 +310,19 @@ def _tiny_wireframe(jpeg_bytes: bytes,
     # edges-on-full-res then averaging-down via LANCZOS dilutes edges
     # below threshold; doing it the other way means each edge pixel
     # in the 64×36 grid is a real (downsampled) gradient and survives.
-    # Light blur before resize denoises JPEG block artifacts.
-    blurred = src.filter(ImageFilter.GaussianBlur(radius=1.0))
+    # Pre-blur radius 2.0 (was 1.0) smears out fine JPEG/sensor texture
+    # so the edge filter sees only meaningful geometry — drops ~10% of
+    # speckle on-pixels without losing room outlines.
+    blurred = src.filter(ImageFilter.GaussianBlur(radius=2.0))
     small = blurred.resize((TINY_W, TINY_H), Image.LANCZOS)
     # Detect edges on the tiny image — far stronger relative response
     # than the full-frame approach.
     edges = small.filter(ImageFilter.FIND_EDGES)
-    # Threshold around 18 lights up real geometry (door frames, window
-    # outlines, furniture edges) without picking up image noise.
-    bw = edges.point(lambda p: 255 if p > 18 else 0, mode="L")
+    # Threshold 50 (was 18) keeps only strong gradients (door frames,
+    # window outlines, furniture silhouettes); cuts on-pixel density
+    # ~31% → ~21% so the image reads as a wireframe scene instead of
+    # a noisy gradient map.
+    bw = edges.point(lambda p: 255 if p > 50 else 0, mode="L")
 
     # OSD mask — channel-1 substream carries the per-second timestamp
     # in the top ~30 px and a `thingino` watermark in the bottom ~30 px
@@ -319,9 +335,11 @@ def _tiny_wireframe(jpeg_bytes: bytes,
 
     # Pack 8 px per byte, MSB-first, row-major. PIL's `convert("1")`
     # produces a 1-bit image; tobytes() gives the right packed bytes.
+    # No header — the dimensions live in the wire-format contract, not
+    # in the bytes (saves 4 B per packet, ~1.5% at 288 B raster).
     one_bit = bw.convert("1")
     raster_bytes = one_bit.tobytes()
-    raw_bytes = TINY_HEADER + raster_bytes
+    raw_bytes = raster_bytes
 
     # Render PNG: upscale 8× nearest-neighbor (chunky pixels = the
     # "intentional" lo-res look). Dark background, off-white "ink".
@@ -917,6 +935,28 @@ class Handler(SimpleHTTPRequestHandler):
             self._send_json(200, r)
             return
 
+        if op == "all":
+            # Single consolidated read of status+leds+ae+proc, one CGI fork
+            # on the cam. The webui poll cycle uses this to avoid 4-way
+            # serialization on cam1's single-process uhttpd. Demux happens
+            # client-side. Shape always present so the frontend can rely
+            # on `r.proc.irlink` etc. without optional-chaining everywhere.
+            r = _cam_get_or_fetch(cam, f"{cam}:all", _CACHE_TTL["all"],
+                                  client.get_all_status)
+            if r is None:
+                self._send_json(200, {
+                    "status": {},
+                    "leds":   {"ir850": None, "ir940": None},
+                    "ae":     None,
+                    "proc":   {"irlink": None, "daynightd": None, "prudynt": None},
+                })
+                return
+            # Normalize ae from int to {value: int} so it matches /api/{cam}/ae.
+            if isinstance(r.get("ae"), int):
+                r["ae"] = {"value": r["ae"]}
+            self._send_json(200, r)
+            return
+
         if op == "leds":
             r = _cam_get_or_fetch(cam, f"{cam}:leds", _CACHE_TTL["leds"],
                                   client.get_led_state)
@@ -943,9 +983,10 @@ class Handler(SimpleHTTPRequestHandler):
 
         if op in ("snapshot-tiny", "snapshot-tiny.png"):
             # Tiny 64×36 1-bit wireframe encoded for eventual IR transfer.
-            # Default returns raw bytes (~292 B) for the would-be transmit
-            # path. ?fmt=png OR the .png suffix returns an 8×-upscaled PNG
-            # for browser display in the lo-res webui card.
+            # Default returns raw bytes (288 B — bare raster, no header;
+            # dimensions are part of the wire-format contract) for the
+            # would-be transmit path. ?fmt=png OR the .png suffix returns
+            # an 8×-upscaled PNG for browser display in the lo-res webui card.
             want_png = op.endswith(".png")
             if not want_png and query:
                 qparams = dict(urllib.parse.parse_qsl(query))

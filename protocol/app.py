@@ -39,8 +39,18 @@ CAL_VISUAL_ZOOM_BYTES = CAL_VISUAL_PANEL_BYTES  # 8 bytes — single DATA frame,
 PROTOCOL_VERSION = 1
 
 MAX_DATA_PAYLOAD = 253
-MAX_SINGLE_FRAME = 16
-MAX_CHUNK_DATA = 12
+# 96-byte cap empirically verified at 160ms/sym, indoor 2-3ft, Δ≈116:
+#   - 100% byte-match at 16/32/48/64/96/128B; 192B exhausts retries with
+#     CRC failures (not DPLL drift, not buffer overflow — accumulated
+#     symbol-noise bit-flips, see protocol/CLAUDE.md "isolated symbol
+#     noise" pitfall).
+#   - 96B is the sweet spot for the 288-byte image transfer benchmark:
+#     3 frames @ ~369s each = 18.4min, vs 27.6min at 16B (33% saving).
+#   - Sits comfortably below the 128/192B failure boundary for SNR margin.
+# Note: this is the APP-LAYER chunk cap. The on-camera RX sample buffer
+# (irlink/irlink.c MAX_SAMPLES) is sized to 16384 to fit ≥128B wire time.
+MAX_SINGLE_FRAME = 96
+MAX_CHUNK_DATA = 92
 CHUNK_HEADER = 4
 
 NACK_UNKNOWN_TYPE = 0x01

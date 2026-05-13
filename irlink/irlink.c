@@ -42,7 +42,9 @@
 #define ROI_CONFIG_PATH     "/run/prudynt/roi_config"
 #define ROI_PATH            "/run/prudynt/brightness_roi"
 #define POLL_INTERVAL_US    5000
-#define MAX_SAMPLES         8192
+#define MAX_SAMPLES         16384  /* ~15 min RX cap at 18 fps; was 8192
+                                      (~7.5 min) which truncated payloads
+                                      ≥128 B at 160 ms/sym mid-frame */
 #define MAX_SYMBOLS         4096
 #define MAX_PAYLOAD         255
 #define SETTLE_MS           400     /* quiet time to detect end of TX (longer = fewer false splits) */
@@ -244,6 +246,49 @@ static void sighandler(int sig)
 {
     (void)sig;
     running = 0;
+}
+
+/* forward decls — these are all defined later in the file but used by
+   prof_mark / status_on_exit which appear up here. */
+static void status_set(const char *state, const char *event);
+static int64_t now_ms(void);
+static int64_t status_started_ms;  /* tentative; real definition further down */
+
+/* ================================================================
+ *  Profiler — emits PROF lines on stderr with absolute (since irlink
+ *  launch) and relative (since last PROF) ms deltas. Compiled in
+ *  unconditionally because it's tiny; turn off by not parsing the
+ *  PROF: lines on the laptop side. status_started_ms is set in main()
+ *  before the first prof_mark could fire, so the "+ms" is always
+ *  meaningful.
+ * ================================================================ */
+static int64_t prof_last_ms = 0;
+static void prof_mark(const char *tag)
+{
+    int64_t now = now_ms();
+    int64_t since_start = now - status_started_ms;
+    int64_t since_last  = (prof_last_ms == 0) ? 0 : (now - prof_last_ms);
+    fprintf(stderr, "PROF +%lldms (+%lldms): %s\n",
+            (long long)since_start, (long long)since_last, tag);
+    prof_last_ms = now;
+}
+
+/* atexit() handler: leave /run/irlink-status.json in a sane state so
+   the webui doesn't show stale in-flight state (e.g. "send/connected"
+   from a HELLO test) after irlink has actually exited. Without this,
+   the JSON keeps the last state forever and only the proc.irlink=0
+   sentinel in the all-status CGI keeps the webui honest — fine, but
+   confuses anyone reading the JSON directly. Fires on normal return
+   and on SIGTERM (sighandler sets running=0, main loop exits, atexit
+   runs); does NOT fire on SIGKILL (use this for `daemon-listen` kills
+   which currently need `kill -9`). */
+static void status_on_exit(void)
+{
+    /* status_set takes the same mutex as the heartbeat thread; safe
+       to call here because the heartbeat thread is daemonized and
+       libc's atexit happens after all other threads are gone in
+       practice (and even if not, the mutex serializes us). */
+    status_set("exited", "irlink stopped");
 }
 
 /* ---- CRC-8/CCITT ---- */
@@ -2870,6 +2915,13 @@ static void *rx_thread(void *arg)
                     if (msg.msg_type == MSG_DATA) {
                         send_message(MSG_ACK, msg.seq, NULL, 0);
                         last_valid_frame_ms = now_ms();
+                        {
+                            char ev[STATUS_EVENT_LEN];
+                            snprintf(ev, sizeof(ev),
+                                     "RX DATA seq=%d len=%d; ACKed",
+                                     msg.seq, msg.data_len);
+                            status_set("data_recv", ev);
+                        }
                     } else if (msg.msg_type == MSG_PING) {
                         send_message(MSG_PONG, 0, NULL, 0);
                         last_valid_frame_ms = now_ms();
@@ -3027,17 +3079,23 @@ static int do_connect(void)
     fprintf(stderr, "PROTO: initiating connection (SYN)...\n");
 
     for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        prof_mark("do_connect: SYN TX start");
         send_message(MSG_SYN, 0, NULL, 0);
+        prof_mark("do_connect: SYN TX done");
 
         fprintf(stderr, "PROTO: waiting for SYN_ACK...\n");
         rx_message_t reply;
+        prof_mark("do_connect: SYN_ACK wait start");
         if (wait_for_msg(MSG_SYN_ACK, &reply, ack_timeout_ms) == 0) {
+            prof_mark("do_connect: SYN_ACK received");
             fprintf(stderr, "PROTO: got SYN_ACK! Sending ACK...\n");
             send_message(MSG_ACK, 0, NULL, 0);
+            prof_mark("do_connect: final ACK TX done");
             fprintf(stderr, "PROTO: connected!\n");
             status_set("connected", "got SYN_ACK; sent ACK");
             return 0;
         }
+        prof_mark("do_connect: SYN_ACK timeout");
         fprintf(stderr, "PROTO: SYN_ACK timeout, retry %d/%d\n",
                 attempt + 1, MAX_RETRIES);
         status_set("connecting", "SYN_ACK timeout, retrying");
@@ -3188,13 +3246,34 @@ static int do_send_bytes(const uint8_t *data, int len)
 
     for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
         if (attempt > 0) retransmit_count++;
+        {
+            char ev[STATUS_EVENT_LEN];
+            snprintf(ev, sizeof(ev),
+                     "TX DATA seq=%d len=%d%s",
+                     seq, len, attempt > 0 ? " (retry)" : "");
+            status_set("sending_data", ev);
+        }
+        prof_mark("do_send_bytes: DATA TX start");
         send_message(MSG_DATA, seq, data, len);
+        prof_mark("do_send_bytes: DATA TX done");
 
         fprintf(stderr, "PROTO: waiting for ACK seq=%d...\n", seq);
+        {
+            char ev[STATUS_EVENT_LEN];
+            snprintf(ev, sizeof(ev), "waiting for ACK seq=%d", seq);
+            status_set("data_ack_wait", ev);
+        }
         rx_message_t reply;
+        prof_mark("do_send_bytes: ACK wait start");
         if (wait_for_msg(MSG_ACK, &reply, ack_timeout_ms) == 0) {
+            prof_mark("do_send_bytes: ACK received");
             if (reply.seq == seq) {
                 fprintf(stderr, "PROTO: ACK received for seq=%d\n", seq);
+                {
+                    char ev[STATUS_EVENT_LEN];
+                    snprintf(ev, sizeof(ev), "ACK received for seq=%d", seq);
+                    status_set("connected", ev);
+                }
                 seq++;
                 success_at_rate++;
                 fail_at_rate = 0;
@@ -3211,6 +3290,12 @@ static int do_send_bytes(const uint8_t *data, int len)
     }
 
     fprintf(stderr, "PROTO: send failed after %d retries\n", MAX_RETRIES);
+    {
+        char ev[STATUS_EVENT_LEN];
+        snprintf(ev, sizeof(ev),
+                 "no ACK for seq=%d after %d retries", seq, MAX_RETRIES);
+        status_set("tx_failed", ev);
+    }
     fail_at_rate++;
     success_at_rate = 0;
     maybe_fallback_down();
@@ -3895,6 +3980,19 @@ static int daemon_mode(int is_listener)
             if (strcmp(status_state, "listening") != 0)
                 status_set("listening", "handler returned; ready");
         }
+
+        /* Auto-revert `data_recv` back to `listening` after a short
+           visibility window. rx_thread sets `data_recv` asynchronously
+           when it auto-ACKs a peer DATA frame — main thread never sees
+           those, so without this revert the webui would show
+           "got data from peer" sticky until the next non-DATA event
+           (could be hours). 1500ms is long enough for the 2s webui
+           poll to catch it at least once. */
+        if (strcmp(status_state, "data_recv") == 0
+            && status_event_ms > 0
+            && now_ms() - status_event_ms > 1500) {
+            status_set("listening", "ready for next peer");
+        }
     }
 
     pthread_join(rx_tid, NULL);
@@ -3917,6 +4015,7 @@ int main(int argc, char *argv[])
         status_mode[sizeof(status_mode) - 1] = '\0';
     }
     status_set("starting", "irlink launched");
+    atexit(status_on_exit);
 
     /* Heartbeat: 1 Hz status re-write so ts_ms ticks even in steady states.
        Detached — terminates implicitly when running=0 + process exit. */
@@ -4268,20 +4367,31 @@ int main(int argc, char *argv[])
             return 1;
         }
 
+        prof_mark("send: ae_freeze=1 + 1s settle");
         set_ae_freeze(1);
         usleep(1000000); /* 1s AE settle */
+        prof_mark("send: settle done; spawning rx_thread");
 
         /* Start RX, connect, send, done */
         pthread_t rx_tid;
         pthread_create(&rx_tid, NULL, rx_thread, NULL);
 
-        if (do_connect() == 0) {
+        prof_mark("send: before do_connect (handshake start)");
+        int connect_rc = do_connect();
+        prof_mark(connect_rc == 0 ? "send: handshake complete"
+                                  : "send: handshake FAILED");
+        if (connect_rc == 0) {
+            prof_mark("send: before do_send (DATA TX + ACK wait)");
             do_send(text);
+            prof_mark("send: do_send returned");
         }
 
         running = 0;
+        prof_mark("send: running=0; joining rx_thread");
         pthread_join(rx_tid, NULL);
+        prof_mark("send: rx_thread joined; ae_freeze=0");
         set_ae_freeze(0);
+        prof_mark("send: ae thawed; returning from main");
         return 0;
     }
 

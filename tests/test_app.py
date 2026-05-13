@@ -71,10 +71,10 @@ def test_cal_visual_roundtrip():
 
 
 def test_cal_visual_fits_single_frame():
-    """14-byte body + 1-byte type = 15 bytes total, ≤ MAX_SINGLE_FRAME (16)."""
+    """14-byte body + 1-byte type = 15 bytes total, ≤ MAX_SINGLE_FRAME."""
     zoom = b"\xAB" * CAL_VISUAL_ZOOM_BYTES
     b = pack_cal_visual(305, 168, 251, 240, zoom)
-    assert len(b) <= MAX_SINGLE_FRAME, f"CAL_VISUAL is {len(b)}B, must fit 16B"
+    assert len(b) <= MAX_SINGLE_FRAME, f"CAL_VISUAL is {len(b)}B, must fit {MAX_SINGLE_FRAME}B"
 
 
 def test_cal_visual_wrong_zoom_size_raises():
@@ -206,24 +206,26 @@ def test_fragment_small_payload_one_chunk():
 
 
 def test_reassemble_missing_chunk_raises():
-    chunks = fragment(APP_TEXT, b"X" * 40)
+    # Force multi-chunk by passing a small max_chunk; the test is about
+    # missing-chunk handling, not the production chunk size.
+    chunks = fragment(APP_TEXT, b"X" * 40, max_chunk=12)
     del chunks[2]
     with pytest.raises(ValueError, match="missing chunks"):
         reassemble(chunks)
 
 
 def test_reassemble_mismatched_msg_id_raises():
-    a = fragment(APP_TEXT, b"X" * 40, msg_id=1)
-    b = fragment(APP_TEXT, b"Y" * 40, msg_id=2)
+    a = fragment(APP_TEXT, b"X" * 40, msg_id=1, max_chunk=12)
+    b = fragment(APP_TEXT, b"Y" * 40, msg_id=2, max_chunk=12)
     mixed = a[:2] + b[2:]
     with pytest.raises(ValueError, match="inconsistent msg_id"):
         reassemble(mixed)
 
 
 def test_fragment_chunk_budget_assertion():
-    # If someone tries max_chunk > 12, function rejects (would bust budget)
+    # If someone tries max_chunk > MAX_CHUNK_DATA, function rejects.
     with pytest.raises(ValueError, match="max_chunk"):
-        fragment(APP_TEXT, b"X" * 40, max_chunk=13)
+        fragment(APP_TEXT, b"X" * 40, max_chunk=MAX_CHUNK_DATA + 1)
 
 
 # ---------- Chunk-ACK bitmap ----------

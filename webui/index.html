@@ -341,13 +341,9 @@ main {
   background: linear-gradient(180deg, rgba(108,242,255,0.26) 0%, rgba(108,242,255,0.06) 100%);
 }
 .big-cal-btn.monocal:active { box-shadow: 0 2px 0 #003a45; }
-.big-cal-btn.monocal.running {
+.big-cal-btn.monocal.firing {
   box-shadow: 0 4px 0 #003a45, 0 0 24px rgba(108,242,255,0.3);
-  animation: monocal-running-pulse 1.6s ease-in-out infinite;
-}
-@keyframes monocal-running-pulse {
-  0%, 100% { box-shadow: 0 4px 0 #003a45, 0 0 24px rgba(108,242,255,0.3); }
-  50%      { box-shadow: 0 4px 0 #003a45, 0 0 36px rgba(108,242,255,0.6); }
+  opacity: 0.85;
 }
 .big-cal-btn.monocal.done-ok  { border-color: var(--cyan); color: var(--cyan); }
 .big-cal-btn.monocal.done-err { border-color: var(--red); color: var(--red); box-shadow: 0 4px 0 #2a0000; }
@@ -445,7 +441,7 @@ main {
 .chip:not(.chip-hero) .chip-value { font-size: 19px; opacity: 0.9; }
 .chip-value.dim { color: var(--gray); text-shadow: none; }
 .chip-value.busy { color: var(--amber); text-shadow: 0 0 4px var(--amber); }
-.chip-value.cal { color: var(--violet); text-shadow: 0 0 4px var(--violet); }
+.chip-value.cal { color: var(--amber); text-shadow: 0 0 4px var(--amber); }
 
 .cam-last-event {
   font-family: 'VT323', monospace;
@@ -496,12 +492,12 @@ main {
   100% { transform: translateY(0); opacity: calc(1 - var(--age, 0) * 0.07); }
 }
 .event-time {
-  font-size: 13px;
+  font-size: 21px;
   color: var(--amber-dim);
   letter-spacing: 1px;
 }
 .event-body {
-  font-size: 16px;
+  font-size: 21px;
   color: var(--green);
   letter-spacing: 1px;
   word-break: break-word;
@@ -512,8 +508,8 @@ main {
 .event.listening .event-body { color: var(--green); text-shadow: 0 0 4px var(--green); }
 .event.busy      { border-left-color: var(--amber);   }
 .event.busy      .event-body { color: var(--amber); text-shadow: 0 0 4px var(--amber); }
-.event.cal       { border-left-color: var(--violet);  }
-.event.cal       .event-body { color: var(--violet); text-shadow: 0 0 4px var(--violet); }
+.event.cal       { border-left-color: var(--amber);  }
+.event.cal       .event-body { color: var(--amber); text-shadow: 0 0 4px var(--amber); }
 .event.done      { border-left-color: var(--green);   }
 .event.done      .event-body { color: var(--green); text-shadow: 0 0 4px var(--green); }
 .event.failed    { border-left-color: var(--red);     }
@@ -1024,6 +1020,59 @@ main {
   border-bottom: 2px solid var(--cyan); border-left: 2px solid var(--cyan); }
 .scope-corners span:nth-child(4) { bottom: 0; right: 0;
   border-bottom: 2px solid var(--cyan); border-right: 2px solid var(--cyan); }
+/* Placeholder shown when the cal snapshot endpoint returns 503 (no
+   cached snapshot yet — typically right after startup, before any
+   cal has run). Sized to match the 16:9 image slot so the card
+   doesn't collapse. Hidden once a real image successfully loads. */
+.cal-placeholder {
+  display: none;
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background:
+    repeating-linear-gradient(45deg,
+      rgba(0,255,65,0.05) 0,
+      rgba(0,255,65,0.05) 2px,
+      transparent 2px,
+      transparent 8px),
+    radial-gradient(ellipse at center,
+      rgba(0,40,15,0.55) 0%,
+      rgba(0,12,4,0.95) 80%);
+  color: var(--green-dim);
+  font-size: 11px;
+  letter-spacing: 3px;
+  text-align: center;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 14px;
+  text-shadow: 0 0 4px var(--green-dim);
+}
+.live-cal-card.no-image .live-cal-img { display: none; }
+.live-cal-card.no-image .cal-placeholder { display: flex; }
+.cal-placeholder-icon {
+  font-size: 38px;
+  color: var(--green-dim);
+  text-shadow: 0 0 8px var(--green-dim);
+  animation: placeholder-pulse 2.4s ease-in-out infinite;
+}
+.cal-placeholder-title {
+  color: var(--amber);
+  text-shadow: 0 0 5px var(--amber);
+  font-size: 12px;
+}
+.cal-placeholder-sub {
+  color: var(--gray);
+  font-size: 8px;
+  letter-spacing: 2px;
+  max-width: 80%;
+  line-height: 1.6;
+}
+@keyframes placeholder-pulse {
+  0%, 100% { opacity: 0.35; }
+  50%      { opacity: 0.9;  }
+}
+
 /* Channel + LIVE badge on the upper-right of each card */
 .scope-badge {
   position: absolute;
@@ -1306,6 +1355,11 @@ main {
           <div class="scope-corners"><span></span><span></span><span></span><span></span></div>
           <img class="live-cal-img" id="live-cam1-img" alt="cam1 sees cam2"
                src="/api/cam1/snapshot-annotated">
+          <div class="cal-placeholder">
+            <div class="cal-placeholder-icon">▦</div>
+            <div class="cal-placeholder-title">NO SNAPSHOT</div>
+            <div class="cal-placeholder-sub">RUN CAL OR MONOCAL<br>TO POPULATE CAM1</div>
+          </div>
           <div class="flip-toggle" data-cam="cam1"
                title="cam1: hi-res annotated JPEG ↔ tiny wireframe (~292 B)">
             <span class="flip-toggle-side active" data-mode="hires">HI</span>
@@ -1317,6 +1371,11 @@ main {
           <div class="scope-corners"><span></span><span></span><span></span><span></span></div>
           <img class="live-cal-img" id="live-cam2-img" alt="cam2 sees cam1"
                src="/api/cam2/snapshot-annotated">
+          <div class="cal-placeholder">
+            <div class="cal-placeholder-icon">▦</div>
+            <div class="cal-placeholder-title">NO SNAPSHOT</div>
+            <div class="cal-placeholder-sub">RUN CAL OR MONOCAL<br>TO POPULATE CAM2</div>
+          </div>
           <div class="flip-toggle" data-cam="cam2"
                title="cam2: hi-res annotated JPEG ↔ tiny wireframe (~292 B)">
             <span class="flip-toggle-side active" data-mode="hires">HI</span>
@@ -1402,18 +1461,26 @@ fetchJSON('/api/info').then(info => {
 // PER-CAM POLL LOOPS — independent, diff-driven event push
 // ============================================================
 const STACK_MAX = 30;
-const POLL_INTERVAL_MS = 1000;
+const POLL_INTERVAL_MS = 2000;     // was 1000 — cam1's uhttpd is single-process
+                                   // on slow MIPS, polling at 1Hz × 2 cams × 4
+                                   // endpoints saturated it. 2s feels nearly
+                                   // identical for state-transition events
+                                   // (which themselves take seconds to occur)
+                                   // and roughly halves cam load.
 const PHOSPHOR_AGE_MAX = 8;        // 8 pushes × 7% = ~56% max fade
 
 const CAM_STATE = {
-  cam1: { prevState: null, irOn: false, stackHasEmpty: true },
-  cam2: { prevState: null, irOn: false, stackHasEmpty: true },
+  cam1: { prevState: null, irOn: false, stackHasEmpty: true, prevCalSig: null, offlineMisses: 0 },
+  cam2: { prevState: null, irOn: false, stackHasEmpty: true, prevCalSig: null, offlineMisses: 0 },
 };
 
 function stateClass(state) {
   if (!state) return 'idle';
   if (state === 'idle' || state === 'never_run') return 'idle';
   if (state === 'listening') return 'listening';
+  // data_recv = peer DATA arrived + auto-ACKed: a success beat, not an
+  // in-progress state. Color it like 'done'.
+  if (state === 'data_recv') return 'done';
   if (state.endsWith('_done') || state === 'monocal_done') return 'done';
   if (state.endsWith('_failed') || state === 'monocal_failed') return 'failed';
   if (state.startsWith('cal_') || state.startsWith('monocal_')
@@ -1430,51 +1497,68 @@ function stateClass(state) {
    debugging since the C code logs the raw name. Unmapped states fall
    through to the raw string. */
 const STATE_LABELS = {
-  // generic
+  // === Generic / lifecycle ===
   'starting':                'starting up',
-  'listening':               'listening',
+  'listening':               'listening for peer',
   'idle':                    'idle',
+  'exited':                  'stopped',
   'never_run':               'never run',
-  'transient':               '…',
-  // handshake (responder side — cam1 receiving)
-  'connecting':              'got SYN',
-  'connected':               'handshake done',
-  // handshake (initiator side — cam2 sending)
-  'handshaking':             'handshaking',
-  'syn_wait':                'waiting for SYN-ACK',
-  'ack_wait':                'waiting for ACK',
-  // regular cal (cam1 holds, cam2 scans)
+  'transient':               '… updating …',
+  // === Handshake (link setup) ===
+  // `connecting` and `handshaking` both mean "actively negotiating" —
+  // direction-agnostic label, since `connecting` is emitted on BOTH
+  // sides (cam1 on SYN-received, cam2 on SYN-ACK-retry). Old label
+  // "got SYN" was correct only on cam1; misleading on cam2.
+  'handshaking':             'negotiating link',
+  'connecting':              'negotiating link',
+  'syn_wait':                'waiting for peer reply',
+  'ack_wait':                'waiting for peer ack',
+  // `connected` is the steady state between exchanges — link is up,
+  // no DATA in flight. During a send the state machine cycles
+  // `connected` → `sending_data` → `data_ack_wait` → `connected`,
+  // with `tx_failed` as the giving-up terminal. On the RX side
+  // `data_recv` fires when a peer DATA arrives and is auto-ACKed.
+  'connected':               'link up · ready',
+  // === Data exchange (mid-link) ===
+  'sending_data':            'sending data',
+  'data_ack_wait':           'waiting for data ack',
+  'data_recv':               'got data from peer',
+  'tx_failed':               'send failed (no ack)',
+  // === Regular cal (this side holds, peer scans) ===
+  'cal_scanning':            'scanning peer LEDs',
+  'cal_holding':             'LEDs on for peer scan',
   'cal_holding_off':         'LEDs off (baseline)',
-  'cal_holding_on':          'LEDs on for peer',
-  'cal_awaiting_done':       'waiting for result',
-  'cal_sending_done':        'sending result',
-  'cal_done':                'cal complete',
-  'cal_failed':              'cal failed',
-  // monocal RESPONDER (cam1 = scanner)
+  'cal_holding_on':          'LEDs on for peer scan',
+  'cal_awaiting_done':       'waiting for peer result',
+  'cal_done_recv':           'got peer result',
+  'cal_sending_done':        'sending result to peer',
+  'cal_done':                'calibration complete',
+  'cal_failed':              'calibration failed',
+  // === Monocal — responder (this side scans peer LEDs) ===
   'monocal_resp_ack':        'got cal request',
   'monocal_resp_scan':       'scanning peer LEDs',
-  'monocal_resp_done':       'sending result',
+  'monocal_resp_done':       'sending result to peer',
   'monocal_resp_failed':     'scan failed',
-  // monocal REQUESTOR (cam2 = holder)
+  // === Monocal — requestor (this side holds LEDs for peer) ===
   'monocal_req':             'sending cal request',
-  'monocal_ack_wait':        'waiting for cal-ack',
+  'monocal_ack_wait':        'waiting for peer ack',
   'monocal_holding_off':     'LEDs off (baseline)',
-  'monocal_holding_on':      'LEDs on (peer scanning)',
-  'monocal_awaiting_done':   'waiting for result',
-  'monocal_done':            'cal complete',
-  'monocal_failed':          'cal failed',
-  // watchdog (autonomous re-cal)
-  'watchdog_refining':       'auto-cal: scanning',
-  'watchdog_wait_falling':   'auto-cal: peer LEDs draining',
-  'watchdog_hold':           'auto-cal: holding for peer',
-  // bootstrap fallback (when protocol path can't decode)
-  'bootstrap_fallback':      'switching to fallback',
-  'bootstrap_hold':          'fallback: holding LEDs',
+  'monocal_holding_on':      'LEDs on for peer scan',
+  'monocal_awaiting_done':   'waiting for peer result',
+  'monocal_done':            'calibration complete',
+  'monocal_failed':          'calibration failed',
+  // === Watchdog (autonomous re-cal on cam1) ===
+  'watchdog_refining':       'auto re-cal: scanning',
+  'watchdog_wait_falling':   'auto re-cal: peer LEDs cooling',
+  'watchdog_hold':           'auto re-cal: LEDs on for peer',
+  // === Bootstrap fallback (when protocol path can't decode) ===
+  'bootstrap_fallback':      'switching to fallback path',
+  'bootstrap_hold':          'fallback: LEDs on for peer',
   'bootstrap_search':        'fallback: searching for peer',
-  // search (cam2 do_search during bootstrap)
-  'search_refining':         'fallback: refining pixel',
-  'search_done':             'fallback: search complete',
-  'search_timeout':          'fallback: timed out',
+  // === Search (cam2 do_search during bootstrap) ===
+  'search_refining':         'fallback: refining peer position',
+  'search_done':             'fallback: peer found',
+  'search_timeout':          'fallback: peer not found',
 };
 
 function humanState(s) {
@@ -1582,23 +1666,31 @@ function setLastEvent(cam, text) {
 }
 
 async function pollOnce(cam) {
-  // proc endpoint distinguishes "cam unreachable" (irlink:null) from
-  // "cam up but irlink not running" (irlink:0). Without this we conflate
-  // both into "—" and the user can't tell whether cam2 is offline or
-  // just idle waiting for a trigger.
-  const [status, leds, ae, proc] = await Promise.all([
-    fetchJSON(`/api/${cam}/status`),
-    fetchJSON(`/api/${cam}/leds`),
-    fetchJSON(`/api/${cam}/ae`),
-    fetchJSON(`/api/${cam}/proc`),
-  ]);
+  // ONE consolidated fetch per cycle — /api/{cam}/all is a single-fork
+  // CGI on the cam that returns {status, leds, ae, proc}. Previously
+  // we fired 4 parallel /api/{cam}/{status,leds,ae,proc} requests which
+  // serialized on cam1's single-process busybox uhttpd, causing OFFLINE
+  // flicker under load. proc.irlink still distinguishes "cam unreachable"
+  // (null) from "cam up, irlink not running" (0).
+  const all = await fetchJSON(`/api/${cam}/all`);
+  const status = (all && all.status) || null;
+  const leds   = (all && all.leds)   || null;
+  const ae     = (all && all.ae)     || null;
+  const proc   = (all && all.proc)   || null;
 
   const col = document.getElementById(cam + '-col');
   const art = document.getElementById(cam + '-art');
   const cs = CAM_STATE[cam];
 
-  const camReachable = proc && proc.irlink !== null && proc.irlink !== undefined;
-  const irlinkRunning = camReachable && proc.irlink >= 1;
+  const probeOk = proc && proc.irlink !== null && proc.irlink !== undefined;
+  // Debounce OFFLINE: a single failed /api/{cam}/proc (TCP probe miss or
+  // transient uhttpd saturation) is not enough to flip the UI. Require
+  // 2 consecutive misses before declaring offline; any success resets.
+  // Without this, sporadic SYN drops under load make cam1 flicker on/off.
+  if (probeOk) cs.offlineMisses = 0;
+  else         cs.offlineMisses = (cs.offlineMisses || 0) + 1;
+  const camReachable = probeOk || cs.offlineMisses < 3;
+  const irlinkRunning = probeOk && proc.irlink >= 1;
   const hasStatus = status && Object.keys(status).length > 0;
 
   if (!camReachable) {
@@ -1647,6 +1739,20 @@ async function pollOnce(cam) {
       cs.prevState = state;
     }
 
+    // Cal-pixel-change detector: refresh this cam's annotated/tiny image
+    // only when the saved cal actually changed (RUN CAL, MONOCAL,
+    // watchdog re-cal). Image is pinned to the markup src by default and
+    // doesn't auto-refresh otherwise — these images are calibration
+    // snapshots, not live video, so polling them every few seconds was
+    // wasted JPEG pulls + PIL re-encodes that piled up against cam1's
+    // slow uhttpd.
+    const peak = status.cal && status.cal.peak ? status.cal.peak : null;
+    const sig = peak ? `${peak[0]},${peak[1]},${status.cal.peak_brightness}` : null;
+    if (cs.prevCalSig !== null && sig !== null && cs.prevCalSig !== sig) {
+      refreshCalImageFor(cam);
+    }
+    if (sig !== null) cs.prevCalSig = sig;
+
     const busy = state !== 'listening' && state !== 'idle' && state !== '—';
     art.classList.toggle('busy', busy);
   }
@@ -1679,6 +1785,9 @@ async function pollLoop(cam) {
 // directional fwd/rev animations.
 // ============================================================
 async function beamLoop() {
+  // 800ms cadence — the beam reads from CAM_STATE that pollOnce updates,
+  // so this doesn't add cam-side load. Could be tighter for animation
+  // feel but 800ms is plenty for the per-2s polling underneath.
   while (true) {
     const cam1On = CAM_STATE.cam1.irOn;
     const cam2On = CAM_STATE.cam2.irOn;
@@ -1687,7 +1796,7 @@ async function beamLoop() {
     document.getElementById('beam-rev').classList.toggle('active', cam2On);
     document.getElementById('beam-rev-label').classList.toggle('active', cam2On);
     document.getElementById('beam-carrier').classList.toggle('live', cam1On || cam2On);
-    await sleep(400);
+    await sleep(800);
   }
 }
 
@@ -1721,6 +1830,13 @@ async function pollCalStatus() {
       pidEl.textContent = '—'; pidEl.classList.add('dim');
       pidEl.classList.remove('live');
       refreshCalViewer();
+      // RUN CAL writes the laptop's host/calibration.json AND restarts
+      // cam1's daemon-listen with new --pixel. The cam saved-cal files
+      // don't auto-update from RUN CAL, but the cal.peak field in status
+      // does — pollOnce's cal-change detector will catch any cam-side
+      // refresh. Refresh both images defensively here too in case the
+      // detector misses the transient (e.g. status cached during run).
+      refreshLiveCal();
     }
     await sleep(2000);
   }
@@ -1744,41 +1860,21 @@ runBtn.addEventListener('click', async () => {
 });
 
 // ============================================================
-// MONOCAL — single POST to cam2; cam2's column polling reflects progress
+// MONOCAL — fire-and-forget POST. Feedback is visual via the camera
+// cards (cam1's IR ring lights up while scanning) and the cal image
+// auto-refresh in pollOnce's cal.peak detector. No status polling.
 // ============================================================
-async function pollMonocalStatus() {
-  while (true) {
-    const s = await fetchJSON('/api/cal/monocal-status');
-    const cam2 = (s && s.cam2) || {};
-    const state = cam2.state;
-    const inflight = state && !['transient', 'never_run', 'monocal_done',
-                                 'monocal_failed', 'idle', 'listening'].includes(state);
-    if (inflight) {
-      monocalBtn.classList.add('running');
-      monocalBtn.classList.remove('done-ok', 'done-err');
-      monocalBtn.querySelector('.big-cal-icon').textContent = '⟳';
-      monocalBtn.querySelector('.big-cal-label').textContent = 'MONOCAL RUNNING…';
-    } else if (monocalBtn.classList.contains('running')) {
-      monocalBtn.classList.remove('running');
-      monocalBtn.querySelector('.big-cal-icon').textContent = '▶';
-      monocalBtn.querySelector('.big-cal-label').textContent = 'MONOCAL CAM1';
-      if (state === 'monocal_done') monocalBtn.classList.add('done-ok');
-      else if (state === 'monocal_failed') monocalBtn.classList.add('done-err');
-    }
-    await sleep(1500);
-  }
-}
-pollMonocalStatus();
-
 monocalBtn.addEventListener('click', async () => {
-  if (monocalBtn.classList.contains('running')) return;
+  if (monocalBtn.classList.contains('firing')) return;
   monocalBtn.classList.remove('done-ok', 'done-err');
+  monocalBtn.classList.add('firing');
   monocalBtn.querySelector('.big-cal-label').textContent = 'TRIGGERING…';
   const r = await fetchJSON('/api/cal/monocal', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: '',
   });
+  monocalBtn.classList.remove('firing');
   if (!r || !r.ok) {
     monocalBtn.classList.add('done-err');
     monocalBtn.querySelector('.big-cal-label').textContent =
@@ -1787,6 +1883,13 @@ monocalBtn.addEventListener('click', async () => {
       monocalBtn.classList.remove('done-err');
       monocalBtn.querySelector('.big-cal-label').textContent = 'MONOCAL CAM1';
     }, 4000);
+  } else {
+    monocalBtn.classList.add('done-ok');
+    monocalBtn.querySelector('.big-cal-label').textContent = 'FIRED ✓';
+    setTimeout(() => {
+      monocalBtn.classList.remove('done-ok');
+      monocalBtn.querySelector('.big-cal-label').textContent = 'MONOCAL CAM1';
+    }, 1500);
   }
 });
 
@@ -1852,12 +1955,34 @@ function calImageUrlFor(cam) {
     : `/api/${cam}/snapshot-annotated`;
 }
 
-function refreshLiveCal() {
-  const t = Date.now();
-  document.getElementById('live-cam1-img').src = `${calImageUrlFor('cam1')}?t=${t}`;
-  document.getElementById('live-cam2-img').src = `${calImageUrlFor('cam2')}?t=${t}`;
+function setCalImageState(cam, ok) {
+  // Toggle the .no-image class on the card so the placeholder takes
+  // over when the snapshot endpoint returned 503 (no cache yet).
+  const card = document.getElementById(`live-${cam}-card`);
+  if (card) card.classList.toggle('no-image', !ok);
 }
-setInterval(refreshLiveCal, 4000);
+
+function refreshCalImageFor(cam) {
+  // Per-cam refresh (used by the cal-change detector in pollOnce, the
+  // flip-toggle, and the cal-completion hooks). Cache-busts via ?t=
+  // so the browser doesn't serve a stale cached PNG/JPEG.
+  const el = document.getElementById(`live-${cam}-img`);
+  if (!el) return;
+  el.onload  = () => setCalImageState(cam, true);
+  el.onerror = () => setCalImageState(cam, false);
+  el.src = `${calImageUrlFor(cam)}?t=${Date.now()}`;
+}
+
+function refreshLiveCal() {
+  refreshCalImageFor('cam1');
+  refreshCalImageFor('cam2');
+}
+// No setInterval — these images are cal snapshots, not live video. They
+// only change when:
+//   1. RUN CAL completes (cal_procedure subprocess exits)
+//   2. MONOCAL or watchdog re-cal updates cam.cal.peak (caught by the
+//      per-cam cal-pixel-change detector in pollOnce above)
+//   3. User flips HI/LO (the toggle click already triggers refresh)
 
 // Reflect the per-cam mode in the DOM: card gets a .lores class for
 // the pixelated rendering hint, and the matching toggle side glows.

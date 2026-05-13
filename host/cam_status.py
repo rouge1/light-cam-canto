@@ -72,7 +72,7 @@ class CamStatusClient:
             return self._login()
         return True
 
-    def _fetch(self, path: str, timeout: float = 3.0,
+    def _fetch(self, path: str, timeout: float = 5.0,
                retry_login: bool = True) -> Optional[str]:
         """Authenticated GET against `http://<ip><path>`, returning the
         response body as text. Returns None on timeout, empty body, HTML
@@ -190,6 +190,23 @@ class CamStatusClient:
     def get(self) -> Optional[dict]:
         """Return parsed irlink status JSON or None on failure."""
         body = self._fetch("/x/cal-status.cgi")
+        if body is None:
+            return None
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            return None
+
+    def get_all_status(self) -> Optional[dict]:
+        """One-shot consolidated read: status + leds + ae + proc.
+
+        Replaces 4 concurrent CGI hits (cal-status / gpio-state / ae-freeze /
+        proc-status) with a single fork on the cam, which the webui poll
+        cycle uses. cam1's busybox uhttpd is single-process, so 4 parallel
+        CGIs serialize on the cam regardless of laptop parallelism. Shape
+        matches what each individual endpoint returns so consumers can
+        demux directly. Returns None on any transport / parse failure."""
+        body = self._fetch("/x/all-status.cgi")
         if body is None:
             return None
         try:

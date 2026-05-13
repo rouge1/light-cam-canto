@@ -88,6 +88,8 @@ _CACHE_TTL = {              # seconds — tuned per-endpoint freshness needs
     "events":   2.0,
     "monocal-status": 1.0,
     "all":      2.0,        # single consolidated read; same freshness as status
+    "health":   10.0,       # uptime/load/mem/disk drift slowly; 10s is plenty
+                            # and cheap on cam1's single-process uhttpd.
 }
 
 _cache: dict = {}
@@ -239,6 +241,19 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 _FONT_CACHE: dict = {}
+
+
+def _resolve_cal_delta(saved_cal: dict | None, status: dict | None):
+    """Best-available grid_delta for the bottom info bar of an annotated
+    snapshot. Mirrors the precedence used to pick `sp` (saved_cal first,
+    then runtime status). Returns int or None."""
+    if isinstance(saved_cal, dict) and isinstance(saved_cal.get("grid_delta"), int):
+        return saved_cal["grid_delta"]
+    if isinstance(status, dict):
+        cal = status.get("cal")
+        if isinstance(cal, dict) and isinstance(cal.get("peak_delta"), int):
+            return cal["peak_delta"]
+    return None
 
 
 def _get_font(size: int):
@@ -426,11 +441,20 @@ def _tiny_wireframe(jpeg_bytes: bytes,
     yellow = (255, 210, 74, 255)
     pixel_str = f"pixel: [{sp[0]}, {sp[1]}]"
     cal_str   = f"cal'd: {cal_time_str}"
+    delta = _resolve_cal_delta(saved_cal, status)
+    delta_str = f"Δ{delta}" if delta is not None else ""
     font = _get_font(15)
     y0 = out_h - info_h + 6
     line_h = 18
     draw3.text((8, y0),            pixel_str, fill=yellow, font=font)
     draw3.text((8, y0 + line_h),   cal_str,   fill=yellow, font=font)
+    if delta_str:
+        try:
+            tb = draw3.textbbox((0, 0), pixel_str, font=font)
+            dx = 8 + (tb[2] - tb[0]) + 14
+        except AttributeError:
+            dx = 8 + 9 * len(pixel_str) + 14
+        draw3.text((dx, y0), delta_str, fill=yellow, font=font)
 
     out_buf = io.BytesIO()
     out.save(out_buf, format="PNG", optimize=True)
@@ -559,11 +583,20 @@ def _faxify_snapshot(jpeg_bytes: bytes,
     white = (240, 240, 240, 255)
     pixel_str = f"pixel: [{sp[0]}, {sp[1]}]"
     cal_str   = f"cal'd: {cal_time_str}"
+    delta = _resolve_cal_delta(saved_cal, status)
+    delta_str = f"Δ{delta}" if delta is not None else ""
     font = _get_font(15)
     y0 = h - info_h + 6
     line_h = 18
     draw2.text((8, y0),            pixel_str, fill=white, font=font)
     draw2.text((8, y0 + line_h),   cal_str,   fill=white, font=font)
+    if delta_str:
+        try:
+            tb = draw2.textbbox((0, 0), pixel_str, font=font)
+            dx = 8 + (tb[2] - tb[0]) + 14
+        except AttributeError:
+            dx = 8 + 9 * len(pixel_str) + 14
+        draw2.text((dx, y0), delta_str, fill=white, font=font)
 
     # Top-left label — fax-style "FAX" prefix to make the artifact's
     # purpose obvious when downloaded standalone.
@@ -679,12 +712,24 @@ def _annotate_snapshot(jpeg_bytes: bytes,
     yellow = (255, 210, 74, 255)
     pixel_str = f"pixel: [{sp[0]}, {sp[1]}]"
     cal_str   = f"cal'd: {cal_time_str}"
+    delta = _resolve_cal_delta(saved_cal, status)
+    delta_str = f"Δ{delta}" if delta is not None else ""
 
     font = _get_font(15)
     y0 = h - info_h + 6
     line_h = 18
     draw2.text((8, y0),            pixel_str, fill=yellow, font=font)
     draw2.text((8, y0 + line_h),   cal_str,   fill=yellow, font=font)
+    if delta_str:
+        # Anchor delta to the right of pixel_str on the same line, with a
+        # 14px gap. textbbox gives accurate width even for proportional
+        # fonts; fall back to a fixed offset on older PIL builds.
+        try:
+            tb = draw2.textbbox((0, 0), pixel_str, font=font)
+            dx = 8 + (tb[2] - tb[0]) + 14
+        except AttributeError:
+            dx = 8 + 9 * len(pixel_str) + 14
+        draw2.text((dx, y0), delta_str, fill=yellow, font=font)
 
     # Top-left small label (CAM1 SEES CAM2 etc) — burned into the JPEG so
     # the artifact is self-describing when downloaded.
@@ -859,11 +904,23 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _handle_api_get(self, path: str, query: str = ""):
         if path == "/api/info":
-            # Cam IPs + server start epoch for the status-bar footer.
+            # Cam IPs + link type ("usb" / "wifi" / "unknown") + server
+            # start epoch for the status-bar footer and the hero-panel
+            # connection icons. Link type comes from the IP prefix:
+            # 172.16.x.x is the USB NCM subnet, 192.168.x.x is the LAN.
+            def _link_for(ip: str | None) -> str:
+                if not ip: return "unknown"
+                if ip.startswith("172.16."):   return "usb"
+                if ip.startswith("192.168."):  return "wifi"
+                return "unknown"
+            cam1_ip = CLIENTS["cam1"].ip if "cam1" in CLIENTS else None
+            cam2_ip = CLIENTS["cam2"].ip if "cam2" in CLIENTS else None
             self._send_json(200, {
                 "started_at": SERVER_STARTED_AT,
-                "cam1_ip": CLIENTS["cam1"].ip if "cam1" in CLIENTS else None,
-                "cam2_ip": CLIENTS["cam2"].ip if "cam2" in CLIENTS else None,
+                "cam1_ip": cam1_ip,
+                "cam2_ip": cam2_ip,
+                "cam1_link": _link_for(cam1_ip),
+                "cam2_link": _link_for(cam2_ip),
             })
             return
 
@@ -933,6 +990,34 @@ class Handler(SimpleHTTPRequestHandler):
                 self._send_json(200, {})
                 return
             self._send_json(200, r)
+            return
+
+        if op == "health":
+            # Bundled health check: system vitals from /x/health.cgi merged
+            # with the everything-else /x/all-status.cgi (procs/leds/ae/
+            # irlink-state) + the laptop-measured uhttpd round-trip ms for
+            # one call. Two CGI hits, cached separately. Designed to mirror
+            # the manual "health check" report — uptime, load, memory, disk,
+            # dmesg errors, processes, irlink state, uhttpd responsiveness.
+            t0 = time.monotonic()
+            vitals = _cam_get_or_fetch(cam, f"{cam}:health",
+                                       _CACHE_TTL["health"], client.get_health)
+            allst = _cam_get_or_fetch(cam, f"{cam}:all", _CACHE_TTL["all"],
+                                      client.get_all_status)
+            uhttpd_ms = int((time.monotonic() - t0) * 1000)
+            if isinstance(allst, dict) and isinstance(allst.get("ae"), int):
+                allst["ae"] = {"value": allst["ae"]}
+            self._send_json(200, {
+                "ok": vitals is not None and allst is not None,
+                "vitals": vitals or {},
+                "all":    allst or {
+                    "status": {},
+                    "leds":   {"ir850": None, "ir940": None},
+                    "ae":     None,
+                    "proc":   {"irlink": None, "daynightd": None, "prudynt": None},
+                },
+                "uhttpd_rt_ms": uhttpd_ms,
+            })
             return
 
         if op == "all":
@@ -1168,6 +1253,24 @@ class Handler(SimpleHTTPRequestHandler):
                 speed_ms = int(params.get("speed_ms", "160"))
             except (ValueError, TypeError):
                 speed_ms = 160
+
+            # Pre-flight: setup.cgi on cam2 puts it in a known IR-comm-ready
+            # state (ircut open, daynightd dead, LEDs off, ae_freeze=0,
+            # mono/night). Without this, a prior `kill -9 irlink` can leave
+            # ae_freeze=1 or LEDs stuck on, and monocal silently produces a
+            # weak/failed cal. setup is skipped only if `setup=0` is passed.
+            # cam1 is left alone — its daemon-listen has its own state mgmt
+            # and rc.local already ran setup at boot.
+            if params.get("setup", "1") != "0":
+                setup_res = cam2.run_setup(timeout=20.0)
+                if setup_res is None or not setup_res.get("ok"):
+                    self._send_json(503, {
+                        "ok": False,
+                        "error": "cam2 setup pre-flight failed",
+                        "setup": setup_res,
+                    })
+                    return
+
             result = cam2.start_monocal(coords, speed_ms=speed_ms)
             if result is None:
                 self._send_json(409, {"ok": False,

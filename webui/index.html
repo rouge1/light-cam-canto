@@ -182,6 +182,7 @@ main {
   flex-direction: column;
   align-items: center;
   gap: 8px;
+  position: relative;          /* anchor for the .cam-link badge + USB cable */
 }
 .cam-art-name {
   font-size: 14px;
@@ -194,6 +195,87 @@ main {
   color: var(--green-dim);
   letter-spacing: 1px;
 }
+
+/* ---------- Connection-type badge (top-right of each camera column) ---------- */
+/* The badge sits above the camera art, near the NAME row, showing how the
+   webui is reaching this cam right now: USB (cable trailing off the side)
+   or WiFi (three arcing bars). The artwork is two child <svg>s; CSS shows
+   exactly one based on data-link="usb"|"wifi" on the parent .cam-art-wrap. */
+.cam-link {
+  position: absolute;
+  top: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+.cam-art-wrap.left  .cam-link { right: 4px; }
+.cam-art-wrap.right .cam-link { left:  4px; }
+.cam-link svg { width: 22px; height: 22px; display: none; }
+.cam-art-wrap[data-link="wifi"] .cam-link .icon-wifi    { display: block; }
+.cam-art-wrap[data-link="usb"]  .cam-link .icon-usb     { display: block; }
+.cam-art-wrap[data-link="unknown"] .cam-link .icon-none { display: block; }
+/* WiFi bars: phosphor green with subtle pulse to read as "active radio". */
+.cam-link .icon-wifi { color: var(--green); filter: drop-shadow(0 0 3px var(--green)); }
+.cam-link .icon-wifi .arc-1 { animation: wifi-pulse 2.2s ease-in-out infinite; }
+.cam-link .icon-wifi .arc-2 { animation: wifi-pulse 2.2s ease-in-out infinite .15s; }
+.cam-link .icon-wifi .arc-3 { animation: wifi-pulse 2.2s ease-in-out infinite .30s; }
+@keyframes wifi-pulse {
+  0%, 100% { opacity: 0.45; }
+  50%      { opacity: 1.00; }
+}
+/* USB trident icon (small badge): cyan/teal to differentiate from green RF. */
+.cam-link .icon-usb { color: #6ad9ff; filter: drop-shadow(0 0 3px #6ad9ff); }
+/* "Disconnected" placeholder (rare): faint dimmed circle so the slot reserves space. */
+.cam-link .icon-none { color: #444; opacity: 0.6; }
+
+/* ---------- USB cable: trails off the camera's outer edge when on USB ---------- */
+/* CSS-only: a short curving line drawn off the side of the camera that
+   visually plugs into the body, fading out toward the page edge. Hidden
+   for wifi/unknown. Mirrored for cam1 (left) vs cam2 (right). */
+.cam-art-wrap .cam-cable { display: none; }
+.cam-art-wrap[data-link="usb"] .cam-cable {
+  display: block;
+  position: absolute;
+  bottom: 32px;           /* approx. height of cam-base — lines up at the body */
+  width: 70px;
+  height: 14px;
+  pointer-events: none;
+  z-index: 2;
+}
+.cam-art-wrap.left[data-link="usb"]  .cam-cable { right: -56px; }
+.cam-art-wrap.right[data-link="usb"] .cam-cable { left:  -56px; transform: scaleX(-1); }
+.cam-cable .cable-plug {
+  position: absolute;
+  left: 0; top: 3px;
+  width: 14px; height: 8px;
+  background: #2a2a2a;
+  border: 1px solid #4a4a4a;
+  border-right: 2px solid #6ad9ff;
+  box-shadow: 0 0 4px rgba(106,217,255,0.35);
+}
+.cam-cable .cable-plug::before {
+  /* the metallic tip going into the camera body */
+  content: '';
+  position: absolute;
+  left: -4px; top: 1px;
+  width: 4px; height: 4px;
+  background: #b8b8b8;
+}
+.cam-cable .cable-wire {
+  position: absolute;
+  left: 12px; top: 5px;
+  right: 0; height: 3px;
+  background: linear-gradient(to right,
+    #4a4a4a 0%, #4a4a4a 20%, #2a2a2a 60%, rgba(0,0,0,0) 100%);
+  border-radius: 2px;
+  /* gentle downward curve so the cable looks like it droops off the page */
+  transform-origin: left center;
+  transform: rotate(8deg);
+}
+
 
 /* ============== DOMINANT BEAM CHANNEL ============== */
 /* Lives between the two cam-art elements in the hero panel. Three parallel
@@ -1204,9 +1286,29 @@ main {
 <!-- ============== HERO PANEL — single picture: cam1 art | beam | cam2 art ============== -->
 <section class="hero-panel">
   <div class="hero-content">
-    <div class="cam-art-wrap left">
+    <div class="cam-art-wrap left" id="cam1-art-wrap" data-link="unknown">
+      <div class="cam-link" title="connection">
+        <svg class="icon-wifi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <path class="arc-3" d="M2 8.5 C 7 4, 17 4, 22 8.5"/>
+          <path class="arc-2" d="M5 12 C 8.5 9, 15.5 9, 19 12"/>
+          <path class="arc-1" d="M8 15.5 C 10 13.5, 14 13.5, 16 15.5"/>
+          <circle cx="12" cy="19" r="1.2" fill="currentColor" stroke="none"/>
+        </svg>
+        <svg class="icon-usb" viewBox="0 0 24 24" fill="currentColor">
+          <circle cx="12" cy="3" r="2"/>
+          <path d="M11 4.5 L11 14 L13 14 L13 4.5 Z"/>
+          <path d="M7 9.5 L7 14 L9 14 L9 9.5 Z M6 8.5 L10 8.5 L10 10 L6 10 Z"/>
+          <path d="M15 11.5 L15 14 L17 14 L17 11.5 Z M14 10.5 L18 10.5 L18 12 L14 12 Z" opacity="0.85"/>
+          <rect x="8" y="14" width="8" height="3.5" rx="0.5"/>
+          <rect x="10" y="17.5" width="4" height="4" rx="0.5"/>
+        </svg>
+        <svg class="icon-none" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="8" stroke-dasharray="3 3"/>
+        </svg>
+      </div>
       <div class="cam-art-name">CAM1</div>
-      <div class="cam-art-host">dacam1 · 192.168.50.113</div>
+      <div class="cam-art-host" id="cam1-host-label">dacam1 · 192.168.50.113</div>
+      <div class="cam-cable"><div class="cable-plug"></div><div class="cable-wire"></div></div>
       <div class="cam-side cam1" id="cam1-art">
         <div class="cam-shadow"></div>
         <div class="cam-top"></div>
@@ -1235,9 +1337,29 @@ main {
       <div class="beam-label reverse" id="beam-rev-label">CAM1 ◀◀◀ CAM2 · 850 / 940 NM</div>
     </div>
 
-    <div class="cam-art-wrap right">
+    <div class="cam-art-wrap right" id="cam2-art-wrap" data-link="unknown">
+      <div class="cam-link" title="connection">
+        <svg class="icon-wifi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <path class="arc-3" d="M2 8.5 C 7 4, 17 4, 22 8.5"/>
+          <path class="arc-2" d="M5 12 C 8.5 9, 15.5 9, 19 12"/>
+          <path class="arc-1" d="M8 15.5 C 10 13.5, 14 13.5, 16 15.5"/>
+          <circle cx="12" cy="19" r="1.2" fill="currentColor" stroke="none"/>
+        </svg>
+        <svg class="icon-usb" viewBox="0 0 24 24" fill="currentColor">
+          <circle cx="12" cy="3" r="2"/>
+          <path d="M11 4.5 L11 14 L13 14 L13 4.5 Z"/>
+          <path d="M7 9.5 L7 14 L9 14 L9 9.5 Z M6 8.5 L10 8.5 L10 10 L6 10 Z"/>
+          <path d="M15 11.5 L15 14 L17 14 L17 11.5 Z M14 10.5 L18 10.5 L18 12 L14 12 Z" opacity="0.85"/>
+          <rect x="8" y="14" width="8" height="3.5" rx="0.5"/>
+          <rect x="10" y="17.5" width="4" height="4" rx="0.5"/>
+        </svg>
+        <svg class="icon-none" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="8" stroke-dasharray="3 3"/>
+        </svg>
+      </div>
       <div class="cam-art-name">CAM2</div>
-      <div class="cam-art-host">dacam2 · 192.168.50.143</div>
+      <div class="cam-art-host" id="cam2-host-label">dacam2 · 192.168.50.143</div>
+      <div class="cam-cable"><div class="cable-plug"></div><div class="cable-wire"></div></div>
       <div class="cam-side cam2" id="cam2-art">
         <div class="cam-shadow"></div>
         <div class="cam-top"></div>
@@ -1444,7 +1566,21 @@ function tickClock() {
 tickClock();
 setInterval(tickClock, 1000);
 
-// One-shot fetch: cam IPs for the status-bar footer.
+// One-shot fetch: cam IPs + link type for the status-bar footer
+// + the hero-panel connection icon (USB cable / WiFi bars).
+function applyCamLink(camNum, ip, linkType) {
+  const wrap = document.getElementById(`cam${camNum}-art-wrap`);
+  const label = document.getElementById(`cam${camNum}-host-label`);
+  if (!wrap) return;
+  // CSS keys on data-link to pick which icon (and whether to show cable)
+  wrap.setAttribute('data-link', linkType || 'unknown');
+  if (label && ip) {
+    // Rewrite "dacamN · <ip>" to reflect what the server actually reached:
+    // usb-camN for the USB NCM subnet, dacamN for the LAN.
+    const alias = linkType === 'usb' ? `usb-cam${camNum}` : `dacam${camNum}`;
+    label.textContent = `${alias} · ${ip}`;
+  }
+}
 fetchJSON('/api/info').then(info => {
   if (!info) return;
   if (info.cam1_ip) {
@@ -1455,6 +1591,8 @@ fetchJSON('/api/info').then(info => {
     const e = document.getElementById('sb-cam2-ip');
     e.textContent = info.cam2_ip; e.classList.remove('dim');
   }
+  applyCamLink(1, info.cam1_ip, info.cam1_link);
+  applyCamLink(2, info.cam2_ip, info.cam2_link);
 });
 
 // ============================================================

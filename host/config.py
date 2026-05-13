@@ -1,10 +1,19 @@
 """Camera and communication configuration."""
 
-# Camera network config (cam1 transmits, cam2 receives)
+# Camera network config (cam1 transmits, cam2 receives). IPs resolve from
+# /etc/hosts at import time so DHCP rotations don't require editing this
+# file — update /etc/hosts and every downstream picks up the new lease.
 TX_HOST = "dacam1"
-TX_IP = "192.168.50.113"
 RX_HOST = "dacam2"
-RX_IP = "192.168.50.143"
+from host.cam_status import resolve_ip as _resolve_ip
+try:
+    TX_IP = _resolve_ip(TX_HOST)
+except RuntimeError:
+    TX_IP = "192.168.50.110"   # last-known fallback
+try:
+    RX_IP = _resolve_ip(RX_HOST)
+except RuntimeError:
+    RX_IP = "192.168.50.143"   # last-known fallback
 RX_RTSP = f"rtsp://thingino:thingino@{RX_IP}/ch0"
 
 # GPIO pins

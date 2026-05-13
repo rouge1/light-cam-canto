@@ -504,6 +504,29 @@ class CamStatusClient:
             return None
         return d if isinstance(d, dict) else None
 
+    def get_health(self) -> Optional[dict]:
+        """Return cam system vitals (uptime, load, mem, disk %s, dmesg errors)
+        from `/x/health.cgi`, or None on failure.
+
+        Returns a dict shaped like:
+            {"uptime_s": int, "load": {"l1": float, "l5": float, "l15": float},
+             "mem_kb": {"total": int, "free": int, "available": int},
+             "disk_pct": {"overlay": int, "opt": int, "tmp": int},
+             "dmesg_errors": int, "ts_s": int}
+        Complements /x/all-status.cgi (proc/leds/ae/irlink-state) — together
+        they give the full "is this cam slow?" picture in two round trips.
+        """
+        body = self._fetch("/x/health.cgi")
+        if body is None:
+            return None
+        try:
+            d = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(d, dict) or "uptime_s" not in d:
+            return None
+        return d
+
     def get_proc_status(self) -> Optional[dict]:
         """Return process counts as `{irlink:N, daynightd:N, prudynt:N, ts_s:T}`
         or None on failure.

@@ -23,10 +23,18 @@ from protocol.frame import (
     DEFAULT_RS_K,
 )
 
-CAMERAS = {
-    "cam1": "192.168.50.110",
-    "cam2": "192.168.50.141",
-}
+# Resolve from /etc/hosts at import time — see config.py for the rationale.
+from host.cam_status import resolve_ip as _resolve_ip
+def _cams():
+    out = {}
+    for cam, alias, fallback in (("cam1", "dacam1", "192.168.50.110"),
+                                 ("cam2", "dacam2", "192.168.50.143")):
+        try:
+            out[cam] = _resolve_ip(alias)
+        except RuntimeError:
+            out[cam] = fallback
+    return out
+CAMERAS = _cams()
 
 
 def main():

@@ -57,13 +57,20 @@ ssh_cmd() {
     ssh -o ConnectTimeout=30 -o BatchMode=yes "$1" "$2" 2>/dev/null
 }
 
-# Get camera IP from hostname
+# Get camera IP from hostname. /etc/hosts is the single source of truth
+# (memory: DHCP IP rotation on reboot — used to require editing this
+# function on every rotation). getent reads /etc/hosts → /etc/nsswitch
+# order, so it picks up whatever the user keeps current there.
 cam_ip() {
-    case "$1" in
-        dacam1) echo "192.168.50.113" ;;
-        dacam2) echo "192.168.50.143" ;;
-        *) ssh_cmd "$1" "hostname -I" | awk '{print $1}' ;;
-    esac
+    local ip
+    ip=$(getent hosts "$1" 2>/dev/null | awk '{print $1}')
+    if [ -n "$ip" ]; then
+        echo "$ip"
+    else
+        # SSH fallback: works if the hostname is in ~/.ssh/config
+        # but not /etc/hosts.
+        ssh_cmd "$1" "hostname -I" | awk '{print $1}'
+    fi
 }
 
 # Login once per camera, reuse cookie

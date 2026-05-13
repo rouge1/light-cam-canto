@@ -23,6 +23,7 @@ import time
 import sys
 import os
 import argparse
+import threading
 from datetime import datetime
 
 from host.config import pick_initial_rate_ms
@@ -33,10 +34,25 @@ from protocol.app import (
     pack_chunk, reassemble, unpack_cal_visual_panel,
 )
 
-CAMERAS = {
-    "cam1": "192.168.50.113",
-    "cam2": "192.168.50.143",
-}
+# Resolve cam IPs from /etc/hosts at import time. /etc/hosts is the single
+# source of truth — every time DHCP shuffles the leases (memory:
+# DHCP IP rotation on reboot), only that file needs updating and every
+# downstream (this script, cam_setup, pixel_rx, tx_resync, config) picks
+# it up automatically. Falls back to the last-known IPs if getent fails
+# so a misconfigured /etc/hosts doesn't ImportError the whole module.
+from host.cam_status import resolve_ip
+
+def _cam_ips():
+    out = {}
+    for cam, alias, fallback in (("cam1", "dacam1", "192.168.50.110"),
+                                 ("cam2", "dacam2", "192.168.50.143")):
+        try:
+            out[cam] = resolve_ip(alias)
+        except RuntimeError:
+            out[cam] = fallback
+    return out
+
+CAMERAS = _cam_ips()
 CAM_PASSWORD = "password"
 
 PHOTOS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "photos")
@@ -673,23 +689,52 @@ if __name__ == "__main__":
 
     cal = load_calibration()
 
+    # Pre-flight: put BOTH cams into a known IR-comm-ready state. Hits
+    # /x/setup.cgi in parallel — ~3s wall vs ~30-60s for the old
+    # ./host/cam_setup.sh SSH path. Same operations, same definitions of
+    # "ok" (kills daynightd, night+mono, LEDs off, ae_freeze=0, ircut open,
+    # verifies grid + prudynt + irlink binary). Runs in BOTH legacy
+    # paths (--over-light and the default frame-diff path); the old code
+    # only ran setup in --over-light, leaving the default path vulnerable
+    # to stuck LEDs / stuck ae_freeze from a prior `kill -9 irlink`.
+    if args.skip_setup:
+        print("\n=== Skipping setup.cgi pre-flight (--skip-setup) ===")
+    else:
+        print("\n=== setup.cgi — verifying camera state (parallel, both cams) ===")
+        from host.cam_status import CamStatusClient
+        clients = {name: CamStatusClient(ip) for name, ip in CAMERAS.items()}
+        results = {}
+        threads = []
+        def _run(name, client):
+            results[name] = client.run_setup(timeout=20.0)
+        for name, client in clients.items():
+            t = threading.Thread(target=_run, args=(name, client), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(timeout=25.0)
+        failed = []
+        for name, r in results.items():
+            if r is None:
+                print(f"  {name}: NO RESPONSE (uhttpd or setup.cgi unreachable)")
+                failed.append(name)
+                continue
+            steps = r.get("steps", [])
+            ok_count = sum(1 for s in steps if s.get("ok"))
+            print(f"  {name}: ok={r.get('ok')} ({ok_count}/{len(steps)} steps)")
+            for s in steps:
+                if not s.get("ok"):
+                    print(f"      ✗ {s.get('name','?')}: {s.get('detail','')}")
+            if not r.get("ok"):
+                failed.append(name)
+        if failed:
+            print(f"\n  ERROR: setup failed on {','.join(failed)} — "
+                  "fix and retry, or run ./host/cam_setup.sh manually, "
+                  "or pass --skip-setup if state is known good.")
+            sys.exit(1)
+
     if args.over_light:
         cam1_ip = CAMERAS["cam1"]
-
-        # Run cam_setup first to verify state (ircut open, daynightd dead,
-        # AE freeze idle on both cams). Without this, repeated kills + scp
-        # cycles can leave ircut closed or AE stuck — direction 1 then gets
-        # delta=-17 and direction 2 hits SYN timeouts.
-        if args.skip_setup:
-            print("\n=== Skipping cam_setup.sh (--skip-setup) ===")
-        else:
-            print("\n=== cam_setup.sh — verifying camera state ===")
-            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            r = subprocess.run(["./host/cam_setup.sh"], cwd=repo_root, timeout=360)
-            if r.returncode != 0:
-                print("\n  ERROR: cam_setup.sh failed — fix and retry "
-                      "(or pass --skip-setup if state is known good)")
-                sys.exit(1)
 
         # Direction 1 needs cam1's autostarted daemon-listen out of the way
         # (it owns LED control and would race with `light ir850 off` SSH calls).

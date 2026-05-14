@@ -423,6 +423,15 @@ static void log_event(const char *tag, const char *fmt, ...)
    split-brain recovery ALSO drop to the floor (160ms) instead of the
    slowest rung — see the split-brain block in the watchdog/recovery
    thread. Both cams converge at the same rate on recovery. */
+/* Floor tried at LEN-3 (120ms) on 2026-05-14 with fused MONOCAL BOTH —
+   SYN handshake decode failed reliably, the run fell through to bootstrap
+   fallback every time. Confirms memory's warning: 120ms × 18fps =
+   ~2.2 samples/sym is too marginal for DPLL Manchester decode at the
+   current grid_delta ≈ 37-52. Reverted to LEN-2 (160ms) which has ~2.7
+   samples/sym headroom. The path to 120ms is to first improve SNR
+   (stronger cal, tighter ROI) or move the rate negotiation in-session
+   AFTER handshake completes (handshake at 160, cal frames at 120 via
+   RATE_CHANGE). For now: 160 is the validated reliable floor. */
 #define RATE_FLOOR_RUNG (RATE_LADDER_LEN - 2)
 static void lock_rate_at_floor(const char *mode)
 {
@@ -4417,7 +4426,18 @@ int main(int argc, char *argv[])
                --reverse = we scan + peer holds (OUR JSON refreshes);
                --both   = fused Phase 1 then Phase 2 in this session, so
                           BOTH /opt/etc/calibration.json files refresh
-                          without paying a second 55s handshake. */
+                          without paying a second 55s handshake.
+
+               In-session rate-change to 120ms was profiled 2026-05-14
+               and made things ~10s slower, not faster: long CAL_REQ
+               (136 syms) and CAL_DONE (168 syms) at 120ms incurred
+               decode retries that outweighed the wire-time savings.
+               Same root cause as the floor-drop attempt — grid_Δ≈37-52
+               is below the DPLL reliability threshold for 120ms frames.
+               Path forward to <235s would be (a) boost SNR (re-aim, or
+               cleaner saved-cal), or (b) shorten the protocol frames
+               (2-way handshake, leaner CAL_REQ payload). Staying at the
+               handshake-rate (160ms floor) for now. */
             int rc;
             if (monocal_both) {
                 /* Phase 1: cam2 (us) holds LEDs, cam1 scans → cam1.json. */

@@ -429,6 +429,36 @@ main {
 }
 .big-cal-btn.monocal.done-ok  { border-color: var(--cyan); color: var(--cyan); }
 .big-cal-btn.monocal.done-err { border-color: var(--red); color: var(--red); box-shadow: 0 4px 0 #2a0000; }
+
+/* MONOCAL BOTH — purple/violet to differentiate from green RUN CAL and
+   cyan MONOCAL CAM1. Same size shape, distinct color so the action set
+   reads as: green=full-cal · cyan=one-way · violet=both-ways. */
+.big-cal-btn.monocal-both {
+  background: linear-gradient(180deg, rgba(186,124,255,0.14) 0%, rgba(186,124,255,0.04) 100%);
+  border: 4px solid #ba7cff;
+  color: #ba7cff;
+  box-shadow: 0 4px 0 #2a1840;
+  padding: 14px 18px;
+}
+.big-cal-btn.monocal-both:hover {
+  box-shadow: 0 6px 0 #2a1840, 0 0 24px rgba(186,124,255,0.4);
+  background: linear-gradient(180deg, rgba(186,124,255,0.26) 0%, rgba(186,124,255,0.06) 100%);
+}
+.big-cal-btn.monocal-both:active { box-shadow: 0 2px 0 #2a1840; }
+.big-cal-btn.monocal-both.running {
+  box-shadow: 0 4px 0 #2a1840, 0 0 24px rgba(186,124,255,0.3);
+  opacity: 0.85;
+  animation: monocal-both-pulse 1.6s ease-in-out infinite;
+}
+@keyframes monocal-both-pulse {
+  0%, 100% { box-shadow: 0 4px 0 #2a1840, 0 0 18px rgba(186,124,255,0.25); }
+  50%      { box-shadow: 0 4px 0 #2a1840, 0 0 32px rgba(186,124,255,0.55); }
+}
+.big-cal-btn.monocal-both.done-ok  { border-color: #ba7cff; color: #ba7cff; }
+.big-cal-btn.monocal-both.done-err { border-color: var(--red); color: var(--red); box-shadow: 0 4px 0 #2a0000; }
+.big-cal-btn.monocal-both .big-cal-icon  { font-size: 24px; }
+.big-cal-btn.monocal-both .big-cal-label { font-size: 12px; }
+.big-cal-btn.monocal-both .big-cal-sub   { font-size: 7px; }
 .big-cal-icon  { font-size: 28px; text-shadow: 0 0 8px currentColor; flex-shrink: 0; }
 .big-cal-text  { display: flex; flex-direction: column; gap: 4px; }
 .big-cal-label { font-size: 13px; text-shadow: 0 0 6px currentColor; line-height: 1.4; }
@@ -1398,6 +1428,13 @@ main {
       <span class="big-cal-sub">cam2 holds · cam1 scans · over the light channel</span>
     </span>
   </button>
+  <button class="big-cal-btn monocal-both" id="monocal-both-btn">
+    <span class="big-cal-icon">▶</span>
+    <span class="big-cal-text">
+      <span class="big-cal-label">MONOCAL BOTH</span>
+      <span class="big-cal-sub">Phase 1: cam1 scans · Phase 2: cam2 scans · ~5 min</span>
+    </span>
+  </button>
 </section>
 
 <!-- ============== TWO PER-CAM DATA COLUMNS ============== -->
@@ -1532,8 +1569,14 @@ async function fetchJSON(url, opts = {}) {
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const r = await fetch(url, { ...rest, signal: ctrl.signal });
-    if (!r.ok) return null;
-    return await r.json();
+    // Parse the body even on non-2xx — handlers may return structured
+    // errors like {"ok":false,"error":"..."}. Falling back to null when
+    // the body isn't JSON (e.g., HTML 500 page).
+    try {
+      return await r.json();
+    } catch (_) {
+      return null;
+    }
   } catch (e) {
     return null;
   } finally {
@@ -1685,6 +1728,15 @@ const STATE_LABELS = {
   'monocal_awaiting_done':   'waiting for peer result',
   'monocal_done':            'calibration complete',
   'monocal_failed':          'calibration failed',
+  // === Monocal both (fused) — Phase 1 then Phase 2 in one session ===
+  'spawning_both':           'starting fused both-direction cal',
+  // === Monocal reverse — requestor SCANS, peer HOLDS (Phase 2 of bidir) ===
+  'spawning_rev':            'starting reverse cal',
+  'monocal_rev_req':         'sending reverse cal request',
+  'monocal_rev_ack_wait':    'waiting for peer to start hold',
+  'monocal_rev_scanning':    'scanning peer LEDs',
+  'monocal_rev_done':        'reverse cal complete',
+  'monocal_rev_failed':      'reverse cal failed',
   // === Watchdog (autonomous re-cal on cam1) ===
   'watchdog_refining':       'auto re-cal: scanning',
   'watchdog_wait_falling':   'auto re-cal: peer LEDs cooling',
@@ -2029,6 +2081,94 @@ monocalBtn.addEventListener('click', async () => {
       monocalBtn.querySelector('.big-cal-label').textContent = 'MONOCAL CAM1';
     }, 1500);
   }
+});
+
+// ============================================================
+// MONOCAL BOTH — bidirectional cal as two sequential one-way runs.
+// Phase 1 (existing MONOCAL CAM1): cam2 holds, cam1 scans → cam1.json updates.
+// Phase 2 (new --reverse path):    cam2 scans, cam1 holds → cam2.json updates.
+// Each phase uses its own SYNC_BARRIER so there's no phase-2 collision risk
+// like bicall has. Total wall ~5 min @ 160ms/sym. Polls monocal-status to
+// detect each phase's completion before triggering the next.
+// ============================================================
+const monocalBothBtn = document.getElementById('monocal-both-btn');
+
+function setBothLabel(text, cls) {
+  monocalBothBtn.classList.remove('firing', 'done-ok', 'done-err', 'running');
+  if (cls) monocalBothBtn.classList.add(cls);
+  monocalBothBtn.querySelector('.big-cal-label').textContent = text;
+}
+
+async function pollUntilMonocalDone(doneStates, failStates, timeoutMs) {
+  // doneStates/failStates are sets of state strings to terminate on. Returns
+  // the final cam2 status dict on success, or null on timeout. Poll cadence
+  // matches the regular monocal poller's 1s.
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    const s = await fetchJSON('/api/cal/monocal-status');
+    const c2 = (s && s.cam2) || {};
+    const st = c2.state || '';
+    if (doneStates.has(st)) return c2;
+    if (failStates.has(st)) return c2;  // caller checks ok=false
+    await sleep(1000);
+  }
+  return null;
+}
+
+monocalBothBtn.addEventListener('click', async () => {
+  if (monocalBothBtn.classList.contains('running')) return;
+  setBothLabel('STARTING…', 'running');
+
+  // Single fused trigger: cam2 spawns `irlink monocal --both` which runs
+  // Phase 1 (cam2 holds, cam1 scans) then Phase 2 (cam2 scans, cam1 holds)
+  // in one session with ONE handshake. Saves ~55s vs the old two-trigger
+  // path. Phase 1 progress walks monocal_* states; Phase 2 walks
+  // monocal_rev_*. Final success state: monocal_rev_done.
+  const r = await fetchJSON('/api/cal/monocal-both', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: '',
+    timeoutMs: 30000,    // setup pre-flight + spawn ~3-5s
+  });
+  if (!r || !r.ok) {
+    setBothLabel('FAIL · ' + ((r && r.error) || 'trigger refused'), 'done-err');
+    setTimeout(() => setBothLabel('MONOCAL BOTH', null), 5000);
+    return;
+  }
+
+  // Poll and relabel as phases progress. We don't trigger again between
+  // phases — the cam-side binary handles the transition. The state
+  // machine goes: ... monocal_done → monocal_rev_req → monocal_rev_done.
+  // We treat monocal_rev_* states as "Phase 2", everything else as Phase 1.
+  setBothLabel('PHASE 1 RUNNING…', 'running');
+  let sawPhase2 = false;
+  const t0 = Date.now();
+  const HARD_TIMEOUT_MS = 360000;  // 6 min ceiling; happy path ~200s
+  while (Date.now() - t0 < HARD_TIMEOUT_MS) {
+    const s = await fetchJSON('/api/cal/monocal-status');
+    const c2 = (s && s.cam2) || {};
+    const st = c2.state || '';
+    if (!sawPhase2 && (st.startsWith('monocal_rev_') || st === 'monocal_done')) {
+      sawPhase2 = true;
+      setBothLabel('PHASE 2 RUNNING…', 'running');
+      refreshLiveCal();  // cam1's bullseye should now reflect Phase 1's fresh cal
+    }
+    if (st === 'monocal_rev_done' && c2.ok === true) {
+      setBothLabel('BOTH DONE ✓', 'done-ok');
+      refreshLiveCal();
+      setTimeout(() => setBothLabel('MONOCAL BOTH', null), 5000);
+      return;
+    }
+    if (st === 'monocal_failed' || st === 'monocal_rev_failed') {
+      setBothLabel(st === 'monocal_failed' ? 'PHASE 1 FAILED' : 'PHASE 2 FAILED',
+                   'done-err');
+      setTimeout(() => setBothLabel('MONOCAL BOTH', null), 5000);
+      return;
+    }
+    await sleep(1000);
+  }
+  setBothLabel('TIMEOUT', 'done-err');
+  setTimeout(() => setBothLabel('MONOCAL BOTH', null), 5000);
 });
 
 // ============================================================

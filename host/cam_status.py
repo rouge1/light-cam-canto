@@ -145,10 +145,31 @@ class CamStatusClient:
 
         channel=1 is the 640x360 substream that matches calibration.json's
         frame_size — use that for displaying cal results. channel=0 is the
-        full-resolution main stream. Returns JPEG bytes or None on failure."""
+        full-resolution main stream. Returns JPEG bytes or None on failure.
+
+        Truncation retry: prudynt's snapshot file is occasionally read by
+        uhttpd mid-write, producing a JPEG that's missing the trailing
+        `\\xff\\xd9` end-of-image marker. PIL with LOAD_TRUNCATED_IMAGES=True
+        still decodes it, but the missing scanlines render as a flat-grey
+        bottom half — what shows up in the webui as "half a picture". We
+        detect the missing EOI and retry up to 2× with a 100ms backoff,
+        which lets prudynt finish its write."""
         if channel not in (0, 1):
             return None
-        return self._fetch_binary(f"/x/ch{channel}.jpg")
+        for attempt in range(3):
+            data = self._fetch_binary(f"/x/ch{channel}.jpg")
+            if data is None:
+                return None
+            if len(data) >= 2 and data[-2:] == b"\xff\xd9":
+                return data
+            if attempt < 2:
+                # Mid-write read; wait briefly for prudynt to finish.
+                import time as _time
+                _time.sleep(0.1)
+        # Three reads, none had the EOI marker. Return the last one anyway
+        # — better to show a half-image than 503 the endpoint. Pipeline
+        # has LOAD_TRUNCATED_IMAGES=True so PIL won't crash.
+        return data
 
     def _post(self, path: str, data: str, content_type: Optional[str] = None,
               timeout: float = 8.0,
@@ -417,6 +438,53 @@ class CamStatusClient:
         surface the failure to the operator."""
         body = f"coords={coords[0]},{coords[1]}&speed={int(speed_ms)}"
         res = self._post("/x/monocal-trigger.cgi", body)
+        if res is None:
+            return None
+        code, response_body = res
+        if code != 200:
+            return None
+        try:
+            d = json.loads(response_body)
+        except json.JSONDecodeError:
+            return None
+        return d if isinstance(d, dict) and d.get("ok") else None
+
+    def start_monocal_rev(self, coords: tuple[int, int],
+                          speed_ms: int = 160) -> Optional[dict]:
+        """POST to /x/monocal-rev-trigger.cgi to spawn `irlink monocal --reverse`
+        on this cam. Phase 2 of bidirectional cal — we (cam2) scan, peer
+        (cam1) holds. Result: OUR /opt/etc/calibration.json refreshes.
+
+        coords is (x, y) — the pixel WE see cam1's TX at (from our own
+        /opt/etc/calibration.json, written by a prior cal). Used for the
+        initial SYN handshake before the reverse cal swap.
+
+        Same shape + same 409/400 behavior as start_monocal. Returns
+        `{ok, pid, coords, speed_ms, mode: "reverse"}` on success."""
+        body = f"coords={coords[0]},{coords[1]}&speed={int(speed_ms)}"
+        res = self._post("/x/monocal-rev-trigger.cgi", body)
+        if res is None:
+            return None
+        code, response_body = res
+        if code != 200:
+            return None
+        try:
+            d = json.loads(response_body)
+        except json.JSONDecodeError:
+            return None
+        return d if isinstance(d, dict) and d.get("ok") else None
+
+    def start_monocal_both(self, coords: tuple[int, int],
+                           speed_ms: int = 160) -> Optional[dict]:
+        """POST to /x/monocal-both-trigger.cgi to spawn `irlink monocal --both`.
+
+        Fused Phase 1 + Phase 2 in one irlink session — saves the ~55s
+        second-handshake overhead the previous two-trigger flow paid.
+        Returns when the trigger is accepted (not when cal completes).
+        Final state: monocal_rev_done (Phase 2 wrote last); intermediate
+        states walk through monocal_* (Phase 1) and monocal_rev_* (Phase 2)."""
+        body = f"coords={coords[0]},{coords[1]}&speed={int(speed_ms)}"
+        res = self._post("/x/monocal-both-trigger.cgi", body)
         if res is None:
             return None
         code, response_body = res

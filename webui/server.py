@@ -120,6 +120,19 @@ def _cache_invalidate(*keys: str):
         _cache.pop(k, None)
 
 
+def _cache_peek(key: str, max_age: float | None = None):
+    """Return the cached value if present (no lock, no fetch). If max_age
+    is given, returns None when the entry is older. Designed for piggyback
+    reads — e.g. /api/{cam}/health can serve vitals from the live page
+    poller's `:all` cache without triggering its own CGI hit on the cam."""
+    cached = _cache.get(key)
+    if not cached:
+        return None
+    if max_age is not None and time.monotonic() - cached[0] > max_age:
+        return None
+    return cached[1]
+
+
 # ---------------------------------------------------------------------------
 # Per-cam alive probe (TCP connect to port 80, 0.5s budget, 3s cached).
 # When a cam is rebooting or unplugged, every per-cam endpoint would otherwise
@@ -993,17 +1006,30 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if op == "health":
-            # Bundled health check: system vitals from /x/health.cgi merged
-            # with the everything-else /x/all-status.cgi (procs/leds/ae/
-            # irlink-state) + the laptop-measured uhttpd round-trip ms for
-            # one call. Two CGI hits, cached separately. Designed to mirror
-            # the manual "health check" report — uptime, load, memory, disk,
-            # dmesg errors, processes, irlink state, uhttpd responsiveness.
+            # Bundled health check. Cam-load optimization (Phase 1+2 of the
+            # congestion fix): all-status.cgi now ALSO carries the vitals
+            # fields (uptime/load/mem/disk/dmesg) so a single CGI gives us
+            # everything. We piggyback on the live page poller's `:all`
+            # cache (it polls every 2s anyway) — when warm, this endpoint
+            # adds ZERO load to the cam. Cold path falls back to the
+            # standalone health.cgi, mainly for direct CLI probing on a
+            # quiescent webui.
             t0 = time.monotonic()
-            vitals = _cam_get_or_fetch(cam, f"{cam}:health",
-                                       _CACHE_TTL["health"], client.get_health)
-            allst = _cam_get_or_fetch(cam, f"{cam}:all", _CACHE_TTL["all"],
-                                      client.get_all_status)
+            allst = _cache_peek(f"{cam}:all", _CACHE_TTL["all"])
+            if allst is None:
+                # Cache miss → fetch via the normal single-flight path.
+                allst = _cam_get_or_fetch(cam, f"{cam}:all", _CACHE_TTL["all"],
+                                          client.get_all_status)
+            # Extract vitals: prefer the all-status payload (one round trip
+            # already paid for above); fall back to standalone health.cgi
+            # if the cam is running an older build of all-status.cgi that
+            # doesn't include them yet.
+            vitals = None
+            if isinstance(allst, dict):
+                vitals = allst.get("vitals")
+            if vitals is None:
+                vitals = _cam_get_or_fetch(cam, f"{cam}:health",
+                                           _CACHE_TTL["health"], client.get_health)
             uhttpd_ms = int((time.monotonic() - t0) * 1000)
             if isinstance(allst, dict) and isinstance(allst.get("ae"), int):
                 allst["ae"] = {"value": allst["ae"]}
@@ -1278,6 +1304,119 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             self._send_json(200, {"ok": True, "coords": list(coords),
                                   "speed_ms": speed_ms, "trigger": result})
+            return
+
+        if path == "/api/cal/monocal-both":
+            # Fused MONOCAL BOTH: single trigger that runs Phase 1 + Phase 2
+            # in one irlink session (single handshake). Spawns
+            # `irlink monocal --both` via the new monocal-both-trigger CGI.
+            # Setup pre-flight runs by default (first trigger of the session,
+            # mirrors /api/cal/monocal). The webui polls /api/cal/monocal-status
+            # — Phase 1 walks monocal_* states, Phase 2 walks monocal_rev_*
+            # states. Final state: monocal_rev_done.
+            cam2 = self._client_for("cam2")
+            if cam2 is None:
+                self._send_json(503, {"ok": False, "error": "cam2 not initialised"})
+                return
+            body = self._read_body()
+            params = dict(urllib.parse.parse_qsl(body))
+            coords_str = params.get("coords")
+            if coords_str:
+                try:
+                    cx, cy = (int(p) for p in coords_str.split(",", 1))
+                except (ValueError, TypeError):
+                    self._send_json(400, {"ok": False,
+                                          "error": "coords must be X,Y"})
+                    return
+                coords = (cx, cy)
+            else:
+                coords = _read_cam2_sees_cam1_pixel()
+                if coords is None:
+                    self._send_json(400, {"ok": False,
+                        "error": "no coords; run cal_procedure first or pass coords=X,Y"})
+                    return
+            try:
+                speed_ms = int(params.get("speed_ms", "160"))
+            except (ValueError, TypeError):
+                speed_ms = 160
+
+            # Pre-flight setup on cam2 (mirrors /api/cal/monocal). cam1 is
+            # untouched — its daemon-listen has its own state mgmt and
+            # rc.local already ran setup at boot.
+            if params.get("setup", "1") != "0":
+                setup_res = cam2.run_setup(timeout=20.0)
+                if setup_res is None or not setup_res.get("ok"):
+                    self._send_json(503, {
+                        "ok": False,
+                        "error": "cam2 setup pre-flight failed",
+                        "setup": setup_res,
+                    })
+                    return
+
+            result = cam2.start_monocal_both(coords, speed_ms=speed_ms)
+            if result is None:
+                self._send_json(409, {"ok": False,
+                    "error": "monocal-both trigger refused (irlink already running on cam2?)"})
+                return
+            self._send_json(200, {"ok": True, "coords": list(coords),
+                                  "speed_ms": speed_ms, "mode": "both",
+                                  "trigger": result})
+            return
+
+        if path == "/api/cal/monocal-rev":
+            # Phase 2 of bidirectional cal: cam2 SCANS, cam1 HOLDS.
+            # Mirror of /api/cal/monocal but spawns `irlink monocal --reverse`.
+            # Result: cam2's /opt/etc/calibration.json refreshes.
+            # Setup pre-flight is skipped by default — this endpoint is
+            # intended to chain immediately after /api/cal/monocal which
+            # just ran setup on cam2. Force a re-setup with setup=1.
+            cam2 = self._client_for("cam2")
+            if cam2 is None:
+                self._send_json(503, {"ok": False, "error": "cam2 not initialised"})
+                return
+            body = self._read_body()
+            params = dict(urllib.parse.parse_qsl(body))
+            coords_str = params.get("coords")
+            if coords_str:
+                try:
+                    cx, cy = (int(p) for p in coords_str.split(",", 1))
+                except (ValueError, TypeError):
+                    self._send_json(400, {"ok": False,
+                                          "error": "coords must be X,Y"})
+                    return
+                coords = (cx, cy)
+            else:
+                coords = _read_cam2_sees_cam1_pixel()
+                if coords is None:
+                    self._send_json(400, {"ok": False,
+                        "error": "no coords; run cal_procedure first or pass coords=X,Y"})
+                    return
+            try:
+                speed_ms = int(params.get("speed_ms", "160"))
+            except (ValueError, TypeError):
+                speed_ms = 160
+
+            # Setup defaults OFF here — assume the caller (MONOCAL BOTH
+            # orchestration) already ran setup before Phase 1. Explicit
+            # setup=1 forces a re-run for standalone reverse triggers.
+            if params.get("setup", "0") == "1":
+                setup_res = cam2.run_setup(timeout=20.0)
+                if setup_res is None or not setup_res.get("ok"):
+                    self._send_json(503, {
+                        "ok": False,
+                        "error": "cam2 setup pre-flight failed",
+                        "setup": setup_res,
+                    })
+                    return
+
+            result = cam2.start_monocal_rev(coords, speed_ms=speed_ms)
+            if result is None:
+                self._send_json(409, {"ok": False,
+                    "error": "monocal-rev trigger refused (irlink already running on cam2?)"})
+                return
+            self._send_json(200, {"ok": True, "coords": list(coords),
+                                  "speed_ms": speed_ms, "mode": "reverse",
+                                  "trigger": result})
             return
 
         parts = path.strip("/").split("/")

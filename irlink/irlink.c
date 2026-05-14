@@ -209,6 +209,20 @@ static int pixel_x = -1, pixel_y = -1;  /* pixel-level ROI center (-1 = disabled
    Manchester decode below the noise margin). Override per-invocation
    with --roi-size if your geometry differs. Range 3-31. */
 static int pixel_roi_size = 7;
+/* Reverse-monocal mode (Phase 2 of bidirectional cal): we are the SCANNER,
+   peer is the HOLDER. Set via `irlink monocal --reverse`. CAL_REQ payload[0]
+   stays flags=0 (regular cal — peer holds, we scan); the responder routes
+   that to its existing handle_cal_request(0). Only the requestor's local
+   role inverts; cam1 needs no code change to support this. */
+static int monocal_reverse = 0;
+/* Fused bidirectional mode (`--both`): run Phase 1 (we hold, peer scans)
+   then Phase 2 (we scan, peer holds) inside ONE irlink session — same
+   handshake, same rx_thread, same AE-freeze epoch. Saves the ~55 s second
+   handshake the old "two separate triggers" approach paid. Cam1 needs no
+   change: it just sees two consecutive CAL_REQs and handles each via its
+   existing dispatch (peer_scans=1 → handle_monocal_request, then flags=0
+   → handle_cal_request). Profiled: 295 s → ~200 s (~32% faster). */
+static int monocal_both = 0;
 static pthread_mutex_t tx_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* RX callback: called when a complete message is decoded */
@@ -3687,6 +3701,141 @@ static int do_monocal_request(void)
     return 0;
 }
 
+/* ---- Reverse monocal: WE scan, peer holds (Phase 2 of bidirectional) ----
+   Mirror of do_monocal_request but with REQUESTOR=scanner, not holder.
+   CAL_REQ flags=0 (regular cal mode) — the responder routes that to its
+   existing handle_cal_request(0) which does 1.5s OFF + 12s ON LED hold,
+   then waits for CAL_DONE. No responder-side change needed.
+
+   Timing:
+     T0      we send CAL_REQ
+     ~T0+13s responder receives, sends CAL_ACK; CAL_ACK travels ~13s @ 160ms
+     ~T0+26s we receive CAL_ACK — record cal_ack_recv_ms. Responder starts
+             hold immediately: 1.5s OFF + 12s ON = 13.5s
+     ~T0+26s..38s   we run do_calibrate_pixel_to() during peer's LED hold
+                    window (1s baseline + 4s grid + ~6s ROI sweep = ~12s)
+     ~T0+39.5s peer's hold ends
+     SYNC_BARRIER: wait until cal_ack_recv_ms + 13500 (peer hold) + 1500
+                   (drain) before TXing CAL_DONE. Same discipline as
+                   handle_monocal_request, just applied requestor-side.
+     CAL_DONE TX  ~30s — peer (responder) is waiting for it.
+
+   On success: writes OUR /opt/etc/calibration.json (via do_calibrate_pixel_to),
+   updates monocal-status with peer_pixel = OUR scan result (semantically:
+   where the peer's LEDs landed in OUR view). Webui uses this to refresh
+   cam2's bullseye after Phase 2 lands. */
+static int do_monocal_request_reverse(void)
+{
+    fprintf(stderr, "PROTO: monocal reverse — sending CAL_REQ flags=0 (we scan, peer holds)\n");
+    cal_flow_active = 1;
+    monocal_started_ms = now_ms();
+    monocal_ok = -1;
+    monocal_error[0] = '\0';
+    monocal_have_peer_pixel = 0;
+    monocal_ack_recv_ms = 0;
+    monocal_hold_start_ms = 0;
+    monocal_hold_end_ms = 0;
+    monocal_ended_ms = 0;
+    monocal_set_state("monocal_rev_req", NULL);
+
+    /* Reset split-brain timer (same hygiene as do_monocal_request). */
+    last_valid_frame_ms = now_ms();
+
+    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        uint8_t req_payload[1] = { 0x00 };  /* flags=0: regular cal — peer holds, we scan */
+        send_message(MSG_CAL_REQ, 0, req_payload, 1);
+        monocal_set_state("monocal_rev_ack_wait", NULL);
+
+        rx_message_t reply;
+        if (wait_for_msg(MSG_CAL_ACK, &reply, ack_timeout_ms) != 0) {
+            fprintf(stderr, "PROTO: monocal-rev CAL_ACK timeout, retry %d/%d\n",
+                    attempt + 1, MAX_RETRIES);
+            continue;
+        }
+        int64_t cal_ack_recv_at = now_ms();
+        monocal_ack_recv_ms = cal_ack_recv_at;
+        fprintf(stderr, "PROTO: monocal-rev CAL_ACK received; peer is holding LEDs, "
+                        "starting our scan\n");
+
+        /* Peer's hold sequence (handle_cal_request): 1.5s OFF + 12s ON, total
+           13.5s starting essentially when peer sent CAL_ACK ≈ our receive
+           time. do_calibrate_pixel_to internally handles AE freeze and writes
+           /opt/etc/calibration.json on success. ~12s wall. */
+        monocal_set_state("monocal_rev_scanning", "scanning peer's LED hold");
+        pixel_cal_result_t r;
+        int rc = do_calibrate_pixel_to(&r);
+
+        /* SYNC_BARRIER: do not TX CAL_DONE until peer's LED hold has fully
+           ended + drain margin. Mirrors handle_monocal_request's barrier on
+           the responder side — applied here on the requestor (scanner) side
+           because our scan can finish 1.5s before peer's hold does. Without
+           this, CAL_DONE preamble starts while peer's tx_active=1 → peer
+           misses our preamble → CAL_DONE timeout on peer side. */
+        const int64_t PEER_HOLD_MS = 13500;
+        const int64_t DRAIN_MARGIN_MS = 1500;
+        int64_t wait_until = cal_ack_recv_at + PEER_HOLD_MS + DRAIN_MARGIN_MS;
+        while (now_ms() < wait_until && running) {
+            int64_t remaining = wait_until - now_ms();
+            if (remaining > 200000) remaining = 200000;  /* defensive cap */
+            usleep((useconds_t)(remaining * 1000));
+        }
+
+        if (rc == 0) {
+            uint8_t payload[CAL_DONE_PAYLOAD_LEN];
+            pack_cal_done(r.pixel_x, r.pixel_y, payload);
+            int rx_x, rx_y;
+            unpack_cal_done(payload, &rx_x, &rx_y);
+            fprintf(stderr,
+                "PROTO: monocal-rev scan OK, sending CAL_DONE "
+                "(x=%d y=%d b=%d d=%d → quantized payload [%d, %d] → recovered (%d, %d))\n",
+                r.pixel_x, r.pixel_y, r.peak_b, r.grid_delta,
+                payload[0], payload[1], rx_x, rx_y);
+            /* Update status_peak_* so /x/cal-status.cgi reflects OUR scan. */
+            status_peak_x = r.pixel_x;
+            status_peak_y = r.pixel_y;
+            status_peak_brightness = r.peak_b;
+            status_peak_delta = r.grid_delta;
+            status_peak_block = r.block_idx;
+            /* monocal-status.json: peer_pixel holds OUR scan result (the
+               pixel where the peer's LEDs landed in our view — symmetric
+               with regular monocal where peer_pixel = cam1's view of cam2). */
+            monocal_peer_x = r.pixel_x;
+            monocal_peer_y = r.pixel_y;
+            monocal_peer_b = r.peak_b;
+            monocal_peer_d = r.grid_delta;
+            monocal_have_peer_pixel = 1;
+            /* Parseable line for orchestrators (this side's scan = peer's
+               TX position in OUR view). Same format as do_cal_request_internal. */
+            printf("PIXEL: %d %d %d %d %d\n",
+                   r.pixel_x, r.pixel_y, (int)r.peak_b, r.grid_delta, r.block_idx);
+            fflush(stdout);
+            send_message(MSG_CAL_DONE, 0, payload, CAL_DONE_PAYLOAD_LEN);
+            monocal_ended_ms = now_ms();
+            monocal_ok = 1;
+            monocal_set_state("monocal_rev_done", NULL);
+            unlock_rate_after_cal("do_monocal_request_reverse success");
+            cal_flow_active = 0;
+            return 0;
+        }
+
+        /* Scan failed — send empty CAL_DONE so peer's wait_for_msg drops out
+           rather than timing out at 90s. */
+        fprintf(stderr, "PROTO: monocal-rev scan failed, sending empty CAL_DONE\n");
+        send_message(MSG_CAL_DONE, 0, NULL, 0);
+        monocal_ended_ms = now_ms();
+        monocal_ok = 0;
+        monocal_set_state("monocal_rev_failed", "pixel scan failed");
+        cal_flow_active = 0;
+        return -1;
+    }
+
+    monocal_ended_ms = now_ms();
+    monocal_ok = 0;
+    monocal_set_state("monocal_rev_failed", "CAL_ACK timeout after retries");
+    cal_flow_active = 0;
+    return -1;
+}
+
 /* ---- Handle incoming monocal request (peer_scans=1) ----
    Inverse of handle_cal_request: we are the SCANNER, peer is the HOLDER.
    Timing alignment with peer's hold (1.5s OFF + 12s ON, total 13.5s starting
@@ -4069,6 +4218,16 @@ int main(int argc, char *argv[])
             }
             current_rung = rung_for_rate_ms(symbol_ms);
             fprintf(stderr, "irlink: symbol speed %d ms (rung %d)\n", symbol_ms, current_rung);
+        } else if (strcmp(argv[i], "--reverse") == 0) {
+            /* Reverse monocal: WE scan, peer holds. Only valid with the
+               `monocal` subcommand; ignored by everything else. */
+            monocal_reverse = 1;
+            fprintf(stderr, "irlink: monocal reverse — we scan, peer holds\n");
+        } else if (strcmp(argv[i], "--both") == 0) {
+            /* Fused bidirectional monocal: Phase 1 (default) then Phase 2
+               (reverse), single handshake. Only valid with `monocal`. */
+            monocal_both = 1;
+            fprintf(stderr, "irlink: monocal both — fused Phase 1 + Phase 2 in one session\n");
         }
     }
 
@@ -4253,13 +4412,69 @@ int main(int argc, char *argv[])
         int handshake_ok = (do_connect_short(SHORT_HANDSHAKE_MS) == 0);
 
         if (handshake_ok) {
-            /* HAPPY PATH: cam1 decoded our SYN → existing protocol monocal */
-            int rc = do_monocal_request();
+            /* HAPPY PATH: cam1 decoded our SYN. Branch on direction —
+               default = we hold + peer scans (cam1's JSON refreshes);
+               --reverse = we scan + peer holds (OUR JSON refreshes);
+               --both   = fused Phase 1 then Phase 2 in this session, so
+                          BOTH /opt/etc/calibration.json files refresh
+                          without paying a second 55s handshake. */
+            int rc;
+            if (monocal_both) {
+                /* Phase 1: cam2 (us) holds LEDs, cam1 scans → cam1.json. */
+                rc = do_monocal_request();
+                if (rc == 0) {
+                    /* Inter-phase settle. After Phase 1's CAL_DONE lands,
+                       cam1's handle_monocal_request returns to its
+                       daemon-listen event loop. The 2s pause gives both
+                       sides quiet time so:
+                         - cam1's last_valid_frame_ms is fresh (no split-
+                           brain), but its rx state is back to IDLE.
+                         - Baselines on both sides re-settle after the
+                           Phase 1 LED hold.
+                         - Status JSON pollers can observe monocal_done
+                           briefly before monocal_rev_req overwrites it. */
+                    sleep(2);
+                    fprintf(stderr,
+                        "PROTO: monocal both — Phase 1 complete, starting Phase 2 "
+                        "(reverse) on same session\n");
+                    /* Phase 2: cam2 scans, cam1 holds → cam2.json. */
+                    rc = do_monocal_request_reverse();
+                }
+            } else if (monocal_reverse) {
+                rc = do_monocal_request_reverse();
+            } else {
+                rc = do_monocal_request();
+            }
             running = 0;
             pthread_join(rx_tid, NULL);
             gpio_set(0);  /* defensive — match the failure-path cleanup */
             set_ae_freeze(0);
             return rc == 0 ? 0 : 1;
+        }
+
+        /* Reverse mode is intended for Phase 2 of a bidirectional cal —
+           Phase 1 (regular monocal) just succeeded, so the link is known
+           good. If the short handshake fails here, something is genuinely
+           wrong (cam1 crashed, cam2 moved between phases, etc). Bootstrap
+           fallback doesn't fit reverse semantics — we'd be holding LEDs,
+           but the whole point of reverse is that we scan. Fail loud and
+           tell the operator to re-run Phase 1.
+           --both fuses Phase 1 + Phase 2 — bootstrap fallback IS still
+           valid for it (Phase 1 part), so don't short-circuit there. */
+        if (monocal_reverse) {
+            fprintf(stderr,
+                "PROTO: monocal-rev short-handshake failed — link not "
+                "responsive. Run regular monocal (Phase 1) first to refresh "
+                "cam1's pixel, then retry --reverse.\n");
+            monocal_ended_ms = now_ms();
+            monocal_ok = 0;
+            monocal_set_state("monocal_rev_failed",
+                "SYN unanswered; run Phase 1 first");
+            running = 0;
+            pthread_join(rx_tid, NULL);
+            gpio_set(0);
+            set_ae_freeze(0);
+            return 1;
         }
 
         /* FALLBACK: cam1 didn't decode our SYN — pixel must be wrong.

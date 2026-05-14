@@ -796,6 +796,14 @@ static void monocal_set_state(const char *state, const char *err)
         monocal_error[i] = '\0';
     }
     write_monocal_status();
+    /* Mirror status_set: emit a STATE event so the events log reflects
+     * cam2's progression through monocal_* / monocal_rev_* states. Without
+     * this, cam2's events log only sees the few status_set calls in main()
+     * (starting/connected/exited) — leaving operator-facing logs and the
+     * webui event stack with ~3 entries per run vs cam1's ~10. */
+    log_event("STATE", "%s | %s",
+              state ? state : monocal_state,
+              err ? err : "");
 }
 
 /* ================================================================

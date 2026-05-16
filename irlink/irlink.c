@@ -1981,11 +1981,58 @@ static int read_saved_peak_brightness(void)
     return v;
 }
 
+/* Read saved tx_pixel from /opt/etc/calibration.json into out_x / out_y.
+ * Returns 0 on success, -1 if missing/unreadable/unparseable. Used by the
+ * watchdog guard to reject far pixel relocations that lack a strong-beacon
+ * justification (a static reflection reads as bright as a real LED in a
+ * single ON snapshot, so absolute brightness can't tell them apart —
+ * distance-from-a-trusted-cal can). */
+static int read_saved_pixel(int *out_x, int *out_y)
+{
+    int fd = open("/opt/etc/calibration.json", O_RDONLY);
+    if (fd < 0) return -1;
+    char buf[1024];
+    int n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+    const char *p = strstr(buf, "\"tx_pixel\"");
+    if (!p) return -1;
+    p = strchr(p, '[');
+    if (!p) return -1;
+    p++;
+    int x = atoi(p);
+    const char *c = strchr(p, ',');
+    if (!c) return -1;
+    int y = atoi(c + 1);
+    if (x < 0 || x > 639 || y < 0 || y > 359) return -1;
+    *out_x = x;
+    *out_y = y;
+    return 0;
+}
+
 static void write_calibration_json(int tx_x, int tx_y, int off_val, int on_val,
                                     int grid_delta, int peak_b)
 {
     mkdir("/opt/etc", 0755);  /* harmless if already exists */
-    char buf[512];
+
+    /* Wall-clock timestamp. The camera's CLOCK_REALTIME is kept in sync with
+       the laptop via /x/time-sync.cgi (NTP UDP-123 is blocked outbound), so
+       this is a real, dateable Unix time. The old CLOCK_MONOTONIC value was
+       boot-relative and meaningless across reboots / vs. laptop time — it
+       made monocal runs impossible to date. `timestamp_ms` is the
+       authoritative TZ-independent value; `timestamp` mirrors
+       cal_procedure.py's %Y%m%d_%H%M%S shape (UTC — the camera runs UTC,
+       laptop writes local, so compare via timestamp_ms, not the string). */
+    struct timespec rt;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    long long ts_ms = (long long)rt.tv_sec * 1000 + rt.tv_nsec / 1000000;
+    char ts_str[24] = "";
+    struct tm tmv;
+    if (gmtime_r(&rt.tv_sec, &tmv))
+        strftime(ts_str, sizeof(ts_str), "%Y%m%d_%H%M%S", &tmv);
+
+    char buf[640];
     int n = snprintf(buf, sizeof(buf),
         "{\n"
         "  \"tx_pixel\": [%d, %d],\n"
@@ -1995,9 +2042,11 @@ static void write_calibration_json(int tx_x, int tx_y, int off_val, int on_val,
         "  \"grid_delta\": %d,\n"
         "  \"peak_brightness\": %d,\n"
         "  \"timestamp_ms\": %lld,\n"
+        "  \"timestamp\": \"%s\",\n"
+        "  \"timestamp_tz\": \"UTC\",\n"
         "  \"source\": \"on_camera_pixel_cal\"\n"
         "}\n",
-        tx_x, tx_y, off_val, on_val, grid_delta, peak_b, (long long)now_ms());
+        tx_x, tx_y, off_val, on_val, grid_delta, peak_b, ts_ms, ts_str);
     int fd = open("/opt/etc/calibration.json", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         fprintf(stderr, "PIXEL-CAL: open calibration.json failed: %s\n", strerror(errno));
@@ -2387,6 +2436,24 @@ static void hold_leds_on(int duration_ms)
  * for cam2's baseline to be captured entirely in cam1's OFF state. */
 #define WATCHDOG_OFF_GRACE_MS      4500
 #define WATCHDOG_HOLD_MS          15000   /* cam1's responding hold for cam2's search */
+/* Guard tuning (replaces the old absolute-brightness "refuse weaker" gate).
+ * Rationale: with a single ON snapshot the watchdog cannot tell a bright
+ * static reflection from a real LED by brightness — the old `pb+30<saved_pb`
+ * test (a) accepted a far reflection that happened to read ~saved_pb and
+ * (b) trapped the cal, since the true TX reads dimmer than a reflection
+ * when the peer is idle, so it rejected the *correct* pixel as "weaker".
+ * Distance from a trusted saved cal is the only robust discriminator:
+ *  - within WATCHDOG_NEAR_PX of saved → normal local refinement, always OK
+ *    (this is what un-traps recovery: a correct-but-dimmer near pixel now
+ *    passes instead of being rejected on brightness).
+ *  - a far relocation is only legitimate when a deliberate solid-LED beacon
+ *    is present (bumped-camera bootstrap: cam2 holds LEDs → strong sustained
+ *    trigger delta). Ambient/reflection that merely cleared the +15 trigger
+ *    floor must NOT move a trusted cal far. */
+#define WATCHDOG_NEAR_PX            48    /* ≤ this from saved pixel = local refine */
+#define WATCHDOG_RELOCATE_DELTA     25    /* far jump needs trigger delta ≥ this
+                                             (well above the 15 trigger floor →
+                                             a real beacon, not ambient) */
 
 /* Set in daemon_mode (listener side) when watchdog is armed; used to gate
  * the startup grace period before the watchdog can actually fire. */
@@ -2445,10 +2512,10 @@ static int watchdog_should_run(void)
 /* The handler. Runs entirely within the watchdog thread. Sets
  * cal_flow_active across its lifetime so other timers (split-brain,
  * AE-drift defense) treat the work as a legitimate cal flow. */
-static void handle_watchdog_trigger(int block_idx)
+static void handle_watchdog_trigger(int block_idx, int trigger_delta)
 {
-    log_event("WATCHDOG", "fired block=%d (%d×%d=col,row)",
-              block_idx, block_idx % 20, block_idx / 20);
+    log_event("WATCHDOG", "fired block=%d (%d×%d=col,row) trig_delta=%d",
+              block_idx, block_idx % 20, block_idx / 20, trigger_delta);
     fprintf(stderr, "WATCHDOG: triggered on block %d — refining pixel\n",
             block_idx);
     status_set("watchdog_refining",
@@ -2479,33 +2546,45 @@ static void handle_watchdog_trigger(int block_idx)
     int on_v  = off_v + WATCHDOG_DELTA;  /* nominal — find_peak gives us pb */
     int delta_v = WATCHDOG_DELTA;
 
-    /* Guard: refuse to overwrite a strong saved cal with a much weaker one.
-     * Wyze V3 has 8 IR LEDs in a ring + nearby surfaces (desk, wall) reflect
-     * IR — the brightest grid block on any given watchdog trigger may be a
-     * weak reflection rather than a direct LED hit. Without this guard a
-     * single bad watchdog refinement (e.g. peak_b=158 from a floor bounce)
-     * trashes a previously-good cal (peak_b=235 from direct LED). Threshold
-     * of 30 units = roughly one ISP step; tighter than that risks rejecting
-     * legitimate re-cals after physical shifts. */
+    /* Guard (replaces the old absolute-brightness "refuse weaker" test —
+     * see WATCHDOG_NEAR_PX / WATCHDOG_RELOCATE_DELTA rationale above).
+     * A single ON snapshot can't tell a bright static reflection from a
+     * real LED, so we anchor on distance from the trusted saved cal:
+     * local refinements always pass (this un-traps recovery — a
+     * correct-but-dimmer near pixel is no longer rejected on brightness);
+     * a FAR relocation is allowed only when a deliberate solid-LED beacon
+     * is present (strong sustained trigger delta), i.e. the bumped-camera
+     * bootstrap case. peak_b is logged for diagnostics only — no longer a
+     * decision input. */
     int saved_pb = read_saved_peak_brightness();
-    if (saved_pb > 0 && pb + 30 < saved_pb) {
-        fprintf(stderr,
-            "WATCHDOG: refusing to overwrite saved cal — "
-            "new pb=%d < saved pb=%d - 30 (likely reflection, not direct LED)\n",
-            pb, saved_pb);
-        log_event("WATCHDOG",
-            "refuse-overwrite new_pb=%d saved_pb=%d block=%d pixel=(%d,%d)",
-            pb, saved_pb, block_idx, px, py);
-        /* Don't update pixel_x/pixel_y or roi_config either — keep the
-         * current ROI so subsequent RX continues at the saved-cal pixel. */
-        status_set("watchdog_skipped", "weak refinement; kept saved cal");
-        set_ae_freeze(1);
-        last_valid_frame_ms = now_ms();
-        last_substantial_decode_fail_ms = 0;
-        watchdog_baseline_init = 0;
-        cal_flow_active = 0;
-        watchdog_active = 0;
-        return;
+    int sx = -1, sy = -1;
+    if (read_saved_pixel(&sx, &sy) == 0) {
+        long ddx = px - sx, ddy = py - sy;
+        long dist2 = ddx * ddx + ddy * ddy;
+        long near2 = (long)WATCHDOG_NEAR_PX * WATCHDOG_NEAR_PX;
+        if (dist2 > near2 && trigger_delta < WATCHDOG_RELOCATE_DELTA) {
+            fprintf(stderr,
+                "WATCHDOG: refusing far relocation — new=(%d,%d) saved=(%d,%d) "
+                "dist2=%ld (near2=%ld) trig_delta=%d < %d "
+                "(reflection/ambient, not a beacon; pb=%d saved_pb=%d)\n",
+                px, py, sx, sy, dist2, near2,
+                trigger_delta, WATCHDOG_RELOCATE_DELTA, pb, saved_pb);
+            log_event("WATCHDOG",
+                "refuse-relocate new=(%d,%d) saved=(%d,%d) dist2=%ld "
+                "trig_delta=%d block=%d pb=%d",
+                px, py, sx, sy, dist2, trigger_delta, block_idx, pb);
+            /* Keep the current ROI/cal — subsequent RX continues at the
+             * saved-cal pixel. */
+            status_set("watchdog_skipped",
+                       "far jump w/o strong beacon; kept saved cal");
+            set_ae_freeze(1);
+            last_valid_frame_ms = now_ms();
+            last_substantial_decode_fail_ms = 0;
+            watchdog_baseline_init = 0;
+            cal_flow_active = 0;
+            watchdog_active = 0;
+            return;
+        }
     }
 
     write_calibration_json(px, py, off_v, on_v, delta_v, pb);
@@ -2686,7 +2765,7 @@ static void *grid_watchdog_thread(void *unused)
         }
 
         if (triggered >= 0) {
-            handle_watchdog_trigger(triggered);
+            handle_watchdog_trigger(triggered, best_delta);
         }
     }
     return NULL;
@@ -3137,26 +3216,36 @@ static int do_connect(void)
     return -1;
 }
 
-/* Single-attempt connect with caller-controlled timeout. Used by monocal's
-   bootstrap-fallback path: send one SYN, wait briefly, return -1 fast if
-   the peer doesn't ACK so we can pivot to a light-only bootstrap instead
-   of waiting through MAX_RETRIES * ack_timeout_ms (~3.5min default).
-   On the happy path (peer ACKs quickly), behavior matches do_connect's
-   first iteration exactly. */
-static int do_connect_short(int wait_ms)
+/* Bounded-retry connect with caller-controlled per-attempt timeout. Used by
+   monocal's bootstrap-fallback path: send up to `tries` SYNs, returning -1
+   fast (after tries * attempt_ms) so we can pivot to a light-only bootstrap
+   instead of grinding through do_connect's MAX_RETRIES * ack_timeout_ms
+   (~3.5min). One SYN→SYN_ACK round trip at 160ms/sym is ~35-37s, so a single
+   SYN with a 35s budget (the old behavior) frequently expired even on a good
+   decode and gave the first SYN ZERO retransmit — one transient miss on the
+   peer (mid-watchdog / AE-settle / baseline) doomed the protocol path. A
+   small bounded retry rescues a lone miss while still failing fast enough to
+   keep the bootstrap pivot snappy when the peer's pixel is genuinely wrong.
+   On the happy path (peer ACKs on the first try) behavior is unchanged. */
+static int do_connect_short(int attempt_ms, int tries)
 {
-    fprintf(stderr, "PROTO: short-handshake SYN (%dms wait)...\n", wait_ms);
-    send_message(MSG_SYN, 0, NULL, 0);
+    for (int attempt = 0; attempt < tries && running; attempt++) {
+        fprintf(stderr, "PROTO: short-handshake SYN (try %d/%d, %dms wait)...\n",
+                attempt + 1, tries, attempt_ms);
+        send_message(MSG_SYN, 0, NULL, 0);
 
-    rx_message_t reply;
-    if (wait_for_msg(MSG_SYN_ACK, &reply, wait_ms) == 0) {
-        fprintf(stderr, "PROTO: got SYN_ACK! Sending ACK...\n");
-        send_message(MSG_ACK, 0, NULL, 0);
-        fprintf(stderr, "PROTO: connected!\n");
-        status_set("connected", "got SYN_ACK; sent ACK");
-        return 0;
+        rx_message_t reply;
+        if (wait_for_msg(MSG_SYN_ACK, &reply, attempt_ms) == 0) {
+            fprintf(stderr, "PROTO: got SYN_ACK! Sending ACK...\n");
+            send_message(MSG_ACK, 0, NULL, 0);
+            fprintf(stderr, "PROTO: connected!\n");
+            status_set("connected", "got SYN_ACK; sent ACK");
+            return 0;
+        }
+        fprintf(stderr,
+            "PROTO: short-handshake SYN_ACK timeout (try %d/%d, %dms)\n",
+            attempt + 1, tries, attempt_ms);
     }
-    fprintf(stderr, "PROTO: short-handshake SYN_ACK timeout (%dms)\n", wait_ms);
     return -1;
 }
 
@@ -3876,6 +3965,49 @@ static void handle_monocal_request(void)
     status_set("monocal_resp_ack", "monocal — sending CAL_ACK as scanner");
     last_valid_frame_ms = now_ms();
 
+    /* Exposure rebalance (scanner-side, pre-CAL_ACK). cam1's daemon-listen
+       holds AE frozen continuously at idle (daemon_mode re-asserts
+       set_ae_freeze(1) after every handled message), so without this the
+       scanner would capture its baseline at whatever exposure the ISP locked
+       at BOOT under boot-time ambient — do_grid_calibration's
+       `set_ae_freeze(1); usleep(500000)` is a no-op in this path because AE
+       is already frozen. If ambient shifted since boot the locked exposure is
+       mismatched (too dark → weak peer-LED Δ; too bright → clipped).
+
+       The holder (peer) has sent CAL_REQ and is now blocked waiting for our
+       CAL_ACK — it will NOT drive LEDs until it receives it, so right here is
+       the one window where the scene is provably peer-LEDs-OFF long enough to
+       let AE re-adapt. Unfreeze, let AE free-run to current ambient, refreeze
+       at the balanced level, THEN send CAL_ACK.
+
+       SYNC_BARRIER stays correct without re-derivation: cal_ack_sent_at is
+       captured AFTER this block and the holder's 13.5s hold clock starts only
+       when it receives CAL_ACK — both anchors shift forward by exactly this
+       settle delay, so their relationship is unchanged. The added delay is
+       far inside the holder's CAL_ACK-wait ack_timeout_ms (~77s @ 160ms/sym),
+       so no CAL_REQ retransmit risk. cal_flow_active is already 1, so the
+       AE-drift defense (which only re-asserts when !cal_flow_active) won't
+       fight our unfreeze. */
+    {
+        const int64_t AE_REBALANCE_SETTLE_MS = 4000;
+        fprintf(stderr,
+            "PROTO: monocal — rebalancing exposure (AE free-run %lldms, "
+            "peer LEDs OFF) before CAL_ACK\n",
+            (long long)AE_REBALANCE_SETTLE_MS);
+        status_set("monocal_resp_aebal",
+                   "rebalancing exposure before scan");
+        set_ae_freeze(0);
+        int64_t reb_until = now_ms() + AE_REBALANCE_SETTLE_MS;
+        while (now_ms() < reb_until && running) {
+            int64_t remaining = reb_until - now_ms();
+            if (remaining > 200000) remaining = 200000;  /* defensive cap */
+            usleep((useconds_t)(remaining * 1000));
+        }
+        set_ae_freeze(1);
+        fprintf(stderr,
+            "PROTO: monocal — exposure rebalanced, AE refrozen\n");
+    }
+
     send_message(MSG_CAL_ACK, 0, NULL, 0);
     int64_t cal_ack_sent_at = now_ms();
 
@@ -4079,20 +4211,28 @@ static int daemon_mode(int is_listener)
         return 1;
     }
 
-    /* Grid-watchdog: only meaningful for the listener side (cam1's
-       bootstrap detector). Detached — exits when running=0 + process
-       exit. Active state is gated by watchdog_should_run() based on
-       last_valid_frame_ms (no decode yet OR long-idle), with a
-       WATCHDOG_STARTUP_GRACE_MS delay measured from arming. */
-    if (is_listener) {
-        watchdog_armed_at_ms = now_ms();
-        watchdog_enabled = 1;
-        pthread_t wd_tid;
-        if (pthread_create(&wd_tid, NULL, grid_watchdog_thread, NULL) == 0)
-            pthread_detach(wd_tid);
-        else
-            fprintf(stderr, "WATCHDOG: failed to spawn thread (continuing)\n");
-    }
+    /* Grid-watchdog DISABLED 2026-05-15 — never armed, never spawned.
+       It auto-overwrote /opt/etc/calibration.json from a single LED-ON
+       brightness argmax with NO peer ground truth. No brightness / delta /
+       distance heuristic can separate a real beacon from a bright ambient
+       reflection: field event logs showed it saving garbage pixels with
+       trigger deltas of 38 / 31 / 60 — STRONGER than a genuine cam2 beacon
+       (only +13..+21) — while no peer was transmitting, random-walking
+       cam1's saved pixel ~200px across the frame every ~10 min and leaving
+       cam1 booting blind on every reboot. Its only legitimate role was a
+       light-only bootstrap LED-hold for a wrong-pixel cam1, but it was
+       ITSELF the cause of the wrong pixel, and the protocol/monocal
+       handshake — reliable after the 2×45s short-handshake fix — is the
+       correct, peer-confirmed way to refresh cal. So cal is now persisted
+       ONLY by a confirmed peer monocal/CAL_DONE. watchdog_enabled stays 0,
+       so watchdog_should_run() always returns 0 (defense in depth if the
+       thread is ever spawned elsewhere). The watchdog code is kept compiled
+       and referenced below so re-enabling is a one-block revert. */
+    (void)grid_watchdog_thread;   /* intentionally never run; see above */
+    (void)watchdog_armed_at_ms;   /* unused while disabled */
+    if (is_listener)
+        fprintf(stderr,
+            "WATCHDOG: disabled — cal is peer-confirmed (monocal) only\n");
 
     /* Handshake */
     int connected;
@@ -4424,9 +4564,16 @@ int main(int argc, char *argv[])
         }
 
         monocal_set_state("handshaking", NULL);
-        const int SHORT_HANDSHAKE_MS = 35000;  /* one SYN + SYN_ACK round
-                                                 trip at 160ms/sym ≈ 33s */
-        int handshake_ok = (do_connect_short(SHORT_HANDSHAKE_MS) == 0);
+        /* 45s/try comfortably clears one ~35-37s round trip at 160ms/sym
+         * (the old 35s single-shot frequently expired on a GOOD decode and
+         * gave zero retransmit); 2 tries rescues a lone transient miss on
+         * cam1. Worst case 90s before the bootstrap pivot — still well
+         * under do_connect's ~230s, so fast-fail-to-bootstrap for a
+         * genuinely-wrong cam1 pixel is preserved. */
+        const int SHORT_HANDSHAKE_PER_TRY_MS = 45000;
+        const int SHORT_HANDSHAKE_TRIES = 2;
+        int handshake_ok = (do_connect_short(SHORT_HANDSHAKE_PER_TRY_MS,
+                                             SHORT_HANDSHAKE_TRIES) == 0);
 
         if (handshake_ok) {
             /* HAPPY PATH: cam1 decoded our SYN. Branch on direction —
@@ -4582,8 +4729,19 @@ int main(int argc, char *argv[])
         monocal_have_peer_pixel = 1;
         monocal_ended_ms = now_ms();
         monocal_ok = 1;
-        monocal_set_state("monocal_done",
-            "bootstrap fallback: both cams refreshed via light-only path");
+        /* The bootstrap path inherently refreshes BOTH cams in one
+         * light-only sequence: cam1 via its grid-watchdog refine during
+         * our 25s hold, cam2 via the do_search above. For `--both` that
+         * IS the complete bidirectional result, so emit the terminal
+         * state the both-flow waits on (monocal_rev_done) rather than
+         * monocal_done — otherwise the webui times out waiting for a
+         * protocol Phase 2 that the bootstrap path legitimately subsumes.
+         * Plain `monocal` (CAM1-only) still ends at monocal_done. */
+        monocal_set_state(
+            monocal_both ? "monocal_rev_done" : "monocal_done",
+            monocal_both
+              ? "bootstrap fallback: both cams refreshed (light-only path)"
+              : "bootstrap fallback: cam1 refreshed via light-only path");
         gpio_set(0);  /* defensive — match the failure-path cleanup */
         set_ae_freeze(0);
         return 0;

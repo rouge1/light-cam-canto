@@ -1,19 +1,28 @@
-"""Thin proxy + 2 fire-and-forget pushes for the LiWiFi webui.
+"""Decoupled poller + SSE push for the LiWiFi webui.
 
-The server's only job is to forward per-cam HTTP reads through
-host.cam_status.CamStatusClient (cookie-cached, fail-soft) and expose two
-push endpoints:
+ONE background poller thread per cam (CamPoller) owns every routine camera
+read via the single consolidated /x/all-status.cgi, writing results into an
+in-memory cache. Request handlers serve that cache and NEVER call a camera
+on the request thread, so the browser cannot hang on a slow/down cam no
+matter how many tabs are open. An adaptive cadence + circuit breaker keep a
+misbehaving cam from being hammered. The browser is a pure receiver: it
+subscribes to /api/events/stream (SSE) and the server pushes the
+consolidated {cam1, cam2} snapshot; the cameras themselves never do SSE
+(their single-process uhttpd has only one CGI slot).
 
-  POST /api/cal/start    detached `python -m host.cal_procedure --no-interactive`
-  POST /api/cal/monocal  one POST to cam2's /x/monocal-trigger.cgi
+  GET  /api/events/stream  SSE: pushed {cam1, cam2} snapshots (~1.5s)
+  POST /api/cal/start       detached `python -m host.cal_procedure --no-interactive`
+  POST /api/cal/monocal     one POST to cam2's /x/monocal-trigger.cgi
 
-No long-running worker threads; no SSH calls in any request handler. The
-frontend reads each cam's state independently via /api/cam{1,2}/* and shows
-two per-camera columns of state-machine transitions. cal_procedure is
-self-contained for its own cam1 daemon kill/restart, so the webui can fire
-and forget.
+cal_procedure is self-contained for its own cam1 daemon kill/restart, so the
+webui can fire and forget. No SSH calls in any request handler.
+
+All GET /api/{cam}/{status,leds,ae,proc,all,health} are now instant
+in-memory reads served from the CamPoller's snapshot (no per-request curl).
 
 Endpoints:
+  GET  /api/events/stream       SSE push of consolidated {cam1, cam2} snapshots
+  GET  /api/{cam}/all           poller snapshot: {status, leds, ae, proc} + meta
   GET  /api/{cam}/grid          → CamStatusClient.get_brightness_grid()
   GET  /api/{cam}/ae            → CamStatusClient.get_ae_freeze()
   POST /api/{cam}/ae            body `value=0|1`
@@ -187,6 +196,317 @@ def _cam_get_or_fetch(cam: str, key: str, ttl: float, fetch_fn):
     return _cache_get_or_fetch(key, ttl, fetch_fn)
 
 
+def _cam_snapshot(key: str):
+    """Non-blocking read of the latest poller-written cache entry. Returns
+    the value or None. NEVER calls a fetch function — the request handler
+    thread must not block on a camera. The CamPoller (below) keeps these
+    keys warm; a None here just means the poller hasn't completed its first
+    cycle yet (or the cam is down), which every handler already renders as
+    its null-shaped default."""
+    cached = _cache.get(key)
+    return cached[1] if cached else None
+
+
+# ---------------------------------------------------------------------------
+# Background poller. ONE daemon thread per cam owns every routine camera read
+# (the single consolidated /x/all-status.cgi). It writes results into the
+# same `_cache` the request handlers read via _cam_snapshot, so the browser
+# never blocks on a camera and the cam is hit at a fixed low rate regardless
+# of how many browser tabs / SSE clients are connected. An adaptive cadence
+# (fast while a client is watching, slow when idle) plus a circuit breaker
+# (a slow/down cam drops to a cheap 2s TCP probe instead of an 8s curl every
+# cycle) keep a misbehaving cam from stalling anything.
+# ---------------------------------------------------------------------------
+
+POLL_ACTIVE_S = 2.0           # a client is watching (demand within DEMAND_TTL_S)
+POLL_IDLE_S = 10.0            # nobody watching — back off, ease cam load
+POLL_BREAKER_S = 10.0         # cam is failing — probe-only at this cadence
+POLLER_FETCH_TIMEOUT_S = 3.0  # curl --max-time for the poll read. Kept ≥2.5:
+                              # cam1's TCP handshake spikes ~1.6s mid-CGI-fork
+                              # (see _PROBE_CONNECT_S note above).
+BREAKER_TRIP = 3              # consecutive failures before the breaker opens
+DEMAND_TTL_S = 12.0           # a demand keeps the poller "active" this long
+MONOCAL_MAX_S = 420.0         # hard ceiling on monocal-active polling (~7 min)
+
+SSE_FRAME_S = 1.5             # push cadence to the browser (memory read only)
+SSE_HEARTBEAT_S = 15.0        # comment-line keepalive / dead-socket detector
+
+
+class CamPoller:
+    """One daemon thread per cam. Polls the consolidated all-status CGI and
+    writes the result — plus the demuxed per-key entries (status/leds/ae/proc)
+    — into `_cache` so every existing request handler gets an instant warm
+    hit and never calls curl itself."""
+
+    def __init__(self, cam: str, client: CamStatusClient):
+        self.cam = cam
+        self.client = client
+        self.reachable = False
+        self.consecutive_failures = 0
+        self.last_ok_monotonic: float | None = None
+        self.interval = POLL_ACTIVE_S
+        self._active_demand_until = 0.0
+        self.monocal_active = False
+        self._monocal_until = 0.0
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self.thread = threading.Thread(
+            target=self.run, name=f"poller-{cam}", daemon=True)
+
+    # --- public: called from request handlers / SSE / control POSTs ---
+
+    def note_demand(self):
+        """Mark that a client is actively watching this cam. Keeps the
+        poller at the fast cadence and wakes it now, so a client connecting
+        after an idle stretch gets a fresh snapshot within a cycle rather
+        than after a full idle interval."""
+        self._active_demand_until = time.monotonic() + DEMAND_TTL_S
+        self._wake.set()
+
+    def mark_monocal_active(self):
+        """Called after a successful monocal trigger so this poller also
+        refreshes cam2:monocal-status each cycle (bounded by MONOCAL_MAX_S)."""
+        self.monocal_active = True
+        self._monocal_until = time.monotonic() + MONOCAL_MAX_S
+        self.note_demand()
+
+    def freshness(self) -> tuple[bool, float | None, bool]:
+        """(_online, _age_s, _stale) for the UI. `stale` means the poll
+        loop hasn't landed a success within ~2× its *current* cadence (so
+        data that's old simply because nobody's watching — idle cadence —
+        isn't mislabeled as stale), or it has never succeeded. `online` is
+        the independent reachability signal the UI keys OFFLINE off."""
+        if self.last_ok_monotonic is None:
+            return (self.reachable, None, True)
+        age = round(time.monotonic() - self.last_ok_monotonic, 1)
+        tol = max(2 * POLL_ACTIVE_S, 2 * self.interval)
+        return (self.reachable, age, age > tol)
+
+    def status_dict(self) -> dict:
+        """Diagnostic snapshot for /api/server-stats."""
+        age = (None if self.last_ok_monotonic is None
+               else round(time.monotonic() - self.last_ok_monotonic, 1))
+        return {
+            "interval": self.interval,
+            "reachable": self.reachable,
+            "failures": self.consecutive_failures,
+            "breaker_open": self._breaker_open(),
+            "last_ok_age_s": age,
+            "monocal_active": self.monocal_active,
+        }
+
+    def stop(self):
+        self._stop.set()
+        self._wake.set()
+
+    # --- internals ---
+
+    def _breaker_open(self) -> bool:
+        return self.consecutive_failures >= BREAKER_TRIP
+
+    def _is_active(self) -> bool:
+        return time.monotonic() < self._active_demand_until
+
+    def _compute_interval(self) -> float:
+        if self._breaker_open():
+            return POLL_BREAKER_S
+        return POLL_ACTIVE_S if self._is_active() else POLL_IDLE_S
+
+    def _commit_all(self, payload: dict):
+        """Write the consolidated payload + demuxed per-key cache entries
+        with fresh timestamps, so every existing handler key stays warm and
+        the request thread only ever reads memory."""
+        now = time.monotonic()
+        # Normalize ae int -> {value:int} once, matching the /api/{cam}/all
+        # and /api/{cam}/ae handler contract so consumers stay identical.
+        if isinstance(payload.get("ae"), int):
+            payload = dict(payload)
+            payload["ae"] = {"value": payload["ae"]}
+        _cache[f"{self.cam}:all"] = (now, payload)
+        st = payload.get("status")
+        if isinstance(st, dict):
+            _cache[f"{self.cam}:status"] = (now, st)
+        leds = payload.get("leds")
+        if isinstance(leds, dict):
+            _cache[f"{self.cam}:leds"] = (now, leds)
+        ae = payload.get("ae")
+        if isinstance(ae, dict) and isinstance(ae.get("value"), int):
+            _cache[f"{self.cam}:ae"] = (now, ae["value"])
+        proc = payload.get("proc")
+        if isinstance(proc, dict):
+            _cache[f"{self.cam}:proc"] = (now, proc)
+
+    def _poll_monocal(self):
+        if time.monotonic() > self._monocal_until:
+            self.monocal_active = False
+            return
+        ms = self.client.get_monocal_status()
+        if ms is not None:
+            _cache[f"{self.cam}:monocal-status"] = (time.monotonic(), ms)
+            state = ms.get("state", "")
+            if isinstance(state, str) and (state.endswith("_done")
+                                           or state.endswith("_failed")):
+                self.monocal_active = False
+
+    def _poll_once(self):
+        client = self.client
+        if self._breaker_open():
+            # Breaker open: only a cheap (cached) 2s TCP probe. One success
+            # → fall through and attempt one real fetch this cycle
+            # (half-open). Failure leaves the breaker open.
+            if not _probe_alive(client.ip):
+                self.reachable = False
+                return
+        payload = client.get_all_status(timeout=POLLER_FETCH_TIMEOUT_S)
+        if payload is not None:
+            self._commit_all(payload)
+            self.reachable = True
+            self.consecutive_failures = 0
+            self.last_ok_monotonic = time.monotonic()
+            # Auto-arm monocal-status polling whenever cam2 is actually
+            # running a monocal (irlink up + mode=monocal), regardless of
+            # how it was triggered (webui BOTH button, CGI, or a script).
+            # Keeps cam2:monocal-status fresh so the CAM2 per-cam column
+            # can show the fine-grained phase progression.
+            if self.cam == "cam2" and not self.monocal_active:
+                _st = payload.get("status") or {}
+                _pr = payload.get("proc") or {}
+                if (_st.get("mode") == "monocal"
+                        and isinstance(_pr.get("irlink"), int)
+                        and _pr["irlink"] >= 1):
+                    self.mark_monocal_active()
+        else:
+            self.consecutive_failures += 1
+            self.reachable = _probe_alive(client.ip)
+        if self.monocal_active:
+            self._poll_monocal()
+
+    def run(self):
+        # Stagger cam2 slightly so the two pollers don't fire in lockstep
+        # (they hit separate uhttpds, so this is purely load-smoothing).
+        if self.cam == "cam2":
+            self._stop.wait(0.3)
+        while not self._stop.is_set():
+            self._wake.clear()
+            cycle_t0 = time.monotonic()
+            try:
+                self._poll_once()
+            except Exception as e:
+                # Never let the poll thread die — a dead poller would freeze
+                # the snapshot for this cam forever.
+                print(f"[poller {self.cam}] {type(e).__name__}: {e}")
+                self.consecutive_failures += 1
+            self.interval = self._compute_interval()
+            elapsed = time.monotonic() - cycle_t0
+            # A note_demand()/stop() between now and the timeout sets _wake
+            # and ends this wait early for a snappy re-poll.
+            self._wake.wait(timeout=max(0.1, self.interval - elapsed))
+
+
+POLLERS: dict[str, "CamPoller"] = {}
+
+
+def init_pollers():
+    """Start one background poller per resolved cam. Call after
+    init_clients(). UNRESOLVED cams get no poller — their handlers keep
+    returning the existing 503."""
+    for cam, client in CLIENTS.items():
+        poller = CamPoller(cam, client)
+        POLLERS[cam] = poller
+        poller.thread.start()
+        print(f"  poller {cam}: started")
+
+
+def _breaker_open(cam: str) -> bool:
+    """True if this cam's poller has tripped its circuit breaker (cam slow
+    or down). Request handlers use this to fast-fail the few endpoints that
+    still do a synchronous curl, instead of blocking the request thread."""
+    p = POLLERS.get(cam)
+    return p is not None and p._breaker_open()
+
+
+def _cam_get_or_fetch_gated(cam: str, key: str, ttl: float, fetch_fn):
+    """Like _cam_get_or_fetch, for the handful of endpoints NOT served by
+    the poller (snapshot/cal-info/saved-cal/grid/grid-deltas). When the
+    poller's breaker is open, return last-good/None immediately rather than
+    issuing a curl that would block the request thread for the cam timeout."""
+    if _breaker_open(cam):
+        cached = _cache.get(key)
+        return cached[1] if cached else None
+    return _cam_get_or_fetch(cam, key, ttl, fetch_fn)
+
+
+def _nudge_poller(cam: str):
+    """After a control POST mutates cam state, wake its poller so the
+    snapshot reflects the change within a sub-second cycle instead of
+    waiting a full poll interval."""
+    p = POLLERS.get(cam)
+    if p is not None:
+        p.note_demand()
+
+
+def _nudge_monocal_poller():
+    """After a monocal trigger, arm cam2's poller to also refresh
+    monocal-status each cycle so the webui's M-phase UI tracks the run."""
+    p = POLLERS.get("cam2")
+    if p is not None:
+        p.mark_monocal_active()
+
+
+def _overlay_cam2_monocal(entry: dict) -> None:
+    """Mutate cam2's snapshot in place so its per-cam column shows the
+    FINE-GRAINED monocal phase. cam2's irlink-status.json only carries the
+    coarse connection lifecycle (idle→starting→link-up); the detailed phase
+    machine (monocal_req → … → monocal_rev_done, bootstrap_*) lives in
+    /run/monocal-status.json. During an active monocal we overlay that phase
+    onto status.state, so the existing column logic (pushEvent on state
+    change) + STATE_LABELS render every step in the CAM2 column itself —
+    not just the BOTH button. Reverts automatically when the run ends and
+    cam2:monocal-status ages out (poller stops refreshing it). status is
+    deep-ish copied so the shared cache entry is never mutated."""
+    ms = _cache_peek("cam2:monocal-status", 8.0)
+    if not isinstance(ms, dict):
+        return
+    st = ms.get("state")
+    if not isinstance(st, str) or st in ("", "never_run", "transient"):
+        return
+    status = dict(entry.get("status") or {})
+    status["state"] = st
+    msg = ms.get("error") or ms.get("message")
+    if msg:
+        status["last_event"] = msg
+    entry["status"] = status
+
+
+def _build_stream_frame() -> dict:
+    """Consolidated SSE push payload: each cam's latest snapshot + the
+    staleness meta, shaped EXACTLY like /api/{cam}/all so the frontend's
+    applySnapshot() treats stream and poll inputs identically. Reads only
+    in-memory snapshots — never touches a camera."""
+    frame: dict = {"_ts": time.time()}
+    for cam, poller in POLLERS.items():
+        snap = _cam_snapshot(f"{cam}:all")
+        if snap is None:
+            entry = {
+                "status": {},
+                "leds":   {"ir850": None, "ir940": None},
+                "ae":     None,
+                "proc":   {"irlink": None, "daynightd": None, "prudynt": None},
+            }
+        else:
+            entry = dict(snap)
+            if isinstance(entry.get("ae"), int):
+                entry["ae"] = {"value": entry["ae"]}
+        online, age, stale = poller.freshness()
+        entry["_online"] = online
+        entry["_age_s"] = age
+        entry["_stale"] = stale
+        if cam == "cam2":
+            _overlay_cam2_monocal(entry)
+        frame[cam] = entry
+    return frame
+
+
 CALIBRATION_JSON_PATH = os.path.join(REPO_ROOT, "host", "calibration.json")
 
 
@@ -223,6 +543,13 @@ def _read_cam2_sees_cam1_pixel() -> tuple[int, int] | None:
 CAM_HOSTS = {"cam1": "dacam1", "cam2": "dacam2"}
 CLIENTS: dict[str, CamStatusClient] = {}
 SERVER_STARTED_AT = time.time()
+
+# Hang-diagnostic counters. Bumped on every HTTP request; exposed via
+# /api/server-stats so the webui can plot growth over time. Helps tell
+# apart "client-side JS leak" from "server-side request backlog / thread
+# leak" when the user reports the page hanging after walking away.
+_request_count = 0
+_request_count_lock = threading.Lock()
 
 ANNOTATED_CACHE_DIR = "/tmp/liwifi-annotated"
 
@@ -852,13 +1179,27 @@ def _start_cal_subprocess() -> tuple[int, float] | None:
 # ============================================================
 
 
+# Per-connection socket timeout. Primary fix is the poller making GETs
+# non-blocking; this is defense-in-depth so a slow/stuck *client* (or a
+# half-open TCP) can't pin a worker thread forever. socketserver applies
+# this via connection.settimeout(); BaseHTTPRequestHandler.handle_one_request
+# already catches the resulting socket.timeout and closes cleanly. Comfortably
+# larger than the SSE heartbeat (15s) so live streams aren't reaped.
+REQUEST_SOCKET_TIMEOUT_S = 30
+
+
 class Handler(SimpleHTTPRequestHandler):
+    timeout = REQUEST_SOCKET_TIMEOUT_S
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=WEBUI_DIR, **kwargs)
 
     def log_message(self, format, *args): pass
 
     def handle_one_request(self):
+        global _request_count
+        with _request_count_lock:
+            _request_count += 1
         try:
             super().handle_one_request()
         except (BrokenPipeError, ConnectionResetError):
@@ -937,6 +1278,72 @@ class Handler(SimpleHTTPRequestHandler):
             })
             return
 
+        if path == "/api/server-stats":
+            # Hang-diagnostic endpoint. Reports server-side counters so the
+            # client diagnostic chips can plot growth: if request_count
+            # grows linearly with poll cycles AND cache_entries plateaus
+            # → the page is healthy server-side. If active_threads climbs
+            # without bound OR cache_entries grows without bound → real
+            # server-side leak driving the user's "frozen after 30 min"
+            # symptom.
+            self._send_json(200, {
+                "uptime_s": int(time.time() - SERVER_STARTED_AT),
+                "request_count": _request_count,
+                "active_threads": threading.active_count(),
+                "cache_entries": len(_cache),
+                "cache_lock_entries": len(_cache_locks),
+                "probe_cache_entries": len(_probe_cache),
+                # Per-cam poller health: interval should widen when idle and
+                # stay flat (not climb) when a cam is down; breaker_open=True
+                # means a cam is being throttled to cheap TCP probes.
+                "pollers": {c: p.status_dict() for c, p in POLLERS.items()},
+            })
+            return
+
+        if path == "/api/events/stream":
+            # Server-Sent Events: push the consolidated {cam1, cam2}
+            # snapshot to the browser so it never polls a camera. The
+            # payload is built from in-memory snapshots only — zero camera
+            # I/O on this thread. One thread per open tab is fine: it's the
+            # laptop, the thread sleeps between frames, and the heartbeat
+            # write reaps the thread when the tab goes away.
+            for poller in POLLERS.values():
+                poller.note_demand()
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+            # Don't let the keep-alive loop try to read another request off
+            # this socket once the stream ends.
+            self.close_connection = True
+            last_beat = time.monotonic()
+            try:
+                while True:
+                    frame = _build_stream_frame()
+                    self.wfile.write(
+                        b"data: " + json.dumps(frame).encode("utf-8") + b"\n\n")
+                    now = time.monotonic()
+                    if now - last_beat >= SSE_HEARTBEAT_S:
+                        self.wfile.write(b": ping\n\n")
+                        last_beat = now
+                    self.wfile.flush()
+                    # Keep the pollers in their fast cadence while a tab is
+                    # watching; when the last tab closes these stop and the
+                    # pollers fall back to the slow idle interval.
+                    for poller in POLLERS.values():
+                        poller.note_demand()
+                    time.sleep(SSE_FRAME_S)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                # Tab closed / navigated away / dead socket. Thread exits,
+                # connection is reaped — no leak.
+                pass
+            return
+
         if path == "/api/cal/status":
             pid, started = _read_cal_pid()
             self._send_json(200, {
@@ -947,14 +1354,18 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/cal/monocal-status":
-            cam2 = self._client_for("cam2")
-            cam1 = self._client_for("cam1")
-            cam2_status = _cam_get_or_fetch(
-                "cam2", "cam2:monocal-status", _CACHE_TTL["monocal-status"],
-                cam2.get_monocal_status) if cam2 else None
-            cam1_status = _cam_get_or_fetch(
-                "cam1", "cam1:status", _CACHE_TTL["status"],
-                cam1.get) if cam1 else None
+            # Non-blocking. Polling this endpoint self-arms cam2's poller to
+            # also refresh monocal-status each cycle (bounded, auto-clears on
+            # a terminal state) so the M-phase UI works even when monocal was
+            # triggered out-of-band (e.g. directly via cam2's CGI).
+            p2 = POLLERS.get("cam2")
+            p1 = POLLERS.get("cam1")
+            if p2 is not None:
+                p2.mark_monocal_active()
+            if p1 is not None:
+                p1.note_demand()
+            cam2_status = _cam_snapshot("cam2:monocal-status")
+            cam1_status = _cam_snapshot("cam1:status")
             self._send_json(200, {
                 "cam2": cam2_status or {"state": "transient"},
                 "cam1": cam1_status or {},
@@ -972,8 +1383,8 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if op == "grid":
-            r = _cam_get_or_fetch(cam, f"{cam}:grid", _CACHE_TTL["grid"],
-                                  client.get_brightness_grid)
+            r = _cam_get_or_fetch_gated(cam, f"{cam}:grid", _CACHE_TTL["grid"],
+                                        client.get_brightness_grid)
             if r is None:
                 self._send_json(200, {"ts": None, "blocks": None})
                 return
@@ -982,14 +1393,13 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if op == "ae":
-            v = _cam_get_or_fetch(cam, f"{cam}:ae", _CACHE_TTL["ae"],
-                                  client.get_ae_freeze)
+            # Poller-backed: instant in-memory read, never touches the cam.
+            v = _cam_snapshot(f"{cam}:ae")
             self._send_json(200, {"value": v})
             return
 
         if op == "proc":
-            r = _cam_get_or_fetch(cam, f"{cam}:proc", _CACHE_TTL["proc"],
-                                  client.get_proc_status)
+            r = _cam_snapshot(f"{cam}:proc")
             if r is None:
                 self._send_json(200, {"irlink": None, "daynightd": None, "prudynt": None})
                 return
@@ -997,8 +1407,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if op == "status":
-            r = _cam_get_or_fetch(cam, f"{cam}:status", _CACHE_TTL["status"],
-                                  client.get)
+            r = _cam_snapshot(f"{cam}:status")
             if r is None:
                 self._send_json(200, {})
                 return
@@ -1017,9 +1426,10 @@ class Handler(SimpleHTTPRequestHandler):
             t0 = time.monotonic()
             allst = _cache_peek(f"{cam}:all", _CACHE_TTL["all"])
             if allst is None:
-                # Cache miss → fetch via the normal single-flight path.
-                allst = _cam_get_or_fetch(cam, f"{cam}:all", _CACHE_TTL["all"],
-                                          client.get_all_status)
+                # Cold path (poller hasn't filled the snapshot yet): read
+                # the snapshot non-blocking. Never curl on the request
+                # thread — the poller owns the all-status fetch.
+                allst = _cam_snapshot(f"{cam}:all")
             # Extract vitals: prefer the all-status payload (one round trip
             # already paid for above); fall back to standalone health.cgi
             # if the cam is running an older build of all-status.cgi that
@@ -1028,8 +1438,12 @@ class Handler(SimpleHTTPRequestHandler):
             if isinstance(allst, dict):
                 vitals = allst.get("vitals")
             if vitals is None:
-                vitals = _cam_get_or_fetch(cam, f"{cam}:health",
-                                           _CACHE_TTL["health"], client.get_health)
+                # Only reached on an older cam build whose all-status.cgi
+                # lacks the `vitals` block. Gated so a slow/down cam
+                # fast-fails instead of blocking this request thread.
+                vitals = _cam_get_or_fetch_gated(cam, f"{cam}:health",
+                                                 _CACHE_TTL["health"],
+                                                 client.get_health)
             uhttpd_ms = int((time.monotonic() - t0) * 1000)
             if isinstance(allst, dict) and isinstance(allst.get("ae"), int):
                 allst["ae"] = {"value": allst["ae"]}
@@ -1047,30 +1461,44 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if op == "all":
-            # Single consolidated read of status+leds+ae+proc, one CGI fork
-            # on the cam. The webui poll cycle uses this to avoid 4-way
-            # serialization on cam1's single-process uhttpd. Demux happens
-            # client-side. Shape always present so the frontend can rely
-            # on `r.proc.irlink` etc. without optional-chaining everywhere.
-            r = _cam_get_or_fetch(cam, f"{cam}:all", _CACHE_TTL["all"],
-                                  client.get_all_status)
+            # Poller-backed, non-blocking. The CamPoller owns the single
+            # consolidated all-status.cgi fetch; this handler only reads the
+            # in-memory snapshot, so the browser NEVER blocks on the cam no
+            # matter how slow/down it is. `_online/_age_s/_stale` let the UI
+            # show "stale" instead of freezing.
+            poller = POLLERS.get(cam)
+            if poller is not None:
+                poller.note_demand()
+            online, age, stale = (
+                poller.freshness() if poller is not None else (False, None, True))
+            r = _cam_snapshot(f"{cam}:all")
             if r is None:
                 self._send_json(200, {
                     "status": {},
                     "leds":   {"ir850": None, "ir940": None},
                     "ae":     None,
                     "proc":   {"irlink": None, "daynightd": None, "prudynt": None},
+                    "_online": online,
+                    "_age_s":  age,
+                    "_stale":  True,
                 })
                 return
-            # Normalize ae from int to {value: int} so it matches /api/{cam}/ae.
-            if isinstance(r.get("ae"), int):
-                r["ae"] = {"value": r["ae"]}
-            self._send_json(200, r)
+            # Copy so the staleness meta isn't written back into the shared
+            # cache entry. ae is already normalized to {value:int} by the
+            # poller's _commit_all; re-normalize defensively.
+            resp = dict(r)
+            if isinstance(resp.get("ae"), int):
+                resp["ae"] = {"value": resp["ae"]}
+            resp["_online"] = online
+            resp["_age_s"] = age
+            resp["_stale"] = stale
+            if cam == "cam2":
+                _overlay_cam2_monocal(resp)
+            self._send_json(200, resp)
             return
 
         if op == "leds":
-            r = _cam_get_or_fetch(cam, f"{cam}:leds", _CACHE_TTL["leds"],
-                                  client.get_led_state)
+            r = _cam_snapshot(f"{cam}:leds")
             if r is None:
                 self._send_json(200, {"ir850": None, "ir940": None, "ircut": None})
                 return
@@ -1083,7 +1511,7 @@ class Handler(SimpleHTTPRequestHandler):
                 params = dict(urllib.parse.parse_qsl(query))
                 if params.get("ch") == "0":
                     ch = 0
-            data = _cam_get_or_fetch(
+            data = _cam_get_or_fetch_gated(
                 cam, f"{cam}:snapshot:{ch}", _CACHE_TTL["snapshot"],
                 lambda: client.get_snapshot(channel=ch))
             if data is None:
@@ -1103,7 +1531,7 @@ class Handler(SimpleHTTPRequestHandler):
                 qparams = dict(urllib.parse.parse_qsl(query))
                 if qparams.get("fmt") == "png":
                     want_png = True
-            raw = _cam_get_or_fetch(
+            raw = _cam_get_or_fetch_gated(
                 cam, f"{cam}:snapshot:1", _CACHE_TTL["snapshot"],
                 lambda: client.get_snapshot(channel=1))
             if raw is None:
@@ -1113,10 +1541,9 @@ class Handler(SimpleHTTPRequestHandler):
             # the cal pixel. The wire bytes (return value [0]) never carry
             # the bullseye — receiver overlays it from coords it already
             # has from CAL_DONE.
-            saved = _cam_get_or_fetch(cam, f"{cam}:saved-cal", 10.0,
-                                      client.get_saved_cal)
-            status = _cam_get_or_fetch(cam, f"{cam}:status", _CACHE_TTL["status"],
-                                       client.get) or {}
+            saved = _cam_get_or_fetch_gated(cam, f"{cam}:saved-cal", 10.0,
+                                            client.get_saved_cal)
+            status = _cam_snapshot(f"{cam}:status") or {}
             label = f"{cam.upper()} SEES {('CAM2' if cam == 'cam1' else 'CAM1')}"
             try:
                 bin_bytes, png_bytes = _tiny_wireframe(raw, label, saved, status)
@@ -1133,16 +1560,15 @@ class Handler(SimpleHTTPRequestHandler):
             # Fax/wireframe variant of snapshot-annotated — designed to
             # look like the cal artifact would if it were small enough to
             # transmit over the IR link itself. Returns PNG.
-            raw = _cam_get_or_fetch(
+            raw = _cam_get_or_fetch_gated(
                 cam, f"{cam}:snapshot:1", _CACHE_TTL["snapshot"],
                 lambda: client.get_snapshot(channel=1))
             if raw is None:
                 self._send_text(503, "(snapshot fetch failed)\n")
                 return
-            status = _cam_get_or_fetch(cam, f"{cam}:status", _CACHE_TTL["status"],
-                                       client.get) or {}
-            saved = _cam_get_or_fetch(cam, f"{cam}:saved-cal", 10.0,
-                                      client.get_saved_cal)
+            status = _cam_snapshot(f"{cam}:status") or {}
+            saved = _cam_get_or_fetch_gated(cam, f"{cam}:saved-cal", 10.0,
+                                            client.get_saved_cal)
             label = f"{cam.upper()} SEES {('CAM2' if cam == 'cam1' else 'CAM1')}"
             try:
                 img_bytes = _faxify_snapshot(raw, status, saved, label)
@@ -1157,16 +1583,15 @@ class Handler(SimpleHTTPRequestHandler):
             # info bar onto the substream JPEG. Single curl returns a
             # self-describing image that's also persisted to
             # /tmp/liwifi-annotated/{cam}.jpg.
-            raw = _cam_get_or_fetch(
+            raw = _cam_get_or_fetch_gated(
                 cam, f"{cam}:snapshot:1", _CACHE_TTL["snapshot"],
                 lambda: client.get_snapshot(channel=1))
             if raw is None:
                 self._send_text(503, "(snapshot fetch failed)\n")
                 return
-            status = _cam_get_or_fetch(cam, f"{cam}:status", _CACHE_TTL["status"],
-                                       client.get) or {}
-            saved = _cam_get_or_fetch(cam, f"{cam}:saved-cal", 10.0,
-                                      client.get_saved_cal)
+            status = _cam_snapshot(f"{cam}:status") or {}
+            saved = _cam_get_or_fetch_gated(cam, f"{cam}:saved-cal", 10.0,
+                                            client.get_saved_cal)
             label = f"{cam.upper()} SEES {('CAM2' if cam == 'cam1' else 'CAM1')}"
             try:
                 img_bytes = _annotate_snapshot(raw, status, saved, label)
@@ -1177,14 +1602,13 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if op == "cal-info":
-            r = _cam_get_or_fetch(cam, f"{cam}:status", _CACHE_TTL["status"],
-                                  client.get)
+            r = _cam_snapshot(f"{cam}:status")
             if r is None:
                 r = {}
             else:
                 r = dict(r)
-            saved = _cam_get_or_fetch(cam, f"{cam}:saved-cal", 10.0,
-                                      client.get_saved_cal)
+            saved = _cam_get_or_fetch_gated(cam, f"{cam}:saved-cal", 10.0,
+                                            client.get_saved_cal)
             if saved is not None:
                 r["saved_cal"] = saved
             r["snapshot_url"] = f"/api/{cam}/snapshot"
@@ -1192,8 +1616,8 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if op == "grid-deltas":
-            r = _cam_get_or_fetch(cam, f"{cam}:grid-deltas", 1.0,
-                                  client.get_grid_deltas)
+            r = _cam_get_or_fetch_gated(cam, f"{cam}:grid-deltas", 1.0,
+                                        client.get_grid_deltas)
             if r is None:
                 self._send_json(404, {"state": "never_run"})
                 return
@@ -1207,7 +1631,7 @@ class Handler(SimpleHTTPRequestHandler):
                 t = params.get("tail")
                 if t and t.isdigit():
                     tail = int(t)
-            if not _probe_alive(client.ip):
+            if not _probe_alive(client.ip) or _breaker_open(cam):
                 self._send_text(503, "(cam unreachable)\n")
                 return
             body = client.get_events_log(tail=tail)
@@ -1228,7 +1652,7 @@ class Handler(SimpleHTTPRequestHandler):
                 t = params.get("tail")
                 if t and t.isdigit():
                     tail = int(t)
-            if not _probe_alive(client.ip):
+            if not _probe_alive(client.ip) or _breaker_open(cam):
                 self._send_text(503, "(cam unreachable)\n")
                 return
             body = client.get_syslog(tag=tag, tail=tail)
@@ -1302,6 +1726,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self._send_json(409, {"ok": False,
                     "error": "monocal trigger refused (irlink already running on cam2?)"})
                 return
+            _nudge_monocal_poller()
             self._send_json(200, {"ok": True, "coords": list(coords),
                                   "speed_ms": speed_ms, "trigger": result})
             return
@@ -1358,6 +1783,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self._send_json(409, {"ok": False,
                     "error": "monocal-both trigger refused (irlink already running on cam2?)"})
                 return
+            _nudge_monocal_poller()
             self._send_json(200, {"ok": True, "coords": list(coords),
                                   "speed_ms": speed_ms, "mode": "both",
                                   "trigger": result})
@@ -1414,6 +1840,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self._send_json(409, {"ok": False,
                     "error": "monocal-rev trigger refused (irlink already running on cam2?)"})
                 return
+            _nudge_monocal_poller()
             self._send_json(200, {"ok": True, "coords": list(coords),
                                   "speed_ms": speed_ms, "mode": "reverse",
                                   "trigger": result})
@@ -1438,6 +1865,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             ok = client.set_ae_freeze(value == "1")
             _cache_invalidate(f"{cam}:ae", f"{cam}:status", f"{cam}:cal-info")
+            _nudge_poller(cam)  # refresh snapshot within a sub-second cycle
             self._send_json(200 if ok else 502, {"ok": ok, "value": int(value) if ok else None})
             return
 
@@ -1455,6 +1883,7 @@ class Handler(SimpleHTTPRequestHandler):
             if report is None:
                 self._send_json(502, {"ok": False, "error": "setup CGI unreachable"})
                 return
+            _nudge_poller(cam)  # setup flips LEDs/ae/ircut — refresh snapshot
             self._send_json(200 if report.get("ok") else 207, report)
             return
 
@@ -1469,6 +1898,7 @@ class Handler(SimpleHTTPRequestHandler):
             ok = client.imp_cmd(lamp, int(value))
             _cache_invalidate(f"{cam}:leds", f"{cam}:status",
                               f"{cam}:cal-info", f"{cam}:proc")
+            _nudge_poller(cam)  # refresh snapshot within a sub-second cycle
             self._send_json(200 if ok else 502, {"ok": ok, "lamp": lamp, "value": int(value) if ok else None})
             return
 
@@ -1505,6 +1935,7 @@ def main():
     print(f"  webui dir: {WEBUI_DIR}")
     print(f"  resolving cams:")
     init_clients()
+    init_pollers()
     print(f"  listening: http://{args.bind}:{args.port}/")
     threading.Thread(target=_periodic_time_sync_loop, daemon=True).start()
 
@@ -1514,6 +1945,10 @@ def main():
     except KeyboardInterrupt:
         print("\nshutting down…")
     finally:
+        for poller in POLLERS.values():
+            poller.stop()
+        for poller in POLLERS.values():
+            poller.thread.join(timeout=2)
         httpd.server_close()
 
 

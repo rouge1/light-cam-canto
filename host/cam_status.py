@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 import urllib.parse
 from typing import Optional
 
@@ -47,6 +48,13 @@ class CamStatusClient:
         self.ip = ip
         self.password = password
         self.cookie_file = f"/tmp/cam_cookie_{ip}.txt"
+        # One client instance is shared across every thread that talks to a
+        # given cam (webui poller + control POSTs + non-poller GETs). On a cam
+        # reboot the cookie is wiped and *every* in-flight request would
+        # otherwise fire its own /x/login.cgi simultaneously — a "login storm"
+        # that itself overloads the cam's single-process uhttpd. This lock
+        # collapses concurrent logins to one.
+        self._login_lock = threading.Lock()
 
     def _login(self, timeout: float = 3.0) -> bool:
         """Authenticate and persist the session cookie. Returns False on
@@ -65,12 +73,45 @@ class CamStatusClient:
             return False
         return '"success":true' in (r.stdout or "")
 
+    def _cookie_valid(self) -> bool:
+        """True if a session cookie file is present and non-trivial."""
+        try:
+            return os.path.getsize(self.cookie_file) >= 10
+        except OSError:
+            return False
+
+    def _cookie_mtime(self) -> float:
+        """mtime of the cookie file, or 0.0 if it doesn't exist. Used to
+        detect that another thread re-logged-in while we waited for the
+        login lock (curl `-c` rewrites the file, advancing mtime)."""
+        try:
+            return os.path.getmtime(self.cookie_file)
+        except OSError:
+            return 0.0
+
+    def _locked_login(self, since_mtime: Optional[float] = None) -> bool:
+        """Log in, collapsing concurrent logins to this cam into one.
+
+        since_mtime: cookie mtime sampled *before* the request that just
+        failed auth. If, by the time we hold the lock, the cookie has been
+        rewritten by another thread (mtime advanced past since_mtime), that
+        thread already re-logged-in for us — reuse it. Pass None for the
+        no-cookie path, where any valid cookie another thread produced is
+        good enough."""
+        with self._login_lock:
+            if since_mtime is None:
+                if self._cookie_valid():
+                    return True
+            elif self._cookie_valid() and self._cookie_mtime() > since_mtime:
+                return True
+            return self._login()
+
     def _ensure_cookie(self) -> bool:
         """True if a cookie is present (or freshly obtained); False if login
         was needed and failed."""
-        if not os.path.exists(self.cookie_file) or os.path.getsize(self.cookie_file) < 10:
-            return self._login()
-        return True
+        if self._cookie_valid():
+            return True
+        return self._locked_login()
 
     def _fetch(self, path: str, timeout: float = 5.0,
                retry_login: bool = True) -> Optional[str]:
@@ -83,6 +124,7 @@ class CamStatusClient:
         machinery keeps each new endpoint a 5-line wrapper around _fetch."""
         if not self._ensure_cookie():
             return None
+        cookie_mt = self._cookie_mtime()
         try:
             r = subprocess.run(
                 ["curl", "-s", "--max-time", str(timeout), "-b", self.cookie_file,
@@ -101,7 +143,7 @@ class CamStatusClient:
         if (body.startswith("<") and "Forbidden" in body) or \
            (body.startswith("{") and "Authentication required" in body):
             if retry_login:
-                self._login()
+                self._locked_login(since_mtime=cookie_mt)
                 return self._fetch(path, timeout=timeout, retry_login=False)
             return None
         if body.startswith("<"):
@@ -115,6 +157,7 @@ class CamStatusClient:
         machinery as _fetch but no text-decoding."""
         if not self._ensure_cookie():
             return None
+        cookie_mt = self._cookie_mtime()
         try:
             r = subprocess.run(
                 ["curl", "-s", "--max-time", str(timeout), "-b", self.cookie_file,
@@ -132,7 +175,7 @@ class CamStatusClient:
         if (body[:1] == b"<" and b"Forbidden" in head) or \
            (body[:1] == b"{" and b"Authentication required" in head):
             if retry_login:
-                self._login()
+                self._locked_login(since_mtime=cookie_mt)
                 return self._fetch_binary(path, timeout=timeout,
                                           retry_login=False)
             return None
@@ -183,14 +226,15 @@ class CamStatusClient:
         pass `"application/json"` (or similar) for JSON-body endpoints."""
         if not self._ensure_cookie():
             return None
-        cmd = ["curl", "-s", "-w", "\n%{http_code}", "-b", self.cookie_file,
-               "-X", "POST", "-d", data]
+        cookie_mt = self._cookie_mtime()
+        cmd = ["curl", "-s", "--max-time", str(timeout), "-w", "\n%{http_code}",
+               "-b", self.cookie_file, "-X", "POST", "-d", data]
         if content_type:
             cmd += ["-H", f"Content-Type: {content_type}"]
         cmd.append(f"http://{self.ip}{path}")
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=timeout)
+                               timeout=timeout + 1)
         except (subprocess.TimeoutExpired, OSError):
             return None
         out = r.stdout or ""
@@ -203,7 +247,7 @@ class CamStatusClient:
         except ValueError:
             return None
         if code in (401, 403) and retry_login:
-            self._login()
+            self._locked_login(since_mtime=cookie_mt)
             return self._post(path, data, content_type=content_type,
                               timeout=timeout, retry_login=False)
         return code, body
@@ -218,7 +262,7 @@ class CamStatusClient:
         except json.JSONDecodeError:
             return None
 
-    def get_all_status(self) -> Optional[dict]:
+    def get_all_status(self, timeout: float = 5.0) -> Optional[dict]:
         """One-shot consolidated read: status + leds + ae + proc.
 
         Replaces 4 concurrent CGI hits (cal-status / gpio-state / ae-freeze /
@@ -226,8 +270,13 @@ class CamStatusClient:
         cycle uses. cam1's busybox uhttpd is single-process, so 4 parallel
         CGIs serialize on the cam regardless of laptop parallelism. Shape
         matches what each individual endpoint returns so consumers can
-        demux directly. Returns None on any transport / parse failure."""
-        body = self._fetch("/x/all-status.cgi")
+        demux directly. Returns None on any transport / parse failure.
+
+        timeout: curl --max-time for this read. The webui background poller
+        passes a tighter value than the 5.0s default so a wedged uhttpd
+        can't pin the poll thread for a full 5s every cycle (the poller's
+        circuit breaker then throttles a dead cam to TCP probes)."""
+        body = self._fetch("/x/all-status.cgi", timeout=timeout)
         if body is None:
             return None
         try:

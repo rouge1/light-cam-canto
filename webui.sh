@@ -28,6 +28,19 @@ PHOTOS_PID="$RUN_DIR/photos.pid"
 WEBUI_PID="$RUN_DIR/webui.pid"
 PHOTOS_LOG="$RUN_DIR/photos.log"
 WEBUI_LOG="$RUN_DIR/webui.log"
+BOOT_LOG="$RUN_DIR/boot.log"
+
+# Reboot persistence. `webui.sh install` adds an idempotent @reboot line to
+# the user crontab — no root/sudo, and it survives reboot regardless of login
+# (unlike a systemd --user unit, which needs `loginctl enable-linger`). cron's
+# env is minimal, but find_python locates the conda python via $HOME and the
+# script is invoked by absolute path; --no-preflight skips the camera-
+# dependent (and currently routeless) /api/setup-all at boot; --no-browser
+# since there's no display. The marker is a trailing sh-comment (cron runs the
+# line via `sh -c`, which ignores `#…`) so a single grep adds/removes it.
+SELF="$ROOT/webui.sh"
+CRON_MARK="# lightcam-webui-autostart"
+CRON_LINE="@reboot $SELF start --no-preflight --no-browser >> $BOOT_LOG 2>&1  $CRON_MARK"
 
 if [ -t 1 ]; then
   C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_AMBER=$'\033[33m'
@@ -87,10 +100,51 @@ print_one() {
   fi
 }
 
+autostart_status() {
+  if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -qF "$CRON_MARK"; then
+    printf "  ${C_GREEN}●${C_RESET} ${C_BOLD}%-15s${C_RESET}  ${C_DIM}@reboot via crontab${C_RESET}\n" "autostart"
+  else
+    printf "  ${C_RED}○${C_RESET} ${C_BOLD}%-15s${C_RESET}  ${C_DIM}not installed — ./webui.sh install${C_RESET}\n" "autostart"
+  fi
+}
+
 cmd_status() {
   echo -e "${C_BOLD}LiWiFi webui${C_RESET}  ${C_DIM}($RUN_DIR)${C_RESET}"
   print_one "photos server" "$PHOTOS_PID" "$PHOTOS_PORT" "http://127.0.0.1:$PHOTOS_PORT/calibration.html"
   print_one "webui server"  "$WEBUI_PID"  "$WEBUI_PORT"  "http://$WEBUI_HOST:$WEBUI_PORT/"
+  autostart_status
+}
+
+cmd_install() {
+  command -v crontab >/dev/null 2>&1 || {
+    echo -e "${C_RED}✗${C_RESET} crontab not found — cannot install reboot autostart" >&2
+    exit 1
+  }
+  local cur filtered
+  cur=$(crontab -l 2>/dev/null || true)
+  filtered=$(printf '%s\n' "$cur" | grep -vF "$CRON_MARK" || true)
+  # Re-emit existing entries minus ours, then append ours; drop blank lines.
+  printf '%s\n%s\n' "$filtered" "$CRON_LINE" | grep -v '^[[:space:]]*$' | crontab -
+  echo -e "${C_GREEN}✓${C_RESET} reboot autostart installed (user crontab @reboot)"
+  echo -e "  ${C_DIM}${CRON_LINE}${C_RESET}"
+  echo -e "  ${C_DIM}boot output → $BOOT_LOG${C_RESET}"
+  echo -e "  ${C_DIM}note: starts once at boot; no auto-restart if it later crashes${C_RESET}"
+}
+
+cmd_uninstall() {
+  command -v crontab >/dev/null 2>&1 || { echo -e "${C_DIM}crontab not found${C_RESET}"; return 0; }
+  local cur filtered
+  cur=$(crontab -l 2>/dev/null || true)
+  if ! printf '%s\n' "$cur" | grep -qF "$CRON_MARK"; then
+    echo -e "${C_DIM}reboot autostart not installed${C_RESET}"; return 0
+  fi
+  filtered=$(printf '%s\n' "$cur" | grep -vF "$CRON_MARK" || true)
+  if [ -z "$(printf '%s' "$filtered" | tr -d '[:space:]')" ]; then
+    crontab -r 2>/dev/null || true
+  else
+    printf '%s\n' "$filtered" | grep -v '^[[:space:]]*$' | crontab -
+  fi
+  echo -e "${C_GREEN}✓${C_RESET} reboot autostart removed"
 }
 
 start_bg() {
@@ -280,8 +334,10 @@ LiWiFi webui control script
                                        run cam_setup.sh, start photos + webui
   ./webui.sh stop                      stop both servers
   ./webui.sh restart                   stop + start
-  ./webui.sh status                    show running state
+  ./webui.sh status                    show running state + autostart
   ./webui.sh logs [webui|photos|both]  tail server logs (default: webui)
+  ./webui.sh install                   start automatically on reboot (@reboot cron)
+  ./webui.sh uninstall                 remove the reboot autostart
 
   webui:   http://$WEBUI_HOST:$WEBUI_PORT/   (port $WEBUI_PORT)
   photos:  http://127.0.0.1:$PHOTOS_PORT/    (port $PHOTOS_PORT, iframe target)
@@ -295,6 +351,8 @@ case "${1:-}" in
   restart)           cmd_stop; sleep 0.4; shift || true; cmd_start "$@" ;;
   status|st)         cmd_status ;;
   logs|log|tail)     shift; cmd_logs "$@" ;;
+  install)           cmd_install ;;
+  uninstall)         cmd_uninstall ;;
   ""|-h|--help|help) usage ;;
   *) echo "unknown command: ${1:-}" >&2; usage; exit 2 ;;
 esac

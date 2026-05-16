@@ -161,6 +161,27 @@ See "Monocal" section above for the full state machine and CGI integration.
 
 **Host-side RTSP cal:** `host/cal_procedure.py` — see `../host/CLAUDE.md`. Uses RTSP frame-diff; can underreport delta when AE compensates (the on-camera grid sees +67 delta where the laptop reports +24). Use the on-camera path when the laptop's cal looks suspiciously weak.
 
+### `/opt/etc/calibration.json` schema
+
+Written by **every** on-camera cal path (`calibrate-pixel`, `cal`, `bicall`, `monocal`, `monocal --both`) via the single `write_calibration_json()`:
+
+```json
+{
+  "tx_pixel": [342, 82],          // peer IR-LED location in the 640×360 ch1 frame
+  "frame_size": [640, 360],
+  "off_value": 112, "on_value": 118,
+  "grid_delta": 6,                // AE-frozen on-camera swing — single digits is
+                                  //   normal, NOT a failure (see ROI-dilution notes)
+  "peak_brightness": 195,         // absolute brightness at the peak pixel (sanity)
+  "timestamp_ms": 1778938721712,  // real Unix epoch ms (CLOCK_REALTIME)
+  "timestamp": "20260516_133841", // same instant, UTC, %Y%m%d_%H%M%S
+  "timestamp_tz": "UTC",
+  "source": "on_camera_pixel_cal"
+}
+```
+
+The cam's `CLOCK_REALTIME` is laptop-synced via `/x/time-sync.cgi` (outbound NTP UDP-123 is blocked), so `timestamp_ms` is genuinely dateable. **When comparing the cam file against the laptop's `host/calibration.json`, compare `timestamp_ms` (epoch, TZ-independent), NOT the `timestamp` string** — the cam writes UTC, `cal_procedure.py` writes laptop *local* time, so the two strings differ by the laptop's UTC offset for the same instant. A `monocal --both` run writes cam1's file (Phase 1) then cam2's (Phase 2) ~90 s apart; both `timestamp_ms` land inside the run window.
+
 ## Boot Automation
 
 Both cameras run `/etc/rc.local` at boot (via `S94rc.local`):
@@ -246,5 +267,6 @@ All endpoints share the cookie auth from `/x/login.cgi`; the laptop client logs 
 - **Bicall phase 2 timing margin is thin.** Holder's LED hold = 1.5 s OFF + 12 s ON = 13.5 s total. Scanner's `do_calibrate_pixel_to` takes ~12 s (1 s baseline + 4 s grid + ~6 s ROI sweep + edge expansion). If the scanner's scan finishes more than ~1.5 s before the holder's LED hold ends, the scanner's CAL_DONE TX starts during the holder's `tx_active=1` window and the holder misses the preamble (1.28 s @ 160 ms). Phase 1 always works because the responder's wait window starts when its LED hold ends, aligned with the scanner's TX start. Phase 2 is more fragile — if you lengthen the pixel sweep (e.g., add stride-1 sub-block refinement), bump the holder's hold to keep the margin.
 - **AE freeze stuck at 1 after `killall -9 irlink`.** The `-9` skips irlink's SIGTERM cleanup that writes `0` to `/run/prudynt/ae_freeze`. Subsequent operations (e.g. `cal_procedure.py`) silently fail because exposure is still locked to whatever it was when irlink was killed. `cam_setup.sh` now detects and resets this; manual fix is `echo 0 > /run/prudynt/ae_freeze`. Prefer `kill` (SIGTERM) over `kill -9` so cleanup fires.
 - **busybox `date +%s%3N` doesn't expand `%N`** — emits seconds only (Thingino busybox 1.37). The `monocal-trigger.cgi` pre-write originally had `started_ms:$(date +%s%3N)` and produced bogus `started_ms:1776061326` (seconds, not ms). Fix: `NOW_MS=$(date +%s)000` for one-second-granularity timestamps. The `irlink monocal` binary's first `write_monocal_status()` overwrites within ~hundreds of ms with real `clock_gettime` ms, so the bad CGI pre-write only shows for one webui poll tick.
+- **On-camera cal `timestamp_ms` was boot-relative until 2026-05-16.** `write_calibration_json()` stamped `now_ms()` (`CLOCK_MONOTONIC`) → values like `2419086` that reset every reboot and were uncomparable to laptop time, so a `monocal`/`bicall` run could not be dated from the saved cal. Now uses `clock_gettime(CLOCK_REALTIME)` → real Unix epoch ms, plus a UTC `timestamp` string (`%Y%m%d_%H%M%S`, mirroring `cal_procedure.py`) and `timestamp_tz`. Reliable because the cam clock is kept synced via `/x/time-sync.cgi`. Two gotchas: (a) **deploying the new binary does NOT rewrite existing cal files** — the old-format `timestamp_ms` persists until the next actual cal scan rewrites the file (validated 2026-05-16: cam2's file only flipped to wall-clock after a `monocal --both` Phase 2, not on deploy); (b) the cam `timestamp` string is **UTC** while the laptop's `host/calibration.json` string is laptop **local** — cross-file comparison must use `timestamp_ms`, not the strings. Don't shell out to `date` for this — busybox `date +%s%3N` is broken (pitfall above); `clock_gettime` in the C binary sidesteps it entirely.
 - **Monocal CAL_REQ flag dispatch must be bit-checked, not equality-checked.** Old code used `int bidi = (data[0] == 1) ? 1 : 0` — that catches bidi but interprets `0x02` (peer_scans) as bidi=0 → falls through to `handle_cal_request(0)` (regular cal — both sides hold LEDs, neither scans). Fix: `int flags = data[0]; int bidi = !!(flags & 0x01); int peer_scans = !!(flags & 0x02);`. Both `interactive_mode` and `daemon_mode` dispatch sites updated. **Cam1 must run the new binary** before any monocal trigger from cam2; old cam1 silently degrades to a no-op cycle.
 - **Monocal SYNC_BARRIER vs bicall race.** `handle_monocal_request` waits until `cal_ack_sent_at + 13500ms (peer hold) + 1500ms (drain margin)` before TXing CAL_DONE. This guarantees the responder's CAL_DONE preamble doesn't collide with the requestor's `tx_active=1` LED-on window — the explicit fix for the existing "Bicall phase 2 timing margin is thin" pitfall above. If you tune the requestor's hold duration in `do_monocal_request`, change `PEER_HOLD_MS` in `handle_monocal_request` to match.

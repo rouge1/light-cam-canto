@@ -578,12 +578,28 @@ main {
   flex-direction: column;
   gap: 5px;
   max-height: 360px;
-  overflow-y: auto;
-  padding-right: 4px;
+  overflow-y: scroll;   /* always reserve gutter so layout doesn't jitter */
+  padding-right: 6px;
+  /* Firefox */
+  scrollbar-width: thin;
+  scrollbar-color: var(--green) #050;
 }
-.event-stack::-webkit-scrollbar { width: 6px; }
-.event-stack::-webkit-scrollbar-track { background: #050; }
-.event-stack::-webkit-scrollbar-thumb { background: var(--green-dim); }
+/* WebKit (Chrome/Safari/Edge) */
+.event-stack::-webkit-scrollbar { width: 12px; }
+.event-stack::-webkit-scrollbar-track {
+  background: #050;
+  border-left: 1px solid var(--green-dim);
+}
+.event-stack::-webkit-scrollbar-thumb {
+  background: var(--green-dim);
+  border: 2px solid #050;
+  border-radius: 2px;
+  box-shadow: 0 0 4px var(--green);
+}
+.event-stack::-webkit-scrollbar-thumb:hover {
+  background: var(--green);
+  box-shadow: 0 0 6px var(--green);
+}
 
 .event {
   display: grid;
@@ -595,13 +611,45 @@ main {
   align-items: center;
   font-family: 'VT323', monospace;
   line-height: 1.2;
+  /* Rows must keep their natural height. .event-stack is a flex column with
+     a fixed max-height + overflow-y:scroll; without flex-shrink:0 the
+     browser compresses every row to fit the 360px box (squishing them into
+     each other and clipping 2-line messages) instead of overflowing into
+     the scroll area. With flex:0 0 auto the stack actually scrolls and
+     older rows fall below the fold as new ones are prepended. */
+  flex: 0 0 auto;
   opacity: calc(1 - var(--age, 0) * 0.07);
-  transition: opacity 320ms ease-out;
+  /* Two transition tracks: opacity (existing, for phosphor decay AND for
+     the 10-min fade-out) + everything-else (so .expiring can collapse
+     padding/border/height alongside opacity for the row's vanish). */
+  transition: opacity 320ms ease-out,
+              padding 1200ms ease-in,
+              border-left-width 1200ms ease-in,
+              max-height 1200ms ease-in,
+              margin 1200ms ease-in;
+  /* Explicit cap (not `auto`) so .expiring can animate max-height → 0.
+     96px clears a wrapped 2-line message at 21px/1.2 + padding; with
+     flex:0 0 auto above, rows never get squished below this anyway. */
+  max-height: 96px;
+  overflow: hidden;
 }
 .event.appearing { animation: event-slide-in 280ms cubic-bezier(0.2,0.8,0.2,1); }
 @keyframes event-slide-in {
   0%   { transform: translateY(-12px); opacity: 0; }
   100% { transform: translateY(0); opacity: calc(1 - var(--age, 0) * 0.07); }
+}
+/* 10-minute fade-out: events older than EXPIRE_MS get .expiring, which
+   fades opacity to 0, collapses height to 0, and removes border. JS
+   removes the DOM node after the transition completes (~1.5s after add).
+   Processed one-at-a-time by the expireOldEvents tick — so the oldest
+   visible event drains first, then the next, etc. */
+.event.expiring {
+  opacity: 0 !important;
+  max-height: 0 !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  margin: 0 !important;
+  border-left-width: 0 !important;
 }
 .event-time {
   font-size: 21px;
@@ -1552,6 +1600,15 @@ main {
   <span><span class="key">UP</span><span class="val" id="sb-uptime">00:00:00</span></span>
   <span><span class="key">CAL PID</span><span class="val dim" id="sb-cal-pid">—</span></span>
   <span><span class="key">EVENTS</span><span class="val" id="sb-event-count">0</span></span>
+  <!-- Hang-diagnostic chips. Updated every 30s. Watch HEAP climb + POLLS
+       grow without bound to confirm the foreground-tab leak hypothesis.
+       Click HEAP to dump a snapshot to localStorage (useful when the page
+       hangs — read via `localStorage.getItem('liwifi.hang-snapshot')`
+       from a fresh tab). -->
+  <span title="JS heap usage (MB) — climbs if memory leaks"><span class="key">HEAP</span><span class="val dim" id="sb-heap-mb">—</span></span>
+  <span title="poll cycles since page load"><span class="key">POLLS</span><span class="val dim" id="sb-poll-count">0</span></span>
+  <span title="mean fetch latency over last 20 cycles"><span class="key">FETCH</span><span class="val dim" id="sb-fetch-ms">—</span></span>
+  <span title="server-side request count / thread count"><span class="key">SRV</span><span class="val dim" id="sb-srv-stats">—</span></span>
   <span><span class="key">cam1</span><span class="val dim" id="sb-cam1-ip">—</span></span>
   <span><span class="key">cam2</span><span class="val dim" id="sb-cam2-ip">—</span></span>
   <span class="sb-clock-wrap"><span class="key">CLOCK</span><span class="val" id="sb-clock">--:--:--</span></span>
@@ -1567,6 +1624,7 @@ async function fetchJSON(url, opts = {}) {
   const { timeoutMs = 3000, ...rest } = opts;
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  const t0 = performance.now();
   try {
     const r = await fetch(url, { ...rest, signal: ctrl.signal });
     // Parse the body even on non-2xx — handlers may return structured
@@ -1581,9 +1639,101 @@ async function fetchJSON(url, opts = {}) {
     return null;
   } finally {
     clearTimeout(t);
+    // Record latency for the diagnostics rolling window. recordFetchLatency
+    // is defined later in the file but JS function declarations hoist, so
+    // it's safe to call here. Stays a no-op until that scope is reached.
+    if (typeof recordFetchLatency === 'function') {
+      recordFetchLatency(performance.now() - t0);
+    }
   }
 }
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// ============================================================
+// PAGE VISIBILITY + HANG DIAGNOSTICS
+// Pause polling when the tab/window is hidden (sleeping monitor, OS tab
+// park, etc). On resume, fire one immediate poll so the UI snaps fresh
+// rather than waiting up to POLL_INTERVAL_MS. The user's "walk away,
+// come back to frozen page" symptom is the cumulative-leak pattern; the
+// visibility gate is cheap insurance for the parked-tab subset of cases.
+// ============================================================
+let pageVisible = !document.hidden;
+document.addEventListener('visibilitychange', () => {
+  const wasHidden = !pageVisible;
+  pageVisible = !document.hidden;
+  if (document.hidden) {
+    // Drop the SSE stream while hidden: no point pushing to a parked tab,
+    // and it stops an unwatched tab from keeping the server poller "active"
+    // (it falls back to its slow idle cadence, easing cam load).
+    closeStream();
+  } else if (wasHidden) {
+    // Resume: reopen the stream (its first frame paints immediately) and
+    // snap one instant in-memory read so the UI is fresh right away.
+    openStream();
+    pollOnce('cam1').catch(()=>{});
+    pollOnce('cam2').catch(()=>{});
+  }
+});
+
+// Counters + rolling fetch-latency window. Every fetchJSON ticks
+// pollCount + records its duration; sb-* updaters read these every 30s.
+let pollCount = 0;
+const fetchLatencyWindow = [];   // ms samples, last 20
+const FETCH_LATENCY_WINDOW_MAX = 20;
+function recordFetchLatency(ms) {
+  fetchLatencyWindow.push(ms);
+  if (fetchLatencyWindow.length > FETCH_LATENCY_WINDOW_MAX) fetchLatencyWindow.shift();
+}
+
+async function updateDiagnostics() {
+  // Heap: only available in Chrome (performance.memory). Fall back to "—".
+  let heapMb = '—';
+  if (performance && performance.memory && performance.memory.usedJSHeapSize) {
+    heapMb = (performance.memory.usedJSHeapSize / (1024*1024)).toFixed(1);
+  }
+  document.getElementById('sb-heap-mb').textContent = heapMb;
+  document.getElementById('sb-poll-count').textContent = pollCount;
+  const fetchMs = fetchLatencyWindow.length
+    ? Math.round(fetchLatencyWindow.reduce((a,b)=>a+b,0) / fetchLatencyWindow.length)
+    : null;
+  document.getElementById('sb-fetch-ms').textContent =
+    fetchMs == null ? '—' : `${fetchMs}ms`;
+
+  // Server-side stats. Logged + displayed.
+  try {
+    const s = await fetchJSON('/api/server-stats', { timeoutMs: 4000 });
+    if (s) {
+      document.getElementById('sb-srv-stats').textContent =
+        `r=${s.request_count} t=${s.active_threads} c=${s.cache_entries}`;
+    }
+  } catch (e) { /* swallow */ }
+
+  // Periodic snapshot to localStorage — lets the user dump diagnostics
+  // from a FRESH tab after a hang by reading
+  // localStorage.getItem('liwifi.hang-snapshot').
+  try {
+    const snap = {
+      ts: new Date().toISOString(),
+      uptime_s: Math.floor((Date.now() - DIAG_BORN_AT) / 1000),
+      heap_mb: heapMb,
+      poll_count: pollCount,
+      fetch_avg_ms: fetchMs,
+      page_visible: pageVisible,
+    };
+    localStorage.setItem('liwifi.hang-snapshot', JSON.stringify(snap));
+  } catch (e) { /* private mode / quota */ }
+}
+const DIAG_BORN_AT = Date.now();
+// Click HEAP to force a snapshot right now (useful right before walking away).
+setTimeout(() => {
+  document.getElementById('sb-heap-mb').parentElement.style.cursor = 'pointer';
+  document.getElementById('sb-heap-mb').parentElement.addEventListener('click', () => {
+    updateDiagnostics();
+    console.log('liwifi diag snapshot:', localStorage.getItem('liwifi.hang-snapshot'));
+  });
+}, 100);
+setInterval(updateDiagnostics, 30000);
+setTimeout(updateDiagnostics, 1000);   // first tick after page settles
 
 function pad2(n) { return String(n).padStart(2, '0'); }
 function nowHMS() {
@@ -1651,9 +1801,10 @@ const POLL_INTERVAL_MS = 2000;     // was 1000 — cam1's uhttpd is single-proce
 const PHOSPHOR_AGE_MAX = 8;        // 8 pushes × 7% = ~56% max fade
 
 const CAM_STATE = {
-  cam1: { prevState: null, irOn: false, stackHasEmpty: true, prevCalSig: null, offlineMisses: 0 },
-  cam2: { prevState: null, irOn: false, stackHasEmpty: true, prevCalSig: null, offlineMisses: 0 },
+  cam1: { prevState: null, irOn: false, stackHasEmpty: true, prevCalSig: null, offlineMisses: 0, idleMisses: 0 },
+  cam2: { prevState: null, irOn: false, stackHasEmpty: true, prevCalSig: null, offlineMisses: 0, idleMisses: 0 },
 };
+const IDLE_MISS_THRESHOLD = 2;   // proc=0 must persist this many polls before we declare 'idle'
 
 function stateClass(state) {
   if (!state) return 'idle';
@@ -1717,6 +1868,7 @@ const STATE_LABELS = {
   'cal_failed':              'calibration failed',
   // === Monocal — responder (this side scans peer LEDs) ===
   'monocal_resp_ack':        'got cal request',
+  'monocal_resp_aebal':      'rebalancing exposure',
   'monocal_resp_scan':       'scanning peer LEDs',
   'monocal_resp_done':       'sending result to peer',
   'monocal_resp_failed':     'scan failed',
@@ -1788,6 +1940,10 @@ function pushEvent(cam, fromState, toState) {
     : humanState(toState);
   row.appendChild(time);
   row.appendChild(body);
+  /* Stamp creation time so expireOldEvents can age rows out by wall
+     clock (vs the push-driven phosphor decay). dataset is sufficient
+     storage; no need for a separate JS-side map. */
+  row.dataset.createdMs = String(Date.now());
   stack.prepend(row);
   setTimeout(() => row.classList.remove('appearing'), 320);
   while (stack.children.length > STACK_MAX) {
@@ -1796,6 +1952,43 @@ function pushEvent(cam, fromState, toState) {
   totalEventCount++;
   document.getElementById('sb-event-count').textContent = totalEventCount;
 }
+
+// ============================================================
+// 10-MINUTE FADE-OUT
+// Drains the oldest expired event per tick (cascades out one-at-a-time,
+// vs all simultaneously). Once .expiring is on the row, CSS transitions
+// the opacity to 0 + collapses height; we DOM-remove after the transition
+// completes so neighbors stay laid out smoothly throughout.
+// ============================================================
+const EVENT_EXPIRE_MS = 10 * 60 * 1000;   // 10 minutes
+const EXPIRE_TICK_MS = 5000;              // check every 5s; cascade pace
+const EXPIRE_FADE_MS = 1300;              // matches the longest CSS transition
+
+function expireOldEvents() {
+  if (!pageVisible) return;   // no work while hidden — fades are a UX
+                              // concern, only relevant when user can see
+  const now = Date.now();
+  for (const cam of ['cam1', 'cam2']) {
+    const stack = document.getElementById(cam + '-stack');
+    if (!stack) continue;
+    /* Walk from oldest (lastChild) up. Drain at most one per tick so
+       multiple-expired bursts cascade out gradually, not all at once. */
+    for (let i = stack.children.length - 1; i >= 0; i--) {
+      const row = stack.children[i];
+      if (!row.classList || !row.classList.contains('event')) continue;
+      if (row.classList.contains('expiring')) continue;   /* in flight */
+      const created = parseInt(row.dataset.createdMs || '0', 10);
+      if (!created) continue;
+      if (now - created < EVENT_EXPIRE_MS) continue;
+      row.classList.add('expiring');
+      setTimeout(() => {
+        if (row.parentNode) row.parentNode.removeChild(row);
+      }, EXPIRE_FADE_MS);
+      break;   /* one-at-a-time per cam */
+    }
+  }
+}
+setInterval(expireOldEvents, EXPIRE_TICK_MS);
 
 /* Shrink the chip value's font-size until the text fits on one line
    inside the chip. Caps at 10px; values smaller than that are unreadable.
@@ -1855,14 +2048,11 @@ function setLastEvent(cam, text) {
   }
 }
 
-async function pollOnce(cam) {
-  // ONE consolidated fetch per cycle — /api/{cam}/all is a single-fork
-  // CGI on the cam that returns {status, leds, ae, proc}. Previously
-  // we fired 4 parallel /api/{cam}/{status,leds,ae,proc} requests which
-  // serialized on cam1's single-process busybox uhttpd, causing OFFLINE
-  // flicker under load. proc.irlink still distinguishes "cam unreachable"
-  // (null) from "cam up, irlink not running" (0).
-  const all = await fetchJSON(`/api/${cam}/all`);
+// Render one consolidated {status, leds, ae, proc} snapshot for a cam.
+// Source-agnostic: fed either by the SSE stream (normal path, server
+// pushes) or by pollOnce()'s fetch (fallback path). The server's
+// background poller owns all camera I/O, so this never blocks on a cam.
+function applySnapshot(cam, all) {
   const status = (all && all.status) || null;
   const leds   = (all && all.leds)   || null;
   const ae     = (all && all.ae)     || null;
@@ -1893,6 +2083,17 @@ async function pollOnce(cam) {
     // Cam reachable but no irlink process. cam2 lives here normally —
     // launches on demand for monocal/send. Show "idle" so STATE isn't a
     // dash that looks like "offline".
+    //
+    // Debounce: cam1's busybox `pgrep|wc -l` over single-process uhttpd
+    // intermittently returns 0 under load (CGI shell timeout). A single
+    // miss would push a phantom `listening → idle → listening` row every
+    // few seconds, flooding the stack. Require IDLE_MISS_THRESHOLD
+    // consecutive proc=0 polls before declaring idle.
+    cs.idleMisses = (cs.idleMisses || 0) + 1;
+    if (cs.idleMisses < IDLE_MISS_THRESHOLD && cs.prevState && cs.prevState !== 'idle') {
+      // Suppress: keep prior state visible, don't push a transition.
+      return;
+    }
     col.classList.remove('offline');
     setChip(cam, 'mode', 'idle', 'dim', 'raw: idle');
     setChip(cam, 'state', humanState('idle'), '', 'raw: idle');
@@ -1909,6 +2110,7 @@ async function pollOnce(cam) {
     setChip(cam, 'state', humanState('starting'), 'busy', 'raw: starting');
   } else {
     col.classList.remove('offline');
+    cs.idleMisses = 0;   // irlink is running — clear the debounce counter
 
     const mode = status.mode || '—';
     const state = status.state || '—';
@@ -1961,9 +2163,19 @@ async function pollOnce(cam) {
   }
 }
 
+// Fallback path only — used when the SSE stream is unavailable. The
+// /api/{cam}/all endpoint is now an instant in-memory read on the server
+// (the poller keeps it warm), so this no longer blocks on the camera.
+async function pollOnce(cam) {
+  const all = await fetchJSON(`/api/${cam}/all`);
+  applySnapshot(cam, all);
+}
+
 async function pollLoop(cam) {
   while (true) {
-    try { await pollOnce(cam); } catch (e) { /* swallow */ }
+    if (pageVisible && streamMode !== 'sse') {
+      try { await pollOnce(cam); pollCount++; } catch (e) { /* swallow */ }
+    }
     await sleep(POLL_INTERVAL_MS);
   }
 }
@@ -1978,19 +2190,69 @@ async function beamLoop() {
   // 800ms cadence — the beam reads from CAM_STATE that pollOnce updates,
   // so this doesn't add cam-side load. Could be tighter for animation
   // feel but 800ms is plenty for the per-2s polling underneath.
+  // Visibility-gated: when the tab is hidden we skip the DOM toggles
+  // so no work accumulates on the compositor.
   while (true) {
-    const cam1On = CAM_STATE.cam1.irOn;
-    const cam2On = CAM_STATE.cam2.irOn;
-    document.getElementById('beam-fwd').classList.toggle('active', cam1On);
-    document.getElementById('beam-fwd-label').classList.toggle('active', cam1On);
-    document.getElementById('beam-rev').classList.toggle('active', cam2On);
-    document.getElementById('beam-rev-label').classList.toggle('active', cam2On);
-    document.getElementById('beam-carrier').classList.toggle('live', cam1On || cam2On);
+    if (pageVisible) {
+      const cam1On = CAM_STATE.cam1.irOn;
+      const cam2On = CAM_STATE.cam2.irOn;
+      document.getElementById('beam-fwd').classList.toggle('active', cam1On);
+      document.getElementById('beam-fwd-label').classList.toggle('active', cam1On);
+      document.getElementById('beam-rev').classList.toggle('active', cam2On);
+      document.getElementById('beam-rev-label').classList.toggle('active', cam2On);
+      document.getElementById('beam-carrier').classList.toggle('live', cam1On || cam2On);
+    }
     await sleep(800);
   }
 }
 
-pollLoop('cam1');
+// ============================================================
+// LIVE STREAM (SSE) — the server pushes a consolidated {cam1, cam2}
+// snapshot ~1.5s. The browser is a PURE RECEIVER: it never polls the
+// cameras. All camera I/O is owned by the server's background poller,
+// so a slow/down cam can never hang this page. If the stream drops,
+// EventSource auto-reconnects; if it stays down, streamMode flips to
+// 'poll' and the pollLoop fallbacks (started below, no-ops while SSE is
+// healthy) keep the UI alive against the now-instant /api/{cam}/all.
+// ============================================================
+let streamMode = 'poll';        // 'sse' once frames arrive; 'poll' on fallback
+let _es = null;
+let _esDownSince = 0;
+
+function applyStreamFrame(frame) {
+  if (!frame) return;
+  if (frame.cam1) applySnapshot('cam1', frame.cam1);
+  if (frame.cam2) applySnapshot('cam2', frame.cam2);
+  pollCount++;
+}
+
+function openStream() {
+  if (_es || !pageVisible) return;
+  try {
+    _es = new EventSource('/api/events/stream');
+  } catch (e) {
+    streamMode = 'poll';
+    return;
+  }
+  _es.onmessage = (ev) => {
+    streamMode = 'sse';
+    _esDownSince = 0;
+    try { applyStreamFrame(JSON.parse(ev.data)); } catch (e) { /* ignore */ }
+  };
+  _es.onerror = () => {
+    // EventSource reconnects on its own. If it can't recover within ~6s,
+    // flip to poll mode so the pollLoop fallbacks take over seamlessly.
+    if (!_esDownSince) _esDownSince = Date.now();
+    if (Date.now() - _esDownSince > 6000) streamMode = 'poll';
+  };
+}
+
+function closeStream() {
+  if (_es) { try { _es.close(); } catch (e) {} _es = null; }
+}
+
+openStream();
+pollLoop('cam1');   // fallback loops — idle (no fetch) while streamMode==='sse'
 pollLoop('cam2');
 beamLoop();
 
@@ -2002,6 +2264,7 @@ const monocalBtn = document.getElementById('monocal-btn');
 
 async function pollCalStatus() {
   while (true) {
+    if (!pageVisible) { await sleep(2000); continue; }
     const s = await fetchJSON('/api/cal/status');
     if (s && s.running) {
       runBtn.classList.add('running');

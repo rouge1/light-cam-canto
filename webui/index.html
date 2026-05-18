@@ -366,12 +366,11 @@ main {
 @keyframes beam-rev { 0% { left: 100%; } 100% { left: -45%; } }
 
 /* ============== ACTION BAR — buttons UNDER the hero ============== */
-/* Asymmetric: RUN CAL is the primary action (full bidi cal_procedure
-   driven by the laptop). MONOCAL is the autonomous-cam1 secondary path.
-   1.6 : 1 column ratio reflects that visually. */
+/* One row, three equal-width actions: RUN CAL SEQUENCE (laptop bidi
+   cal_procedure), MONOCAL CAM1, and MONOCAL BOTH (over-light paths). */
 .action-bar {
   display: grid;
-  grid-template-columns: 1.6fr 1fr;
+  grid-template-columns: repeat(3, 1fr);
   gap: 14px;
   margin-bottom: 16px;
   animation: phosphor-warmup 700ms 350ms ease-out backwards;
